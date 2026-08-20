@@ -1,0 +1,198 @@
+BBK Temporal FIR - offline DSP validation results
+==================================================
+
+Produced by running Tests/DSPTest.cpp locally (framework-independent,
+no JUCE) against the generated Source/TemporalFIRBank.h coefficient
+bank, before this project was ever pushed to CI. The same test also
+runs as a required, blocking step in the GitHub Actions build
+.github/workflows/build-windows.yml - if any of these checks fail,
+the CI build fails before the plugin itself is even compiled.
+
+BBK Temporal FIR DSP verification (framework-independent)
+Fs = 192000 Hz, maxN = 127, maxGroupDelaySamples = 63, 16 filter points
+
+--- N=19 (index 0) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=23 (index 1) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=27 (index 2) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=31 (index 3) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=37 (index 4) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=45 (index 5) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=47 (index 6) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=51 (index 7) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=57 (index 8) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=61 (index 9) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=65 (index 10) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=67 (index 11) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=77 (index 12) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=97 (index 13) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=105 (index 14) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+--- N=121 (index 15) ---
+  ok: padded taps are exactly symmetric
+  ok: DC gain equals 1.0 within 1e-6
+  ok: passband |A(f)-1| <= 1e-4 (0-20 kHz, 5% grid slack)
+  ok: stopband |A(f)| <= -100.3 dB (76-96 kHz, 5% grid slack)
+  ok: recomputed peak sidelobe % matches stored value within 0.01%
+  ok: recomputed ringing energy % matches stored value within 0.01%
+  ok: recomputed settling duration matches stored value
+  ok: taps are exactly zero outside the true filter's own support
+  ok: system impulse response equals padded taps sample-for-sample
+
+  ok: the 19-tap baseline is present in the selectable bank
+  ok: bypass/dry impulse appears at exactly maxGroupDelaySamples
+  ok: two channels with different, independent inputs do not cross-contaminate
+  ok: 192000 Hz is accepted
+  ok: 44100 Hz is rejected (safe-bypass path)
+  ok: 96000 Hz is rejected (safe-bypass path)
+  ok: 191999 Hz is rejected (outside 0.5 Hz tolerance)
+
+PASS
