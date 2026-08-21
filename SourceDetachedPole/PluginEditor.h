@@ -22,11 +22,11 @@ private:
     juce::Label subtitle;
     juce::Label sampleRate;
     juce::Label status;
-    juce::ToggleButton enable { "ACTIVE" };
+    juce::ComboBox modeBox;
 
     juce::Label metricsReadout;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enableAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };
