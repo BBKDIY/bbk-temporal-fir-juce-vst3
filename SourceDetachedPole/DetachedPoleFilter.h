@@ -81,6 +81,17 @@ constexpr double worstStopbandLevelDb = -116.17;
 constexpr double passbandDroopDbAt20k = -0.50;
 constexpr double groupDelaySamples = 9.515; // mean across 0-20 kHz, flat to within +/-0.002 samples
 
+// Case B (the same 19-tap FIR above, used alone with no pole stage) -
+// verified metrics matching the article's own published Case B figures
+// (Part Two): Rpeak=14.93%, EZC=2.73%, worst-case stopband -105.94 dB,
+// exactly flat passband (no droop - Case B has no pole), exact group
+// delay of (firTapCount-1)/2 = 9 samples (plain linear-phase FIR).
+constexpr double caseBPeakSidelobePercent = 14.928;
+constexpr double caseBTotalRingingEnergyPercent = 2.728;
+constexpr int caseBDurationSamples = 18;
+constexpr double caseBWorstStopbandLevelDb = -105.94;
+constexpr int caseBGroupDelaySamples = firCentreIndex; // exactly 9, no pole
+
 // Latency reported to the host: the nearest integer to this design's own
 // near-flat group delay (~9.515 samples across the passband). The dry
 // (bypass) path is delayed by exactly this many samples so toggling
