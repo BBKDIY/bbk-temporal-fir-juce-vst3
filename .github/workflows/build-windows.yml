@@ -17,31 +17,49 @@ jobs:
         run: |
           cmake -S . -B build-dsp -DBBK_BUILD_DSP_TEST_ONLY=ON
           cmake --build build-dsp --config Release --target BBKTemporalFIR_DSPTest
-          $exe = Get-ChildItem -Path build-dsp -Recurse -Filter "BBKTemporalFIR_DSPTest.exe" | Select-Object -First 1
-          if (-not $exe) { throw "BBKTemporalFIR_DSPTest.exe not found - DSP test build failed." }
-          & $exe.FullName
-          if ($LASTEXITCODE -ne 0) { throw "DSP verification FAILED (exit code $LASTEXITCODE)." }
+          cmake --build build-dsp --config Release --target BBKDetachedPole_DSPTest
+          $exe1 = Get-ChildItem -Path build-dsp -Recurse -Filter "BBKTemporalFIR_DSPTest.exe" | Select-Object -First 1
+          if (-not $exe1) { throw "BBKTemporalFIR_DSPTest.exe not found - DSP test build failed." }
+          & $exe1.FullName
+          if ($LASTEXITCODE -ne 0) { throw "BBKTemporalFIR DSP verification FAILED (exit code $LASTEXITCODE)." }
+          $exe2 = Get-ChildItem -Path build-dsp -Recurse -Filter "BBKDetachedPole_DSPTest.exe" | Select-Object -First 1
+          if (-not $exe2) { throw "BBKDetachedPole_DSPTest.exe not found - DSP test build failed." }
+          & $exe2.FullName
+          if ($LASTEXITCODE -ne 0) { throw "BBKDetachedPole DSP verification FAILED (exit code $LASTEXITCODE)." }
 
       - name: Configure (CMake + Visual Studio 17 2022, x64)
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build (Release)
-        run: cmake --build build --config Release --target BBKTemporalFIR_VST3
+        run: |
+          cmake --build build --config Release --target BBKTemporalFIR_VST3
+          cmake --build build --config Release --target BBKDetachedPole_VST3
 
-      - name: Locate the built .vst3
+      - name: Locate the built .vst3 files
         shell: pwsh
         run: |
-          $found = Get-ChildItem -Path build -Recurse -Filter "BBK Temporal FIR.vst3" | Select-Object -First 1
-          if (-not $found) { throw "BBK Temporal FIR.vst3 not found under build/ - build likely failed." }
-          Write-Host "Found: $($found.FullName)"
+          $found1 = Get-ChildItem -Path build -Recurse -Filter "BBK Temporal FIR.vst3" | Select-Object -First 1
+          if (-not $found1) { throw "BBK Temporal FIR.vst3 not found under build/ - build likely failed." }
+          Write-Host "Found: $($found1.FullName)"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item $found.FullName -Destination "dist/BBK Temporal FIR.vst3" -Recurse
+          Copy-Item $found1.FullName -Destination "dist/BBK Temporal FIR.vst3" -Recurse
 
-      - name: Upload artifact
+          $found2 = Get-ChildItem -Path build -Recurse -Filter "BBK Detached Pole.vst3" | Select-Object -First 1
+          if (-not $found2) { throw "BBK Detached Pole.vst3 not found under build/ - build likely failed." }
+          Write-Host "Found: $($found2.FullName)"
+          Copy-Item $found2.FullName -Destination "dist/BBK Detached Pole.vst3" -Recurse
+
+      - name: Upload BBK Temporal FIR artifact
         uses: actions/upload-artifact@v4
         with:
           name: BBK-TemporalFIR-Windows-VST3-JUCE-MSVC
           path: dist/BBK Temporal FIR.vst3
+
+      - name: Upload BBK Detached Pole artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BBK-DetachedPole-Windows-VST3-JUCE-MSVC
+          path: dist/BBK Detached Pole.vst3
 
       - name: Upload coefficient generation artifacts (sweep data / metrics)
         uses: actions/upload-artifact@v4
