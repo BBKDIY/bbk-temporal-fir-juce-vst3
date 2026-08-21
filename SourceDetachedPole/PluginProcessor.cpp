@@ -144,7 +144,7 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
             // Stage 2: first-order real-pole IIR, always updated from the
             // the FIR own continuous output so Case C own state stays
             // warm and a mode switch into it is never a cold-start
-            /i] ransient (see header comment).
+            // transient (see header comment).
             const double wetC = poleB0 * w + poleB1 * state.poleW1 - poleA1 * state.poleY1;
             state.poleW1 = w;
             state.poleY1 = wetC;
