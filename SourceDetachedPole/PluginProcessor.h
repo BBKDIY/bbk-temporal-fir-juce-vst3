@@ -6,19 +6,28 @@
 #include <vector>
 #include "DetachedPoleFilter.h"
 
-// BBK Detached Pole: a real-time reproduction of the accompanying
-// article's Case C (Part Two, "A Practical Challenge to the FIR
-// Frontier: The Detached Real Pole") - a 19-tap linear-phase FIR cascaded
-// with a single real IIR pole whose cut-off is deliberately decoupled
-// from the FIR's own passband edge. See DetachedPoleFilter.h for the
-// exact design, its coefficients, and its provenance.
+// BBK Detached Pole: an A/B/C loopback-comparison tool built around the
+// accompanying article's Case B and Case C designs (Part Two, "A
+// Practical Challenge to the FIR Frontier: The Detached Real Pole").
+// Case B and Case C share the exact same 19-tap FIR stage (identical
+// scipy.signal.remez call, same 20/76 kHz edges); Case C additionally
+// cascades that FIR through a single real IIR pole whose cut-off (47 kHz)
+// is decoupled from the FIR's own passband edge. See DetachedPoleFilter.h
+// for the exact coefficients and their provenance.
 //
-// Unlike BBK Temporal FIR, this is a single fixed design point (Case C
-// is not swept), so the plugin exposes only a BYPASS/ACTIVE toggle - no
-// trade-off slider.
+// The plugin exposes one 3-way MODE selector rather than a bypass toggle:
+//   0 = Bypass   (dry, latency-matched)
+//   1 = Case B   (19-tap FIR only)
+//   2 = Case C   (19-tap FIR + decoupled 47 kHz real pole)
+// so all three can be measured through the same physical signal chain
+// (e.g. a loopback interface) and compared at matched level, directly
+// testing whether Case C's simulated advantage over Case B survives
+// real D/A + A/D conversion.
 class BBKDetachedPoleAudioProcessor final : public juce::AudioProcessor
 {
 public:
+    enum class Mode { bypass = 0, caseB = 1, caseC = 2 };
+
     BBKDetachedPoleAudioProcessor();
     ~BBKDetachedPoleAudioProcessor() override = default;
 
@@ -52,7 +61,7 @@ public:
     juce::AudioProcessorValueTreeState& getAPVTS() noexcept { return parameters; }
     double getCurrentSampleRateForUI() const noexcept { return currentSampleRate.load(); }
     bool isRateValidForUI() const noexcept { return valid192k.load(); }
-    bool isEnabledForUI() const noexcept;
+    Mode getModeForUI() const noexcept;
 
 private:
     struct ChannelState
@@ -79,8 +88,16 @@ private:
     juce::AudioProcessorValueTreeState parameters;
     std::vector<ChannelState> channels;
 
-    // enabled/bypass crossfade (dry <-> filtered), same pattern as BBK Temporal FIR.
-    juce::SmoothedValue<double, juce::ValueSmoothingTypes::Linear> wetMix;
+    // Mode-select crossfade: the currently-audible mode's own signal
+    // ("from") keeps playing uninterrupted while a newly-selected mode's
+    // signal ("to") fades in - every mode's own signal (dry/wetB/wetC) is
+    // computed every sample regardless of which is selected, so the pole
+    // stage's own state is always warm and a switch into Case C is never
+    // a cold-start transient.
+    juce::SmoothedValue<double, juce::ValueSmoothingTypes::Linear> modeCrossfade;
+    Mode fromMode = Mode::bypass;
+    Mode toMode = Mode::bypass;
+    Mode lastSeenMode = Mode::bypass;
 
     std::atomic<double> currentSampleRate { 0.0 };
     std::atomic<bool> valid192k { false };
