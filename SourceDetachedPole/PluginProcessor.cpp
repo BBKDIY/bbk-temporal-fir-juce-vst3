@@ -13,7 +13,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     double caseFSum = 0.0;
     for (double h : bbk::detachedpole::caseFFirTaps())
         caseFSum += h;
-    JUCE_DBG ("Case F coefficient sum: " << juce::String (caseFSum, 12));
+    DBG ("Case F coefficient sum: " << juce::String (caseFSum, 12));
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcessor::createParameterLayout()
