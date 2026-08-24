@@ -7,6 +7,13 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
   parameters (*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    // Debug-output verification for Case F: print the loaded coefficient
+    // sum so a build log / debugger console shows unity DC gain was
+    // preserved exactly as supplied (no renormalization applied).
+    double caseFSum = 0.0;
+    for (double h : bbk::detachedpole::caseFFirTaps())
+        caseFSum += h;
+    JUCE_DBG ("Case F coefficient sum: " << juce::String (caseFSum, 12));
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcessor::createParameterLayout()
@@ -14,14 +21,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         juce::ParameterID { "mode", 1 }, "Mode",
-        juce::StringArray { "Bypass", "Case B: FIR only", "Case C: FIR + Pole" }, 0));
+        juce::StringArray { "Bypass", "Case B: FIR only", "Case C: FIR + Pole", "Case F: Joint-Optimized FIR" }, 0));
     return layout;
 }
 
 BBKDetachedPoleAudioProcessor::Mode BBKDetachedPoleAudioProcessor::getModeForUI() const noexcept
 {
     if (const auto* value = parameters.getRawParameterValue ("mode"))
-        return static_cast<Mode> (juce::jlimit (0, 2, static_cast<int> (std::lround (value->load()))));
+        return static_cast<Mode> (juce::jlimit (0, 3, static_cast<int> (std::lround (value->load()))));
     return Mode::bypass;
 }
 
@@ -56,12 +63,12 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
     lastPreparedSampleRate = sampleRate;
     hasPrepared = true;
 
-    // Case B own group delay is exactly 9 samples (linear phase, no
-    // pole); Case C is flat to within +/-0.002 samples of ~9.515 across
-    // 0-20 kHz. latencySamples (10) is used uniformly for all three modes
-    // so the reported host latency never changes at runtime regardless of
-    // which mode is selected - which is what matters for host PDC
-    // correctness. See DetachedPoleFilter.h.
+    // Case B and Case F both have an exact group delay of 9 samples
+    // (linear phase, no pole); Case C is flat to within +/-0.002 samples
+    // of ~9.515 across 0-20 kHz. latencySamples (10) is used uniformly
+    // for all four modes so the reported host latency never changes at
+    // runtime regardless of which mode is selected - which is what
+    // matters for host PDC correctness. See DetachedPoleFilter.h.
     setLatencySamples (bbk::detachedpole::latencySamples);
 }
 
@@ -118,6 +125,7 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
 
     using namespace bbk::detachedpole;
     const auto& taps = firTaps();
+    const auto& caseFTaps = caseFFirTaps();
 
     for (int sample = 0; sample < numSamples; ++sample)
     {
@@ -151,6 +159,21 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
 
             const double wetB = w;
 
+            // Case F: a completely independent 19-tap FIR convolution
+            // over the same raw-input history buffer, using its own
+            // separate coefficient array. This never reads or writes
+            // state.poleW1/state.poleY1 (those belong to Case C only),
+            // so Case F can never be affected by, or leave behind, any
+            // pole state - y[n] = sum_{k=0..18} h[k]*x[n-k], nothing else.
+            double wF = 0.0;
+            for (int k = 0; k < firTapCount; ++k)
+            {
+                int index = state.writeIndex - k;
+                if (index < 0)
+                    index += historyLength;
+                wF += caseFTaps[static_cast<std::size_t> (k)] * state.history[static_cast<std::size_t> (index)];
+            }
+
             int dryIndex = state.writeIndex - bbk::detachedpole::latencySamples;
             if (dryIndex < 0)
                 dryIndex += historyLength;
@@ -163,6 +186,7 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                     case Mode::bypass: return dry;
                     case Mode::caseB:  return wetB;
                     case Mode::caseC:  return wetC;
+                    case Mode::caseF:  return wF;
                 }
                 return dry;
             };

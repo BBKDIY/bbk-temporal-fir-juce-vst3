@@ -92,14 +92,78 @@ constexpr int caseBDurationSamples = 18;
 constexpr double caseBWorstStopbandLevelDb = -105.94;
 constexpr int caseBGroupDelaySamples = firCentreIndex; // exactly 9, no pole
 
-// Latency reported to the host: the nearest integer to this design's own
-// near-flat group delay (~9.515 samples across the passband). The dry
-// (bypass) path is delayed by exactly this many samples so toggling
-// bypass never clicks.
+// Case F (19-tap joint passband/transition-optimized FIR) - a separate,
+// independently-optimized 19-tap Type-I linear-phase FIR supplied here as
+// a fixed, externally-verified coefficient set (not re-derived inside
+// this plugin, so the implementation being measured is exactly the same
+// numerical solution that produced the analytical result). It was
+// optimized at 192 kHz with the 0-20 kHz passband held within +/-0.1 dB
+// of a straight-line trajectory from 0 dB at DC to -0.5 dB at 20 kHz,
+// the 20-76 kHz transition band left completely unconstrained (the
+// optimizer chose the transition shape freely), and the 76-96 kHz
+// stopband held to approximately -98.1 dB. The objective was to minimize
+// the largest impulse-response sample outside the zero-crossing-bounded
+// main lobe relative to the centre tap. No pole, no oversampling, and no
+// coefficient renormalization beyond floating-point roundoff at the
+// 1e-12 level are applied here or at load time.
+inline const std::array<double, firTapCount>& caseFFirTaps()
+{
+    static const std::array<double, firTapCount> taps = { {
+         0.003155439812,
+         0.010428539232,
+         0.005651821553,
+        -0.014349256024,
+        -0.014349256024,
+        -0.002697321491,
+        -0.014349356024,
+         0.051673448469,
+         0.269888428340,
+         0.409895024314,
+         0.269888428340,
+         0.051673448469,
+        -0.014349356024,
+        -0.002697321491,
+        -0.014349256024,
+        -0.014349256024,
+         0.005651821553,
+         0.010428539232,
+         0.003155439812
+    } };
+    return taps;
+}
+
+// Verified metrics for the Case F coefficients above, reproduced
+// independently from the taps themselves (see
+// Tests/DSPTestDetachedPole.cpp) - nothing here is hardcoded from the
+// validation spec except the tolerances used to compare against it:
+// Rpeak=3.5007%, EZC=0.484%, duration=18 samples (full 19-tap span,
+// same convention as Case B), worst-case stopband ~-98.29 dB across
+// 76-96 kHz, exact group delay of (firTapCount-1)/2 = 9 samples (plain
+// linear-phase FIR, no pole), -0.50 dB droop at 20 kHz (built into the
+// FIR's own shape, not a pole stage), and a -3 dB point near 29.06 kHz.
+constexpr double caseFPeakSidelobePercent = 3.5007;
+constexpr double caseFTotalRingingEnergyPercent = 0.484;
+constexpr int caseFDurationSamples = 18;
+constexpr double caseFWorstStopbandLevelDb = -98.29;
+constexpr double caseFDroopDbAt20k = -0.50;
+constexpr int caseFGroupDelaySamples = firCentreIndex; // exactly 9, no pole
+constexpr double caseFMinus3dBHz = 29060.0;
+
+// Latency reported to the host: the nearest integer to Case C's own
+// near-flat group delay (~9.515 samples across the passband) - the same
+// figure used uniformly across all wet modes (Case B, Case C, Case F all
+// have an actual group delay within one sample of this value) so the
+// reported host latency never changes at runtime regardless of which
+// mode is selected. The dry (bypass) path is delayed by exactly this
+// many samples so toggling bypass never clicks.
 constexpr int latencySamples = 10;
 
 // History buffer length: must cover the FIR's own tap count (19) and the
 // dry-path delay (10), plus headroom. The pole's own state is tracked
-// separately (it is IIR, not part of this buffer).
+// separately (it is IIR, not part of this buffer). Case B, Case C and
+// Case F all read from this same shared input-sample history, but each
+// case's own wet output is computed independently every sample from its
+// own coefficients (and, for Case C only, its own separate pole state) -
+// no case ever reads another case's coefficients, pole state, or output.
 constexpr int historyLength = 32;
 }

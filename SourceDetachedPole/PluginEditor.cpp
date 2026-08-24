@@ -18,7 +18,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);
-    subtitle.setText ("A/B/C loopback comparator: Bypass vs Case B (FIR only) vs Case C (FIR + pole)",
+    subtitle.setText ("A/B/C/F loopback comparator: Bypass vs Case B (FIR only) vs Case C (FIR + pole) vs Case F (joint-optimized FIR)",
                        juce::dontSendNotification);
     addAndMakeVisible (subtitle);
 
@@ -31,6 +31,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     modeBox.addItem ("BYPASS", 1);
     modeBox.addItem ("CASE B - FIR only (19 taps)", 2);
     modeBox.addItem ("CASE C - FIR + 47 kHz pole", 3);
+    modeBox.addItem ("CASE F - Joint-optimized FIR (19 taps, no pole)", 4);
     modeBox.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (modeBox);
     modeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
@@ -94,7 +95,7 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     switch (mode)
     {
         case BBKDetachedPoleAudioProcessor::Mode::bypass:
-            text = "BYPASS: dry signal, delayed to match the other two modes (no filtering).";
+            text = "BYPASS: dry signal, delayed to match the other modes (no filtering).";
             break;
 
         case BBKDetachedPoleAudioProcessor::Mode::caseB:
@@ -114,6 +115,17 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
                  << "Worst stopband " << juce::String (worstStopbandLevelDb, 1) << " dB\n"
                  << "Droop at 20 kHz " << juce::String (passbandDroopDbAt20k, 2) << " dB   "
                  << "Mean group delay " << juce::String (groupDelaySamples, 3) << " samples (flat +/-0.002)";
+            break;
+
+        case BBKDetachedPoleAudioProcessor::Mode::caseF:
+            text << "CASE F - 19-tap joint passband/transition-optimized FIR (no pole):\n"
+                 << "Peak sidelobe " << juce::String (caseFPeakSidelobePercent, 4) << "%   "
+                 << "Total ringing energy " << juce::String (caseFTotalRingingEnergyPercent, 3) << "%\n"
+                 << "Duration " << caseFDurationSamples << " samples   "
+                 << "Worst stopband " << juce::String (caseFWorstStopbandLevelDb, 2) << " dB\n"
+                 << "Droop at 20 kHz " << juce::String (caseFDroopDbAt20k, 2) << " dB   "
+                 << "Group delay " << caseFGroupDelaySamples << " samples (exact, no pole)   "
+                 << "-3 dB near " << juce::String (caseFMinus3dBHz / 1000.0, 2) << " kHz";
             break;
     }
 
