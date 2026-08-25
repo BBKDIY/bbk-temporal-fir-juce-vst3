@@ -333,7 +333,7 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
             // always at maxHalfLength), so bypassing lines up
             // sample-for-sample with the filtered signal it is fading
             // against.
-            int dryIndex = state.writeIndex - latencySamples;
+            int dryIndex = state.writeIndex - bbk::detachedpole::latencySamples;
             if (dryIndex < 0) dryIndex += historyLength;
             const double dry = state.history[static_cast<std::size_t> (dryIndex)];
 
