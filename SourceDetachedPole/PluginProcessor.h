@@ -7,7 +7,7 @@
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
 
-// BBK Detached Pole: a single parametric constrained-least-squares FIR
+// BBK Black 19: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
 // controls - cutoff, attenuation at cutoff, and minimum stopband
 // rejection - are handed straight to bbk::parametric::designParametricFIR().
@@ -41,7 +41,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "BBK Detached Pole"; }
+    const juce::String getName() const override { return "BBK Black 19"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }

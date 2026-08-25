@@ -1,4 +1,4 @@
-// Framework-independent DSP verification for the BBK Detached Pole plugin.
+// Framework-independent DSP verification for the BBK Black 19 plugin.
 // Builds and runs with plain g++ (no JUCE dependency) so it can act as a
 // fast CI gate before the real MSVC/JUCE build.
 //

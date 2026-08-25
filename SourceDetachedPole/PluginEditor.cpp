@@ -22,7 +22,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     : AudioProcessorEditor (&p), processor (p)
 {
     prepareLabel (title, 22.0f, true);
-    title.setText ("BBK Detached Pole", juce::dontSendNotification);
+    title.setText ("BBK Black 19", juce::dontSendNotification);
     addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);

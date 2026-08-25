@@ -90,7 +90,7 @@ juce_add_plugin(BBKDetachedPole
     PLUGIN_MANUFACTURER_CODE Bbk1
     PLUGIN_CODE Dpol
     FORMATS VST3
-    PRODUCT_NAME "BBK Detached Pole"
+    PRODUCT_NAME "BBK Black 19"
     NEEDS_WEB_BROWSER FALSE
     NEEDS_CURL FALSE
 )
