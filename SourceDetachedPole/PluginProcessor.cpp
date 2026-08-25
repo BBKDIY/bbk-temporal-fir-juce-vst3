@@ -115,6 +115,7 @@ void BBKDetachedPoleAudioProcessor::redesignSynchronously (const bbk::parametric
         uiSnapshot.constraintsMet = result.constraintsMet;
         uiSnapshot.designAttempts = result.designAttempts;
         uiSnapshot.taps = result.taps;
+        uiSnapshot.temporal = result.temporal;
     }
 }
 
@@ -186,6 +187,7 @@ void BBKDetachedPoleAudioProcessor::run()
             uiSnapshot.constraintsMet = result.constraintsMet;
             uiSnapshot.designAttempts = result.designAttempts;
             uiSnapshot.taps = result.taps;
+            uiSnapshot.temporal = result.temporal;
         }
     }
 }

@@ -78,7 +78,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 480);
+    setSize (680, 510);
     startTimerHz (4);
     timerCallback();
 }
@@ -118,7 +118,7 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     sliderRow (stopbandLabel, stopbandSlider);
 
     area.removeFromTop (10);
-    metricsReadout.setBounds (area.removeFromTop (110));
+    metricsReadout.setBounds (area.removeFromTop (140));
 
     area.removeFromTop (8);
     coefficientsButton.setBounds (area.removeFromTop (26).removeFromLeft (200));
@@ -183,7 +183,11 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
          << juce::String (snap.stopbandRejectionDb, 1) << " dB min. stopband rejection\n"
          << "Achieved worst-case stopband level: " << juce::String (snap.achievedStopbandDb, 2) << " dB (Nyquist = "
          << juce::String (nyquist, 0) << " Hz)\n"
-         << "Design attempts (tap-count search): " << snap.designAttempts << "\n";
+         << "Design attempts (tap-count search): " << snap.designAttempts << "\n"
+         << "Temporal concentration (from the article's own metrics):\n"
+         << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "
+         << juce::String (snap.temporal.eZcPercent, 3) << "%  |  T_0.1% "
+         << juce::String (snap.temporal.settlingMs, 4) << " ms (" << snap.temporal.settlingSampleSpan << " samples)\n";
 
     if (snap.constraintsMet)
     {

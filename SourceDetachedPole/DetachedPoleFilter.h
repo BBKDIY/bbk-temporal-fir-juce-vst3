@@ -32,8 +32,20 @@ constexpr double defaultCutoffHz = 20000.0;
 constexpr double defaultAttenuationDb = 0.5;
 constexpr double defaultStopbandRejectionDb = 98.0;
 
-constexpr double minCutoffHz = 1000.0;
-constexpr double maxCutoffHz = 40000.0;
+// The slider's own range covers every supported sample rate's Nyquist
+// (up to 192 kHz -> 96 kHz), so the user can push the cutoff as high as
+// "half the sampling rate of the material" at whichever rate is
+// actually playing - trading passband extension for a more compact
+// impulse response, as the paper's own transition-width sweep predicts
+// (Section 2), rather than being capped at a fixed 40 kHz regardless of
+// how much headroom the current sample rate actually offers. The
+// engine (see PluginProcessor::specFromParameters) separately clamps
+// the *effective* cutoff to stay safely below the current sample
+// rate's real Nyquist, since the slider range itself cannot depend on
+// the sample rate in a JUCE APVTS parameter without breaking host
+// automation/state compatibility when the rate changes.
+constexpr double minCutoffHz = 10000.0;
+constexpr double maxCutoffHz = 96000.0;
 constexpr double minAttenuationDb = 0.0;
 constexpr double maxAttenuationDb = 3.0;
 constexpr double minStopbandRejectionDb = 40.0;

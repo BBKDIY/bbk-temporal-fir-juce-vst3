@@ -81,6 +81,13 @@ public:
         bool constraintsMet = false;
         int designAttempts = 0;
         std::vector<double> taps; // the actual (unpadded) symmetric taps
+
+        // Temporal-concentration metrics from the article ("Impulse-
+        // Response Ringing in Digital Reconstruction Filtering"), computed
+        // directly from the taps above by
+        // bbk::parametric::computeTemporalMetrics() - see ParametricFIR.h
+        // for exact definitions and the Case C reference validation.
+        bbk::parametric::TemporalMetrics temporal;
     };
     DesignSnapshot getDesignSnapshotForUI() const;
 
