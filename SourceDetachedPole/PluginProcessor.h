@@ -7,7 +7,7 @@
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
 
-// BBK Black 19: a single parametric constrained-least-squares FIR
+// BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
 // controls - cutoff, attenuation at cutoff, and minimum stopband
 // rejection - are handed straight to bbk::parametric::designParametricFIR().
@@ -41,7 +41,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "BBK Black 19"; }
+    const juce::String getName() const override { return "BBK Parametric FIR"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
@@ -57,6 +57,15 @@ public:
     void setStateInformation (const void* data, int sizeInBytes) override;
 
     juce::AudioProcessorValueTreeState& getAPVTS() noexcept { return parameters; }
+
+    // The host's actual current sample rate, updated unconditionally on
+    // every prepareToPlay() call - deliberately independent of whether a
+    // redesign happened, so the UI's sample-rate readout always reflects
+    // what the host just reported rather than lagging behind until the
+    // next completed design (see DesignSnapshot::sampleRateHz below,
+    // which is a different thing: the rate a specific *design* was run
+    // for, not necessarily the host's rate right now).
+    double getCurrentSampleRateForUI() const noexcept { return currentSampleRate.load(); }
 
     // A snapshot of the most recently completed design, safe to read from
     // the message thread at any time (used by the editor's metrics

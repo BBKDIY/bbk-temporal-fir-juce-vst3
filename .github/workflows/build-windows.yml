@@ -44,10 +44,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item $found1.FullName -Destination "dist/BBK Temporal FIR.vst3" -Recurse
 
-          $found2 = Get-ChildItem -Path build -Recurse -Filter "BBK Black 19.vst3" | Select-Object -First 1
-          if (-not $found2) { throw "BBK Black 19.vst3 not found under build/ - build likely failed." }
+          $found2 = Get-ChildItem -Path build -Recurse -Filter "BBK Parametric FIR.vst3" | Select-Object -First 1
+          if (-not $found2) { throw "BBK Parametric FIR.vst3 not found under build/ - build likely failed." }
           Write-Host "Found: $($found2.FullName)"
-          Copy-Item $found2.FullName -Destination "dist/BBK Black 19.vst3" -Recurse
+          Copy-Item $found2.FullName -Destination "dist/BBK Parametric FIR.vst3" -Recurse
 
       - name: Upload BBK Temporal FIR artifact
         uses: actions/upload-artifact@v4
@@ -55,11 +55,11 @@ jobs:
           name: BBK-TemporalFIR-Windows-VST3-JUCE-MSVC
           path: dist/BBK Temporal FIR.vst3
 
-      - name: Upload BBK Black 19 artifact
+      - name: Upload BBK Parametric FIR artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BBK-Black19-Windows-VST3-JUCE-MSVC
-          path: dist/BBK Black 19.vst3
+          name: BBK-ParametricFIR-Windows-VST3-JUCE-MSVC
+          path: dist/BBK Parametric FIR.vst3
 
       - name: Upload coefficient generation artifacts (sweep data / metrics)
         uses: actions/upload-artifact@v4

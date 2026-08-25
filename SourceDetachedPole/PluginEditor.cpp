@@ -22,7 +22,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     : AudioProcessorEditor (&p), processor (p)
 {
     prepareLabel (title, 22.0f, true);
-    title.setText ("BBK Black 19", juce::dontSendNotification);
+    title.setText ("BBK Parametric FIR", juce::dontSendNotification);
     addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);
@@ -148,7 +148,11 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 {
     const auto snap = processor.getDesignSnapshotForUI();
 
-    sampleRate.setText ("Sample rate: " + juce::String (snap.sampleRateHz, 0) + " Hz", juce::dontSendNotification);
+    // Read directly from the host, not from the design snapshot - the
+    // snapshot only updates when a redesign finishes, which lagged behind
+    // (or in some host round-trips, never actually reflected) the real
+    // current sample rate.
+    sampleRate.setText ("Sample rate: " + juce::String (processor.getCurrentSampleRateForUI(), 0) + " Hz", juce::dontSendNotification);
 
     if (snap.tapCount == 0)
     {
