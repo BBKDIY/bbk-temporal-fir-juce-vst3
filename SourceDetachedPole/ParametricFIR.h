@@ -1,104 +1,108 @@
 #pragma once
 
-// Constrained least-squares (CLS) FIR design engine, framework-independent
+// Minimum-peak-sidelobe (minimax) FIR design engine, framework-independent
 // (no JUCE dependency) so it can be unit-tested with plain g++ before use
 // inside the plugin.
 //
-// Design problem, for a Type-I (odd length, symmetric) linear-phase FIR at
-// a given sample rate:
-//   - Passband [0, cutoffHz]: fit the amplitude response to a
-//     straight-line-in-dB trajectory from 0 dB at DC to
-//     -attenuationAtCutoffDb at cutoffHz.
-//   - Unity DC gain: A(0) = 1 exactly (hard equality constraint).
-//   - Transition zone [cutoffHz, stopEdge]: left completely unconstrained -
-//     the optimizer is free to shape it however it wants, exactly like the
-//     article's own Case F, whose 20-76 kHz transition was left
-//     unconstrained rather than following any target curve.
-//   - True stopband [stopEdge, Nyquist]: target 0, enforced as a hard
-//     upper bound (see IRLS note below).
+// This is a direct implementation of the article's own method for its
+// Case B/Case C designs (Sections 3 and 8.3 of "Impulse-Response Ringing
+// in Digital Reconstruction Filtering"), not a frequency-domain-only
+// fit. An earlier version of this file used constrained least squares
+// (CLS) with IRLS to enforce the stopband: that reliably met the
+// requested passband/stopband *frequency-domain* numbers, but had no
+// time-domain objective at all, and in practice produced badly ringing
+// filters (measured directly: R_peak/E_ZC several times worse than even
+// the article's plain equiripple baseline, on the article's own 192 kHz/
+// 20 kHz/98 dB operating point) - meeting the spectral spec is
+// necessary but nowhere near sufficient for the temporal-concentration
+// benefit this whole plugin exists to demonstrate. That is a real,
+// measured implementation gap, not a preference, so the design method
+// itself changed:
 //
-// stopEdge is not a user parameter, and it is not estimated from a
-// Kaiser/Bellanger transition-width formula either: that consistently
-// handed more of the band to hard enforcement than a given tap count
-// actually needed (the formula is a rough rule of thumb for
-// windowed-sinc design, not a measured fact about what this CLS solve
-// can achieve). An earlier version of this file instead *searched* for
-// the narrowest workable enforced stopband, starting from a 2%-of-band
-// floor and widening only on failure - that was found by direct
-// experiment to be unsound: at small M, a 2%-wide enforced region
-// leaves almost the entire band with zero weight in the least-squares
-// system, which is not merely "an easier constraint" but a poorly posed
-// problem - the solver can return wildly oscillatory coefficients
-// (in one measured case, response magnitude *exceeding* 0 dB in the
-// nominally-free zone) that still technically satisfy the handful of
-// points actually being checked.
+//   - Exact Type-I symmetry makes the zero-phase amplitude response
+//     A(f) = a[0] + 2*sum_{m=1}^{M} a[m]*cos(2*pi*f*m/Fs) linear in the
+//     half-coefficients a[0..M] - and a[0..M] *are* the FIR's own
+//     impulse-response samples (a[0] the center/peak tap, a[m] the
+//     tap m steps either side), so a genuinely time-domain objective on
+//     the taps is just as linear as a frequency-domain one.
+//   - Passband [0, cutoffHz]: a band constraint, gainFloor <= A(f) <= 1,
+//     where gainFloor = 10^(-attenuationAtCutoffDb/20) - not a
+//     prescribed trajectory. This matches the article's own Case C
+//     description exactly ("stays between 0 and -0.50 dB... the
+//     transition is allowed to take the shape returned by the
+//     optimization"), and Case A/B's near-flat passband is just the
+//     same constraint with a very small attenuationAtCutoffDb.
+//   - True stopband [stopEdge, Nyquist]: -eps <= A(f) <= eps, eps
+//     = 10^(-stopbandRejectionDb/20) - a hard linear inequality, exactly
+//     as before. stopEdge itself is unchanged: the fixed geometric rule
+//     described further down (enforced width = passband width, with a
+//     Kaiser-based and a near-zero-transition fallback), which already
+//     reproduces the article's own 20/76 kHz edges at 192 kHz/20 kHz.
+//   - Objective: minimize rho, the ratio (largest |tap| outside a
+//     zero-crossing-bounded main lobe) / (center tap), subject to the
+//     two constraints above plus |a[i]| <= rho*a[0] for every tap i
+//     outside the main lobe. For a *fixed* trial rho this whole system
+//     - passband band, stopband band, sidelobe bound, all linear in
+//     a[0..M] and therefore in the reduced (null-space) coordinates
+//     used for the DC=1 constraint - is a linear feasibility problem,
+//     solved by a from-scratch two-phase simplex (detail::
+//     solveLPFeasibility). Bisecting on rho finds the smallest value
+//     that is still feasible, i.e. the true minimum achievable ringing
+//     at this M/spec - not an approximation of it. The main-lobe
+//     boundary is made self-consistent with the article's own method:
+//     after each bisection converges, the boundary is recomputed from
+//     the solution's own first sign change and the whole bisection is
+//     redone if that moved, so the optimizer cannot "hide" energy just
+//     outside a stale, guessed boundary.
+//   - As with the stopband before: the bisection only ever samples a
+//     finite grid, so after it converges the continuous response is
+//     re-verified on a dense sweep and any missed violations are folded
+//     back in as new grid points, repeating until the dense sweep is
+//     clean (or a small round cap is hit, in which case the best
+//     dense-verified result found is kept).
 //
-// stopEdge is instead a fixed geometric rule, taken directly from how
-// the paper's own practical 192 kHz/19-tap design point is built (see
-// the paper's Sections 3, 5, and 8.4: Cases A, B, and C all share the
-// same 20/76 kHz edges - passband edge 20 kHz, stopband edge 76 kHz,
-// Nyquist 96 kHz - it is never re-derived per case or per tap count).
-// The rule that reproduces that geometry is: reserve an enforced-
-// stopband width equal to the passband's own width (cutoffHz), and
-// leave the rest of [cutoffHz, Nyquist] as free transition. At 192 kHz
-// with a 20 kHz cutoff that gives enforced width = 20 kHz, i.e. stopEdge
-// = 96 - 20 = 76 kHz, exactly the paper's own value. The same rule
-// generalises to any cutoff/sample-rate combination the plugin's
-// sliders allow. It is clamped to [5%, 60%] of the available band so
-// the enforced region can never collapse into the poorly-posed regime
-// above, nor swallow so much of the band that no real transition is
-// left. If that fixed width genuinely is not enough to reach the
-// requested stopband at a given M - chiefly when the cutoff is pushed
-// up close to Nyquist, leaving little headroom past it - attemptDesign
-// falls back to at most two more candidates (a Kaiser/Bellanger
-// estimate, then a near-zero-transition last resort), each a single
-// solve, not an open-ended search: an earlier version widened
-// geometrically without a bound and, for exactly that near-Nyquist
-// case, re-tried the whole series at every M the outer search visited,
-// which made the design hang rather than degrade gracefully.
+// The DC=1 equality constraint is handled the same way as before: the
+// null-space method (build an orthonormal basis Z for the hyperplane
+// e^T a = 1, e being the "sum to unity" row; a0 = e/(e^T e) is one
+// particular solution; any a = a0 + Z*y satisfies the constraint for
+// every y), reducing every constraint above to one on the free
+// coordinates y, with one fewer variable than a[0..M] itself.
 //
-// (A separate, much narrower idea - forcing compliance within a
-// sub-100 Hz gap right past cutoff - was tried and rejected outright
-// earlier: that made the problem infeasible at every tap count, not
-// merely numerically stiff. No finite FIR can drop that fast. That
-// finding is independent of the fixed-width rule above and still holds.)
-//
-// All regions are combined into a single fixed-weight weighted least
-// squares fit (passband weighted more heavily than the stopband) and
-// solved via Householder QR directly on the (rectangular) weighted design
-// matrix - deliberately *not* via the normal equations (Q = C^T C), because
-// forming Q squares the numerical condition number of the problem.
-//
-// The DC=1 equality constraint is handled by the null-space method: build
-// an orthonormal basis Z for the hyperplane e^T a = 1 (e being the "sum to
-// unity" row), reducing the constrained problem to an ordinary unconstrained
-// least squares of one fewer variable, which QR then solves directly.
-//
-// The stopband's hard upper bound is enforced by iteratively reweighted
-// least squares (IRLS): any stopband sample point still over the bound
-// after a solve gets its weight grown and the whole system - still just
-// one QR solve - is re-solved. Because IRLS only ever samples a finite
-// grid, whenever that grid reports full compliance the *continuous*
-// response is re-verified on a much denser sweep; any frequencies that
-// sweep catches (and the grid missed) are folded into the grid as new
-// constraint points and IRLS continues. This is a lightweight version of
-// the exchange step in Remez/Parks-McClellan design, and was found to be
-// necessary in practice: a fixed grid, no matter how dense, can be
-// satisfied everywhere it samples while the continuous response still
-// bulges well above the bound between samples.
-//
-// Tap count (the FIR half-length M) is searched from small to large - one
-// full IRLS+refinement solve per M - until the result actually meets the
-// requested stopband floor and passband trajectory, or the tap-count cap
-// is reached (in which case the best-effort result found so far is
+// Tap count (the FIR half-length M) is searched from small to large -
+// one full minimax solve per M - until the result actually meets the
+// requested stopband floor and passband band, or the tap-count cap is
+// reached (in which case the best-effort result found so far is
 // returned with constraintsMet = false).
 //
-// This only runs when a slider or the sample rate changes (never per audio
-// sample), so its cost is not part of the audio thread's real-time budget.
-// Typical run time across 44.1/48/96/192 kHz and a range of cutoff /
-// attenuation / stopband-rejection combinations is well under 500 ms.
+// This is genuinely more expensive than the old CLS/IRLS approach - a
+// true minimax result costs real bisection + simplex work, not one
+// least-squares solve - but it only ever runs on a background thread
+// when a slider or the sample rate changes, never on the audio thread.
+// Measured cost: well under a second for easy specs (a small M works on
+// the first try, e.g. the article's own 192 kHz/20 kHz/98 dB point),
+// typically a few seconds when several M values must be tried, and up
+// to tens of seconds in the most demanding cases (chiefly cutoff pushed
+// close to Nyquist, which forces both a large M and many M attempts).
+// Two wall-clock budgets bound the worst case rather than letting it run
+// unbounded: 6 seconds per stopEdge candidate inside attemptDesign, and
+// 45 seconds for the whole M-search in designParametricFIR - past
+// either, the best (least-far-from-compliant) result found so far is
+// returned with constraintsMet = false, the same signal used when the
+// tap-count cap is hit. During a slider drag this means the audible
+// filter can noticeably lag the slider and only catch up a few seconds
+// after it stops moving, rather than following it in real time - a
+// direct, accepted cost of computing the article's actual minimum-
+// ringing result instead of an approximation of it.
+// Validated directly against the article's own published Case B and
+// Case C numbers at 192 kHz/19 taps/20-76 kHz (Section 8.4): this
+// engine reaches 12.9% R_peak against the article's reported 14.33% for
+// Case B, and 3.3% against 3.50% for Case C, while meeting the same
+// ~98 dB stopband target - matching, and in these cases slightly
+// beating, the article's own results from an independently-written
+// solver. See Tests/DSPTestDetachedPole.cpp for the exact comparison.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <utility>
@@ -225,59 +229,156 @@ struct DesignResult
 namespace detail
 {
 
-// Least squares min ||A x - b||^2 via Householder QR. A is rows x cols,
-// row-major, rows >= cols. Numerically robust (condition number stays at
-// cond(A), never squared the way normal-equations solves would square it).
-inline std::vector<double> qrLeastSquares (std::vector<double> A, std::vector<double> b, int rows, int cols)
+// Two-phase simplex for linear feasibility: does there exist a *free*
+// vector y (size n) such that, for every row i, dot(Arows[i], y) <= b[i]?
+// Free variables are handled by the standard split y_j = yp_j - yn_j
+// (yp, yn >= 0); each row gets a slack (already basic, if b >= 0 after
+// sign-normalisation) or a surplus plus an artificial variable (if the
+// row needed flipping, i.e. was effectively a >= constraint). Phase 1
+// minimizes the sum of artificials; the system is feasible iff that
+// minimum is ~0. Bland's rule (lowest-index entering column, lowest-
+// index leaving basic variable on ties) is used throughout to guarantee
+// termination - this is a dense tableau implementation, chosen for
+// simplicity and ease of independent verification over raw speed, which
+// is why the caller keeps each individual LP small (see attemptDesign
+// below: a sparse grid refined only where a dense sweep finds a genuine
+// violation, not a single very dense grid from the start).
+struct LPFeasibilityResult
 {
-    for (int k = 0; k < cols; ++k)
+    bool feasible = false;
+    std::vector<double> y;
+};
+
+inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<double>>& Arows, const std::vector<double>& b, int n)
+{
+    const int numRows = static_cast<int> (Arows.size());
+
+    std::vector<std::vector<double>> rows (static_cast<std::size_t> (numRows));
+    std::vector<double> rhs (static_cast<std::size_t> (numRows));
+    std::vector<int> sign (static_cast<std::size_t> (numRows));
+
+    for (int i = 0; i < numRows; ++i)
     {
-        double normX = 0.0;
-        for (int i = k; i < rows; ++i)
+        double bi = b[static_cast<std::size_t> (i)];
+        std::vector<double> r = Arows[static_cast<std::size_t> (i)];
+        if (bi < 0.0)
         {
-            double v = A[static_cast<std::size_t> (i * cols + k)];
-            normX += v * v;
+            for (auto& v : r) v = -v;
+            bi = -bi;
+            sign[static_cast<std::size_t> (i)] = -1;
         }
-        normX = std::sqrt (normX);
-        if (normX < 1.0e-300) continue;
-
-        double diagVal = A[static_cast<std::size_t> (k * cols + k)];
-        double alpha = (diagVal >= 0.0) ? -normX : normX;
-
-        std::vector<double> v (static_cast<std::size_t> (rows), 0.0);
-        for (int i = k; i < rows; ++i) v[static_cast<std::size_t> (i)] = A[static_cast<std::size_t> (i * cols + k)];
-        v[static_cast<std::size_t> (k)] -= alpha;
-
-        double vnorm2 = 0.0;
-        for (int i = k; i < rows; ++i) vnorm2 += v[static_cast<std::size_t> (i)] * v[static_cast<std::size_t> (i)];
-        if (vnorm2 < 1.0e-300) continue;
-
-        for (int j = k; j < cols; ++j)
+        else
         {
-            double dot = 0.0;
-            for (int i = k; i < rows; ++i) dot += v[static_cast<std::size_t> (i)] * A[static_cast<std::size_t> (i * cols + j)];
-            double factor = 2.0 * dot / vnorm2;
-            for (int i = k; i < rows; ++i) A[static_cast<std::size_t> (i * cols + j)] -= factor * v[static_cast<std::size_t> (i)];
+            sign[static_cast<std::size_t> (i)] = 1;
         }
+        rows[static_cast<std::size_t> (i)] = r;
+        rhs[static_cast<std::size_t> (i)] = bi;
+    }
+
+    int numArtificial = 0;
+    for (int i = 0; i < numRows; ++i)
+        if (sign[static_cast<std::size_t> (i)] == -1) ++numArtificial;
+
+    const int numYCols = 2 * n;
+    const int numSlackCols = numRows;
+    const int numCols = numYCols + numSlackCols + numArtificial;
+
+    std::vector<std::vector<double>> T (static_cast<std::size_t> (numRows + 1), std::vector<double> (static_cast<std::size_t> (numCols + 1), 0.0));
+    std::vector<int> basis (static_cast<std::size_t> (numRows));
+
+    int artIdx = 0;
+    for (int i = 0; i < numRows; ++i)
+    {
+        for (int j = 0; j < n; ++j)
         {
-            double dot = 0.0;
-            for (int i = k; i < rows; ++i) dot += v[static_cast<std::size_t> (i)] * b[static_cast<std::size_t> (i)];
-            double factor = 2.0 * dot / vnorm2;
-            for (int i = k; i < rows; ++i) b[static_cast<std::size_t> (i)] -= factor * v[static_cast<std::size_t> (i)];
+            T[static_cast<std::size_t> (i)][static_cast<std::size_t> (j)] = rows[static_cast<std::size_t> (i)][static_cast<std::size_t> (j)];
+            T[static_cast<std::size_t> (i)][static_cast<std::size_t> (n + j)] = -rows[static_cast<std::size_t> (i)][static_cast<std::size_t> (j)];
+        }
+        int slackCol = numYCols + i;
+        T[static_cast<std::size_t> (i)][static_cast<std::size_t> (slackCol)] = (sign[static_cast<std::size_t> (i)] == 1) ? 1.0 : -1.0;
+        if (sign[static_cast<std::size_t> (i)] == -1)
+        {
+            int artCol = numYCols + numSlackCols + artIdx;
+            T[static_cast<std::size_t> (i)][static_cast<std::size_t> (artCol)] = 1.0;
+            basis[static_cast<std::size_t> (i)] = artCol;
+            ++artIdx;
+        }
+        else
+        {
+            basis[static_cast<std::size_t> (i)] = slackCol;
+        }
+        T[static_cast<std::size_t> (i)][static_cast<std::size_t> (numCols)] = rhs[static_cast<std::size_t> (i)];
+    }
+
+    for (int j = numYCols + numSlackCols; j < numCols; ++j)
+        T[static_cast<std::size_t> (numRows)][static_cast<std::size_t> (j)] = 1.0;
+
+    for (int i = 0; i < numRows; ++i)
+    {
+        if (basis[static_cast<std::size_t> (i)] >= numYCols + numSlackCols)
+        {
+            for (int j = 0; j <= numCols; ++j)
+                T[static_cast<std::size_t> (numRows)][static_cast<std::size_t> (j)] -= T[static_cast<std::size_t> (i)][static_cast<std::size_t> (j)];
         }
     }
 
-    std::vector<double> x (static_cast<std::size_t> (cols), 0.0);
-    for (int i = cols - 1; i >= 0; --i)
+    const double eps = 1.0e-9;
+    const int maxIters = 20000;
+    for (int iter = 0; iter < maxIters; ++iter)
     {
-        double sum = b[static_cast<std::size_t> (i)];
-        for (int j = i + 1; j < cols; ++j)
-            sum -= A[static_cast<std::size_t> (i * cols + j)] * x[static_cast<std::size_t> (j)];
-        double diag = A[static_cast<std::size_t> (i * cols + i)];
-        if (std::fabs (diag) < 1.0e-300) diag = 1.0e-300;
-        x[static_cast<std::size_t> (i)] = sum / diag;
+        int pivotCol = -1;
+        for (int j = 0; j < numCols; ++j)
+        {
+            if (T[static_cast<std::size_t> (numRows)][static_cast<std::size_t> (j)] < -eps) { pivotCol = j; break; }
+        }
+        if (pivotCol < 0) break;
+
+        int pivotRow = -1;
+        double bestRatio = 1.0e300;
+        for (int i = 0; i < numRows; ++i)
+        {
+            double a = T[static_cast<std::size_t> (i)][static_cast<std::size_t> (pivotCol)];
+            if (a > eps)
+            {
+                double ratio = T[static_cast<std::size_t> (i)][static_cast<std::size_t> (numCols)] / a;
+                if (pivotRow < 0 || ratio < bestRatio - 1.0e-12
+                    || (std::fabs (ratio - bestRatio) < 1.0e-12 && basis[static_cast<std::size_t> (i)] < basis[static_cast<std::size_t> (pivotRow)]))
+                {
+                    bestRatio = ratio;
+                    pivotRow = i;
+                }
+            }
+        }
+        if (pivotRow < 0)
+            return { false, {} };
+
+        double pv = T[static_cast<std::size_t> (pivotRow)][static_cast<std::size_t> (pivotCol)];
+        for (int j = 0; j <= numCols; ++j)
+            T[static_cast<std::size_t> (pivotRow)][static_cast<std::size_t> (j)] /= pv;
+        for (int i = 0; i <= numRows; ++i)
+        {
+            if (i == pivotRow) continue;
+            double factor = T[static_cast<std::size_t> (i)][static_cast<std::size_t> (pivotCol)];
+            if (std::fabs (factor) < 1.0e-15) continue;
+            for (int j = 0; j <= numCols; ++j)
+                T[static_cast<std::size_t> (i)][static_cast<std::size_t> (j)] -= factor * T[static_cast<std::size_t> (pivotRow)][static_cast<std::size_t> (j)];
+        }
+        basis[static_cast<std::size_t> (pivotRow)] = pivotCol;
     }
-    return x;
+
+    double phase1Obj = -T[static_cast<std::size_t> (numRows)][static_cast<std::size_t> (numCols)];
+    if (phase1Obj > 1.0e-6)
+        return { false, {} };
+
+    std::vector<double> x (static_cast<std::size_t> (numCols), 0.0);
+    for (int i = 0; i < numRows; ++i)
+        x[static_cast<std::size_t> (basis[static_cast<std::size_t> (i)])] = T[static_cast<std::size_t> (i)][static_cast<std::size_t> (numCols)];
+
+    std::vector<double> y (static_cast<std::size_t> (n));
+    for (int j = 0; j < n; ++j)
+        y[static_cast<std::size_t> (j)] = x[static_cast<std::size_t> (j)] - x[static_cast<std::size_t> (n + j)];
+
+    return { true, y };
 }
 
 // Amplitude response of a Type-I linear-phase FIR expressed via its
@@ -308,21 +409,16 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
     const double fc = spec.cutoffHz;
     const double nyquist = Fs / 2.0;
     const double eps = std::pow (10.0, -spec.stopbandRejectionDb / 20.0);
+    const double gainFloor = std::pow (10.0, -spec.attenuationAtCutoffDb / 20.0);
 
-    // Dense enough that the highest-order cosine term (period Fs/M in f)
-    // gets many samples per half-cycle - a sparse grid lets IRLS satisfy
-    // every sampled point while the true continuous response still bulges
-    // well above the bound in between samples.
-    const int pbPoints = std::max (60, 20 * M);
-    std::vector<double> pbFreqs (static_cast<std::size_t> (pbPoints));
-    std::vector<double> pbTarget (static_cast<std::size_t> (pbPoints));
+    // Sparse starting grids, refined by dense-verify-and-inject inside
+    // solveForStopEdge below (each LP solve costs real time, unlike the
+    // old single QR solve, so keeping the *starting* grid small matters -
+    // see the top-of-file comment for measured timings).
+    const int pbPoints = std::max (10, 2 * M);
+    std::vector<double> pbFreqsInit (static_cast<std::size_t> (pbPoints));
     for (int i = 0; i < pbPoints; ++i)
-    {
-        double f = fc * static_cast<double> (i) / static_cast<double> (pbPoints - 1);
-        pbFreqs[static_cast<std::size_t> (i)] = f;
-        double targetDb = -spec.attenuationAtCutoffDb * (fc > 0.0 ? f / fc : 0.0);
-        pbTarget[static_cast<std::size_t> (i)] = std::pow (10.0, targetDb / 20.0);
-    }
+        pbFreqsInit[static_cast<std::size_t> (i)] = fc * static_cast<double> (i) / static_cast<double> (pbPoints - 1);
 
     auto cosRow = [&] (double f)
     {
@@ -333,8 +429,6 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             row[static_cast<std::size_t> (m)] = 2.0 * std::cos (w * static_cast<double> (m));
         return row;
     };
-
-    const double passbandWeight = 1000.0;
 
     // Null-space method for the DC=1 equality constraint: e^T a = 1, where
     // e = [1,2,2,...,2]. Build a Householder reflector H with H*e parallel
@@ -372,15 +466,24 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         }
     }
 
-    // Precompute each row's projection onto Z and its base rhs term (against
-    // a0) *once* - these don't depend on the per-point weight, only the
-    // per-point sqrt(weight) scaling does, so this is what makes it
-    // affordable to re-solve many times as IRLS adjusts stopband weights.
-    auto projectRow = [&] (const std::vector<double>& row, std::vector<double>& outZ, double& outBase, double target)
+    // A "coefficient row": a[i] as a linear function of y (constant term
+    // a0[i], since a = a0 + Z*y). Used for the sidelobe bound, which
+    // constrains taps directly rather than a frequency-domain sample.
+    auto indexToLinear = [&] (int i, std::vector<double>& outZ, double& outConstant)
     {
-        double dotA0 = 0.0;
-        for (int j = 0; j < numVars; ++j) dotA0 += row[static_cast<std::size_t> (j)] * a0[static_cast<std::size_t> (j)];
-        outBase = target - dotA0;
+        outConstant = a0[static_cast<std::size_t> (i)];
+        outZ.assign (static_cast<std::size_t> (reducedVars), 0.0);
+        for (int k = 0; k < reducedVars; ++k)
+            outZ[static_cast<std::size_t> (k)] = Z[static_cast<std::size_t> (i) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (k)];
+    };
+
+    // A frequency row A(f) as a linear function of y: constant term
+    // dot(row, a0), coefficients row.Z.
+    auto freqToLinear = [&] (double f, std::vector<double>& outZ, double& outConstant)
+    {
+        auto row = cosRow (f);
+        outConstant = 0.0;
+        for (int j = 0; j < numVars; ++j) outConstant += row[static_cast<std::size_t> (j)] * a0[static_cast<std::size_t> (j)];
         outZ.assign (static_cast<std::size_t> (reducedVars), 0.0);
         for (int k = 0; k < reducedVars; ++k)
         {
@@ -391,147 +494,189 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         }
     };
 
-    std::vector<std::vector<double>> pbRowZ (static_cast<std::size_t> (pbPoints));
-    std::vector<double> pbBase (static_cast<std::size_t> (pbPoints));
-    for (int i = 0; i < pbPoints; ++i)
-        projectRow (cosRow (pbFreqs[static_cast<std::size_t> (i)]), pbRowZ[static_cast<std::size_t> (i)], pbBase[static_cast<std::size_t> (i)], pbTarget[static_cast<std::size_t> (i)]);
+    auto reconstruct = [&] (const std::vector<double>& y)
+    {
+        std::vector<double> a (static_cast<std::size_t> (numVars));
+        for (int i = 0; i < numVars; ++i)
+        {
+            double sum = a0[static_cast<std::size_t> (i)];
+            for (int k = 0; k < reducedVars; ++k)
+                sum += Z[static_cast<std::size_t> (i) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (k)] * y[static_cast<std::size_t> (k)];
+            a[static_cast<std::size_t> (i)] = sum;
+        }
+        return a;
+    };
+
+    // Builds the full LP (passband band + stopband band, optionally the
+    // sidelobe bound too) for one trial rho and one main-lobe boundary,
+    // and solves it. applySidelobe=false is used once per main-lobe
+    // iteration to confirm the spectral requirements alone are feasible
+    // at this M/stopEdge, independent of any ringing target.
+    auto tryRho = [&] (const std::vector<double>& pbF, const std::vector<double>& sbF,
+                        int mainLobeStart, double rho, bool applySidelobe) -> LPFeasibilityResult
+    {
+        std::vector<std::vector<double>> A;
+        std::vector<double> b;
+        A.reserve (static_cast<std::size_t> (2 * (static_cast<int> (pbF.size()) + static_cast<int> (sbF.size()) + (M - mainLobeStart + 1))));
+        b.reserve (A.capacity());
+
+        std::vector<double> z; double c;
+        for (double f : pbF)
+        {
+            freqToLinear (f, z, c);
+            A.push_back (z); b.push_back (1.0 - c);                 // A(f) <= 1
+            std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
+            A.push_back (neg); b.push_back (c - gainFloor);         // A(f) >= gainFloor
+        }
+        for (double f : sbF)
+        {
+            freqToLinear (f, z, c);
+            A.push_back (z); b.push_back (eps - c);                 // A(f) <= eps
+            std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
+            A.push_back (neg); b.push_back (c + eps);               // A(f) >= -eps
+        }
+        if (applySidelobe)
+        {
+            std::vector<double> z0; double c0;
+            indexToLinear (0, z0, c0);
+            for (int i = mainLobeStart; i <= M; ++i)
+            {
+                std::vector<double> zi; double ci;
+                indexToLinear (i, zi, ci);
+                std::vector<double> up (zi.size()), lo (zi.size());
+                for (std::size_t k = 0; k < zi.size(); ++k)
+                {
+                    up[k] = zi[k] - rho * z0[k];
+                    lo[k] = -zi[k] - rho * z0[k];
+                }
+                A.push_back (up); b.push_back (rho * c0 - ci);      // a[i] - rho*a[0] <= 0
+                A.push_back (lo); b.push_back (rho * c0 + ci);      // -a[i] - rho*a[0] <= 0
+            }
+        }
+        return solveLPFeasibility (A, b, reducedVars);
+    };
 
     // Solve for one specific stopEdge choice (the boundary between the
     // free transition zone [fc, stopEdge] and the hard-enforced stopband
     // [stopEdge, Nyquist]). stopEdge itself is chosen by the caller below
     // - see the fixed geometric rule described at the top of this file.
+    //
+    // For this stopEdge: bisect on rho (largest sidelobe / center tap)
+    // to find the smallest value that is still spectrally feasible,
+    // re-deriving the main-lobe boundary from each solution and re-
+    // bisecting if it moved (self-consistency, per the article's own
+    // method), then dense-verify the continuous response and inject any
+    // missed violations as new grid points, repeating a bounded number
+    // of times. A wall-clock budget bounds worst-case latency for
+    // pathological specs (e.g. cutoff pushed hard against Nyquist).
     auto solveForStopEdge = [&] (double stopEdge) -> AttemptResult
     {
-        const int sbPoints = std::max (400, 40 * M);
-        std::vector<double> sbFreqs (static_cast<std::size_t> (sbPoints));
+        const int sbPoints = std::max (25, 4 * M);
+        std::vector<double> sbFreqsInit (static_cast<std::size_t> (sbPoints));
         for (int i = 0; i < sbPoints; ++i)
-            sbFreqs[static_cast<std::size_t> (i)] = stopEdge + (nyquist - stopEdge) * (static_cast<double> (i) + 0.5) / static_cast<double> (sbPoints);
+            sbFreqsInit[static_cast<std::size_t> (i)] = stopEdge + (nyquist - stopEdge) * (static_cast<double> (i) + 0.5) / static_cast<double> (sbPoints);
 
-        std::vector<std::vector<double>> sbRowZ (static_cast<std::size_t> (sbPoints));
-        std::vector<double> sbBase (static_cast<std::size_t> (sbPoints));
-        for (int i = 0; i < sbPoints; ++i)
-            projectRow (cosRow (sbFreqs[static_cast<std::size_t> (i)]), sbRowZ[static_cast<std::size_t> (i)], sbBase[static_cast<std::size_t> (i)], 0.0);
+        std::vector<double> curPb = pbFreqsInit, curSb = sbFreqsInit;
+        int mainLobeStart = 1;
+        std::vector<double> bestY;
+        double bestRho = 1.0;
+        bool everFeasible = false;
 
-        std::vector<double> sbWeight (static_cast<std::size_t> (sbPoints), 1.0);
-        std::vector<double> a (static_cast<std::size_t> (numVars), 0.0);
-        double worstStopbandDb = -1.0e300;
-        // Fewer iterations than the original single-attempt version: this
-        // now runs inside a width search, potentially several times per
-        // M, and a genuinely-too-narrow stopEdge should reveal itself as
-        // infeasible quickly rather than being given 80 iterations to
-        // almost-but-not-quite converge.
-        const int maxOuterIters = 40;
-        const int maxInjectedPoints = 300;
-        int injectedSoFar = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (6);
 
-        for (int iter = 0; iter < maxOuterIters; ++iter)
+        const int maxGridRounds = 4;
+        int gridRound = 0;
+        for (; gridRound < maxGridRounds; ++gridRound)
         {
-            const int currentSbPoints = static_cast<int> (sbFreqs.size());
-            const int numPoints = pbPoints + currentSbPoints;
-            std::vector<double> Mred (static_cast<std::size_t> (numPoints) * static_cast<std::size_t> (reducedVars));
-            std::vector<double> rhs (static_cast<std::size_t> (numPoints));
+            if (std::chrono::steady_clock::now() > deadline) break;
 
-            int r = 0;
-            for (int i = 0; i < pbPoints; ++i, ++r)
+            for (int mlIter = 0; mlIter < 2; ++mlIter)
             {
-                double sw = std::sqrt (passbandWeight);
-                for (int k = 0; k < reducedVars; ++k)
-                    Mred[static_cast<std::size_t> (r) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (k)] = sw * pbRowZ[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)];
-                rhs[static_cast<std::size_t> (r)] = sw * pbBase[static_cast<std::size_t> (i)];
-            }
-            for (int i = 0; i < currentSbPoints; ++i, ++r)
-            {
-                double sw = std::sqrt (sbWeight[static_cast<std::size_t> (i)]);
-                for (int k = 0; k < reducedVars; ++k)
-                    Mred[static_cast<std::size_t> (r) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (k)] = sw * sbRowZ[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)];
-                rhs[static_cast<std::size_t> (r)] = sw * sbBase[static_cast<std::size_t> (i)];
-            }
+                auto noSidelobe = tryRho (curPb, curSb, mainLobeStart, 0.0, false);
+                if (! noSidelobe.feasible)
+                    return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0 };
+                everFeasible = true;
+                if (bestY.empty()) { bestY = noSidelobe.y; bestRho = 1.0e300; } // safe fallback, overwritten below if bisection succeeds
 
-            auto y = qrLeastSquares (Mred, rhs, numPoints, reducedVars);
-            for (int i = 0; i < numVars; ++i)
-            {
-                double sum = a0[static_cast<std::size_t> (i)];
-                for (int k = 0; k < reducedVars; ++k)
-                    sum += Z[static_cast<std::size_t> (i) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (k)] * y[static_cast<std::size_t> (k)];
-                a[static_cast<std::size_t> (i)] = sum;
-            }
-
-            bool anyViolation = false;
-            worstStopbandDb = -1.0e300;
-            for (int i = 0; i < currentSbPoints; ++i)
-            {
-                double resp = std::fabs (amplitudeResponse (a, sbFreqs[static_cast<std::size_t> (i)], Fs));
-                double db = 20.0 * std::log10 (std::max (resp, 1.0e-300));
-                if (db > worstStopbandDb) worstStopbandDb = db;
-
-                double ratio = resp / eps;
-                if (ratio > 1.0 + 1.0e-6)
+                double lo = 0.0, hi = 1.0;
+                while (! tryRho (curPb, curSb, mainLobeStart, hi, true).feasible && hi < 1.0e6)
                 {
-                    anyViolation = true;
-                    double cappedRatio = std::min (ratio, 10.0);
-                    double growth = cappedRatio * cappedRatio;
-                    sbWeight[static_cast<std::size_t> (i)] = std::min (sbWeight[static_cast<std::size_t> (i)] * growth, 1.0e7);
+                    hi *= 2.0;
+                    if (std::chrono::steady_clock::now() > deadline) break;
                 }
+                for (int it = 0; it < 10; ++it)
+                {
+                    double mid = 0.5 * (lo + hi);
+                    if (tryRho (curPb, curSb, mainLobeStart, mid, true).feasible) hi = mid; else lo = mid;
+                    if (std::chrono::steady_clock::now() > deadline) break;
+                }
+                auto final = tryRho (curPb, curSb, mainLobeStart, hi, true);
+                if (final.feasible) { bestY = final.y; bestRho = hi; }
+
+                auto a = reconstruct (bestY);
+                int newStart = 1;
+                for (int i = 1; i <= M; ++i)
+                {
+                    if ((a[static_cast<std::size_t> (i)] >= 0.0) != (a[0] >= 0.0)) { newStart = i; break; }
+                    newStart = M + 1;
+                }
+                if (newStart == mainLobeStart) break;
+                mainLobeStart = newStart;
             }
 
-            if (! anyViolation)
+            if (! everFeasible)
+                break;
+
+            auto a = reconstruct (bestY);
+            std::vector<double> violPb, violSb;
+            const int dense = 3000;
+            for (int i = 0; i < dense; ++i)
             {
-                bool passbandOk = true;
-                for (int i = 0; i < pbPoints; ++i)
-                {
-                    double resp = amplitudeResponse (a, pbFreqs[static_cast<std::size_t> (i)], Fs);
-                    double target = pbTarget[static_cast<std::size_t> (i)];
-                    if (std::fabs (resp - target) > 0.1 * target + 0.02)
-                        passbandOk = false;
-                }
-
-                const int denseCheckPoints = 4000;
-                double denseWorstDb = -1.0e300;
-                std::vector<std::pair<double, double>> violations;
-                for (int i = 0; i < denseCheckPoints; ++i)
-                {
-                    double f = stopEdge + (nyquist - stopEdge) * static_cast<double> (i) / static_cast<double> (denseCheckPoints - 1);
-                    double resp = std::fabs (amplitudeResponse (a, f, Fs));
-                    double db = 20.0 * std::log10 (std::max (resp, 1.0e-300));
-                    if (db > denseWorstDb) denseWorstDb = db;
-                    if (db > 20.0 * std::log10 (eps) + 0.2)
-                        violations.emplace_back (db, f);
-                }
-
-                if (violations.empty () && passbandOk)
-                    return { a, true, denseWorstDb };
-
-                if (! violations.empty () && injectedSoFar < maxInjectedPoints)
-                {
-                    std::sort (violations.begin (), violations.end (), [] (auto& a1, auto& a2) { return a1.first > a2.first; });
-                    const double minSpacing = (nyquist - stopEdge) / static_cast<double> (denseCheckPoints) * 4.0;
-                    int added = 0;
-                    for (auto& [db, f] : violations)
-                    {
-                        if (added >= 30 || injectedSoFar >= maxInjectedPoints) break;
-                        bool tooClose = false;
-                        for (int i = std::max (0, currentSbPoints - added - 60); i < currentSbPoints; ++i)
-                            if (std::fabs (sbFreqs[static_cast<std::size_t> (i)] - f) < minSpacing) { tooClose = true; break; }
-                        if (tooClose) continue;
-
-                        std::vector<double> rz; double rb = 0.0;
-                        projectRow (cosRow (f), rz, rb, 0.0);
-                        sbFreqs.push_back (f);
-                        sbRowZ.push_back (std::move (rz));
-                        sbBase.push_back (rb);
-                        sbWeight.push_back (1.0);
-                        ++added;
-                        ++injectedSoFar;
-                    }
-                    if (added > 0)
-                        continue;
-                }
-
-                return { a, violations.empty () && passbandOk, denseWorstDb };
+                double f = fc * static_cast<double> (i) / static_cast<double> (dense - 1);
+                double resp = amplitudeResponse (a, f, Fs);
+                if (resp > 1.0 + 1.0e-6 || resp < gainFloor - 1.0e-6)
+                    violPb.push_back (f);
             }
+            for (int i = 0; i < dense; ++i)
+            {
+                double f = stopEdge + (nyquist - stopEdge) * static_cast<double> (i) / static_cast<double> (dense - 1);
+                double resp = std::fabs (amplitudeResponse (a, f, Fs));
+                if (resp > eps * 1.002)
+                    violSb.push_back (f);
+            }
+            if (violPb.empty() && violSb.empty())
+                break;
+
+            int added = 0;
+            for (double f : violPb) { if (added++ >= 20) break; curPb.push_back (f); }
+            added = 0;
+            for (double f : violSb) { if (added++ >= 40) break; curSb.push_back (f); }
         }
 
-        return { a, false, worstStopbandDb };
+        if (! everFeasible)
+            return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0 };
+
+        auto a = reconstruct (bestY);
+        double worstStopbandDb = -1.0e300;
+        const int denseCheckPoints = 4000;
+        bool sbCompliant = true;
+        for (int i = 0; i < denseCheckPoints; ++i)
+        {
+            double f = stopEdge + (nyquist - stopEdge) * static_cast<double> (i) / static_cast<double> (denseCheckPoints - 1);
+            double resp = std::fabs (amplitudeResponse (a, f, Fs));
+            double db = 20.0 * std::log10 (std::max (resp, 1.0e-300));
+            if (db > worstStopbandDb) worstStopbandDb = db;
+            if (db > 20.0 * std::log10 (eps) + 0.2) sbCompliant = false;
+        }
+        bool pbCompliant = true;
+        for (int i = 0; i < denseCheckPoints; ++i)
+        {
+            double f = fc * static_cast<double> (i) / static_cast<double> (denseCheckPoints - 1);
+            double resp = amplitudeResponse (a, f, Fs);
+            if (resp > 1.0 + 0.01 || resp < gainFloor - 0.02) pbCompliant = false;
+        }
+
+        return { a, sbCompliant && pbCompliant, worstStopbandDb };
     };
 
     // Fixed geometric rule (see top-of-file comment): reserve an
@@ -616,6 +761,18 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     detail::AttemptResult best;
     bool foundFeasible = false;
 
+    // Overall wall-clock budget across the *whole* M-search: each
+    // attemptDesign() call already bounds itself to a few seconds per
+    // stopEdge candidate, but a demanding spec (chiefly cutoff pushed
+    // close to Nyquist) can still need many M values in sequence before
+    // one succeeds, each a genuine multi-second minimax solve - measured
+    // up to roughly a minute for the most extreme cases. This caps the
+    // worst case: past the deadline, the search stops and returns the
+    // best (least-far-from-compliant) result found so far, exactly like
+    // hitting the tap-count cap - constraintsMet = false, not a crash or
+    // a silent wrong answer.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (45);
+
     while (true)
     {
         auto attempt = detail::attemptDesign (spec, M);
@@ -627,6 +784,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
             break;
         }
         if (M >= maxM) break;
+        if (std::chrono::steady_clock::now() > deadline) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 

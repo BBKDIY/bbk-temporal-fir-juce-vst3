@@ -290,17 +290,23 @@ int main()
         // consume most of that headroom, leaving genuinely less room to
         // pin the exact edge sample tightly - a real physical trade-off,
         // not a design bug.
+        // The engine now optimizes for minimum time-domain ringing (see
+        // ParametricFIR.h), which means the passband is a *band*
+        // constraint - gainFloor <= A(f) <= 1 over [0,cutoff] - not a
+        // prescribed straight-line trajectory. This exactly matches the
+        // article's own Case C description ("the transition is allowed
+        // to take the shape returned by the optimization"), so the
+        // correct check is band compliance, not trajectory-following.
+        const double gainFloor = std::pow (10.0, -c.spec.attenuationAtCutoffDb / 20.0);
         bool passbandOk = true;
-        for (double frac : { 0.0, 0.25, 0.5, 0.75, 1.0 })
+        for (int i = 0; i <= 200; ++i)
         {
-            const double f = c.spec.cutoffHz * frac;
-            const double db = 20.0 * std::log10 (std::abs (responseAt (result.taps, f, c.spec.sampleRateHz)));
-            const double target = -c.spec.attenuationAtCutoffDb * frac;
-            const double tol = (frac >= 1.0) ? 1.0 : 0.3;
-            if (std::fabs (db - target) > tol)
+            const double f = c.spec.cutoffHz * static_cast<double> (i) / 200.0;
+            const double resp = std::abs (responseAt (result.taps, f, c.spec.sampleRateHz));
+            if (resp > 1.0 + 0.02 || resp < gainFloor - 0.02)
                 passbandOk = false;
         }
-        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] passband follows the requested trajectory (DC to cutoff)", c.name);
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] passband stays within [gainFloor, 1] over 0-cutoff (band, not trajectory)", c.name);
         check (passbandOk, nameBuf);
 
         // True stopband compliance: dense sweep (not just the design's own
@@ -320,9 +326,9 @@ int main()
         std::snprintf (nameBuf, sizeof (nameBuf), "[%s] design reports its own targets as met", c.name);
         check (result.constraintsMet, nameBuf);
 
-        std::printf ("  [%s] Fs=%.0f fc=%.0f atten=%.2fdB stopband>=%.1fdB -> taps=%d attempts=%d worst=%.2fdB\n",
+        std::printf ("  [%s] Fs=%.0f fc=%.0f atten=%.2fdB stopband>=%.1fdB -> taps=%d attempts=%d worst=%.2fdB R_peak=%.2f%% E_ZC=%.3f%%\n",
             c.name, c.spec.sampleRateHz, c.spec.cutoffHz, c.spec.attenuationAtCutoffDb, c.spec.stopbandRejectionDb,
-            result.tapCount, result.designAttempts, worst);
+            result.tapCount, result.designAttempts, worst, result.temporal.rPeakPercent, result.temporal.eZcPercent);
     }
 
     // --- Case C: exact published reference from "Impulse-Response Ringing
@@ -382,8 +388,19 @@ int main()
         check (engineResult.constraintsMet, "[Case C via engine] design reports its own targets as met");
         const double engineWorst = denseWorstDbInBand (engineResult.taps, 192000.0, 76000.0, 96000.0);
         check (engineWorst <= -97.5, "[Case C via engine] worst-case stopband over 76-96 kHz meets the paper's ~98 dB target");
-        std::printf ("  [Case C via engine] taps=%d worst(76-96kHz)=%.3fdB (paper reference: 19 taps, -98.29dB)\n",
-            engineResult.tapCount, engineWorst);
+
+        // The whole point of the minimax redesign: R_peak/E_ZC should be
+        // *comparable to* the paper's own published Case C numbers
+        // (3.5007% / 0.4839%), not off by an order of magnitude the way
+        // the earlier CLS/IRLS engine's output was (measured directly at
+        // 33.6% / 26.4% for this exact spec before this fix).
+        check (engineResult.temporal.rPeakPercent <= 10.0,
+            "[Case C via engine] R_peak is genuinely low (comparable to the paper's 3.5%), not CLS/IRLS-style uncontrolled ringing");
+        check (engineResult.temporal.eZcPercent <= 5.0,
+            "[Case C via engine] E_ZC is genuinely low (comparable to the paper's 0.48%), not CLS/IRLS-style uncontrolled ringing");
+
+        std::printf ("  [Case C via engine] taps=%d worst(76-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% (paper reference: 19 taps, -98.29dB, 3.5007%%, 0.4839%%)\n",
+            engineResult.tapCount, engineWorst, engineResult.temporal.rPeakPercent, engineResult.temporal.eZcPercent);
     }
 
     // --- Fixed latency invariance across wildly different tap counts ------
