@@ -51,6 +51,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::NormalisableRange<float> (static_cast<float> (minStopbandRejectionDb), static_cast<float> (maxStopbandRejectionDb), 0.1f),
         static_cast<float> (defaultStopbandRejectionDb)));
 
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "bypass", 1 }, "Bypass", false));
+
     return layout;
 }
 
@@ -214,6 +217,10 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
         designCrossfade.reset (sampleRate, 0.015); // 15 ms click-free redesign crossfade
         crossfading = false;
 
+        lastBypassParam = parameters.getRawParameterValue ("bypass")->load() > 0.5f;
+        bypassCrossfade.reset (sampleRate, 0.015); // same 15 ms as the redesign crossfade
+        bypassCrossfade.setCurrentAndTargetValue (lastBypassParam ? 1.0 : 0.0);
+
         // A sample-rate (or first-ever) change is a natural discontinuity
         // anyway - the host already expects a pause here - so the initial
         // design for the new rate is computed synchronously rather than
@@ -277,9 +284,20 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
         }
     }
 
+    // Bypass toggle: retarget (never reset) the independent bypass
+    // crossfade so a toggle mid-ramp reverses smoothly from wherever it
+    // currently is, rather than jumping.
+    const bool bypassNow = parameters.getRawParameterValue ("bypass")->load() > 0.5f;
+    if (bypassNow != lastBypassParam)
+    {
+        lastBypassParam = bypassNow;
+        bypassCrossfade.setTargetValue (bypassNow ? 1.0 : 0.0);
+    }
+
     for (int sample = 0; sample < numSamples; ++sample)
     {
         const double crossfadeAmount = crossfading ? designCrossfade.getNextValue() : 1.0;
+        const double bypassAmount = bypassCrossfade.getNextValue();
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
@@ -297,7 +315,7 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                 wOld += activeTaps[static_cast<std::size_t> (k)] * state.history[static_cast<std::size_t> (index)];
             }
 
-            double out = wOld;
+            double wet = wOld;
             if (crossfading)
             {
                 double wNew = 0.0;
@@ -307,9 +325,19 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                     if (index < 0) index += historyLength;
                     wNew += incomingTaps[static_cast<std::size_t> (k)] * state.history[static_cast<std::size_t> (index)];
                 }
-                out = wOld + crossfadeAmount * (wNew - wOld);
+                wet = wOld + crossfadeAmount * (wNew - wOld);
             }
 
+            // Dry path delayed by exactly latencySamples - the same fixed
+            // group delay every design has by construction (centre tap
+            // always at maxHalfLength), so bypassing lines up
+            // sample-for-sample with the filtered signal it is fading
+            // against.
+            int dryIndex = state.writeIndex - latencySamples;
+            if (dryIndex < 0) dryIndex += historyLength;
+            const double dry = state.history[static_cast<std::size_t> (dryIndex)];
+
+            const double out = wet + bypassAmount * (dry - wet);
             data[sample] = static_cast<SampleType> (out);
 
             if (++state.writeIndex == historyLength)

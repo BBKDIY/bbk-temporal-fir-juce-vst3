@@ -124,6 +124,18 @@ private:
     juce::SmoothedValue<double, juce::ValueSmoothingTypes::Linear> designCrossfade;
     bool crossfading = false;
 
+    // Bypass: a second, independent crossfade layered on top of the
+    // design crossfade above - 0 means fully processed, 1 means fully dry
+    // (delayed by exactly latencySamples, the same fixed delay the
+    // filtered path already has by construction, so toggling bypass lines
+    // up sample-for-sample with whatever is currently playing and can
+    // never click). Deliberately kept independent of the design crossfade
+    // rather than folded into a single state machine: if a redesign
+    // happens to complete while bypassed, it quietly finishes in the
+    // background and the user hears it only once they un-bypass.
+    juce::SmoothedValue<double, juce::ValueSmoothingTypes::Linear> bypassCrossfade;
+    bool lastBypassParam = false;
+
     // Background design thread hand-off. The audio thread never runs
     // designParametricFIR() itself - it can take tens to low hundreds of
     // milliseconds for demanding specs, fine off the audio thread, fatal

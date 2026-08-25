@@ -33,6 +33,11 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     prepareLabel (sampleRate);
     addAndMakeVisible (sampleRate);
 
+    bypassButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (bypassButton);
+    bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "bypass", bypassButton);
+
     prepareLabel (cutoffLabel, 13.0f, false, juce::Justification::centredLeft);
     cutoffLabel.setText ("Cutoff", juce::dontSendNotification);
     addAndMakeVisible (cutoffLabel);
@@ -93,7 +98,11 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     subtitle.setBounds (area.removeFromTop (18));
     area.removeFromTop (6);
 
-    sampleRate.setBounds (area.removeFromTop (20));
+    {
+        auto row = area.removeFromTop (24);
+        bypassButton.setBounds (row.removeFromRight (100));
+        sampleRate.setBounds (row);
+    }
     area.removeFromTop (10);
 
     auto sliderRow = [&] (juce::Label& label, juce::Slider& slider)
@@ -163,6 +172,10 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     const double nyquist = snap.sampleRateHz * 0.5;
 
     juce::String text;
+    if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
+        if (bypassParam->load() > 0.5f)
+            text << "BYPASSED (dry signal, delay-matched - no filtering audible)\n";
+
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
          << "Target: cutoff " << juce::String (snap.cutoffHz, 0) << " Hz, "

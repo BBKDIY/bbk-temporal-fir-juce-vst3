@@ -144,6 +144,31 @@ struct MiniProcessor
         if (++writeIndex == historyLength) writeIndex = 0;
         return out;
     }
+
+    // Mirrors the bypass blend added to PluginProcessor::process(): the
+    // wet signal (itself possibly mid-redesign-crossfade) is blended
+    // against a dry path delayed by exactly latencySamples - the same
+    // fixed group delay every design has by construction - so bypassing
+    // lines up sample-for-sample with whatever is currently playing.
+    double tickWithBypass (double x, const std::array<double, maxTapCount>& fromTaps,
+                           const std::array<double, maxTapCount>& toTaps, double crossfadeAmount, bool crossfading,
+                           double bypassAmount)
+    {
+        history[static_cast<std::size_t> (writeIndex)] = x;
+        const double wOld = convolve (fromTaps);
+        double wet = wOld;
+        if (crossfading)
+        {
+            const double wNew = convolve (toTaps);
+            wet = wOld + crossfadeAmount * (wNew - wOld);
+        }
+        int dryIndex = writeIndex - latencySamples;
+        if (dryIndex < 0) dryIndex += historyLength;
+        const double dry = history[static_cast<std::size_t> (dryIndex)];
+        const double out = wet + bypassAmount * (dry - wet);
+        if (++writeIndex == historyLength) writeIndex = 0;
+        return out;
+    }
 };
 
 } // namespace
@@ -351,6 +376,68 @@ int main()
         check (startsAtOld, "Crossfade starts exactly on the old design's own output");
         check (endsAtNew, "Crossfade ends exactly on the new design's own output");
         check (staysInBetween, "Crossfade output never exceeds the range spanned by the two designs at any sample");
+    }
+
+    // --- Bypass blend (mirrors the bypass toggle in PluginProcessor::process()) ---
+    {
+        auto design = designParametricFIR ({ 192000.0, 20000.0, 0.5, 98.0 }, maxTapCount);
+        auto taps = padTapsToFixedLength (design.taps);
+
+        // Fully bypassed (bypassAmount = 1.0 throughout): output must be
+        // an exact latencySamples-sample delay of the input, regardless of
+        // what the filter itself would have done - i.e. bypass genuinely
+        // disables filtering rather than just attenuating it.
+        {
+            MiniProcessor proc;
+            const int len = latencySamples + 30;
+            std::vector<double> input (static_cast<std::size_t> (len));
+            for (int n = 0; n < len; ++n)
+                input[static_cast<std::size_t> (n)] = std::sin (2.0 * M_PI * 5000.0 * n / 192000.0) + (n == 3 ? 1.0 : 0.0);
+
+            bool matchesDelay = true;
+            std::vector<double> outputs;
+            for (int n = 0; n < len; ++n)
+                outputs.push_back (proc.tickWithBypass (input[static_cast<std::size_t> (n)], taps, taps, 0.0, false, 1.0));
+            for (int n = latencySamples; n < len; ++n)
+                if (std::fabs (outputs[static_cast<std::size_t> (n)] - input[static_cast<std::size_t> (n - latencySamples)]) > 1.0e-12)
+                    matchesDelay = false;
+            check (matchesDelay, "Fully bypassed output is an exact latencySamples-sample delay of the input (no filtering)");
+        }
+
+        // Fully wet (bypassAmount = 0.0): output must match the plain
+        // (non-bypass) convolution exactly - bypass logic must not perturb
+        // normal filtered operation at all when disengaged.
+        {
+            MiniProcessor procBypassPath;
+            MiniProcessor procPlain;
+            bool matchesPlain = true;
+            for (int n = 0; n < 100; ++n)
+            {
+                const double x = std::sin (2.0 * M_PI * 5000.0 * n / 192000.0);
+                const double withBypassLogic = procBypassPath.tickWithBypass (x, taps, taps, 0.0, false, 0.0);
+                const double plain = procPlain.tick (x, taps, taps, 0.0, false);
+                if (std::fabs (withBypassLogic - plain) > 1.0e-12)
+                    matchesPlain = false;
+            }
+            check (matchesPlain, "Bypass fully disengaged (amount 0.0) matches plain filtered output exactly");
+        }
+
+        // Mid-crossfade (bypassAmount = 0.5): must land exactly halfway
+        // between the fully-wet and fully-dry outputs at every sample.
+        {
+            MiniProcessor procHalf, procWet, procDry;
+            bool isExactMidpoint = true;
+            for (int n = 0; n < 100; ++n)
+            {
+                const double x = std::sin (2.0 * M_PI * 5000.0 * n / 192000.0);
+                const double half = procHalf.tickWithBypass (x, taps, taps, 0.0, false, 0.5);
+                const double wet = procWet.tickWithBypass (x, taps, taps, 0.0, false, 0.0);
+                const double dry = procDry.tickWithBypass (x, taps, taps, 0.0, false, 1.0);
+                if (std::fabs (half - (wet + 0.5 * (dry - wet))) > 1.0e-12)
+                    isExactMidpoint = false;
+            }
+            check (isExactMidpoint, "Bypass amount 0.5 lands exactly halfway between fully-wet and fully-dry output");
+        }
     }
 
     std::printf ("\n%d/%d checks passed\n", checksRun - checksFailed, checksRun);

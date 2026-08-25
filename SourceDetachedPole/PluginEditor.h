@@ -23,6 +23,7 @@ private:
     juce::Label title;
     juce::Label subtitle;
     juce::Label sampleRate;
+    juce::ToggleButton bypassButton { "Bypass" };
 
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
@@ -39,6 +40,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };
