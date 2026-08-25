@@ -1,25 +1,38 @@
 // Framework-independent DSP verification for the BBK Detached Pole plugin.
 // Builds and runs with plain g++ (no JUCE dependency) so it can act as a
-// fast CI gate before the real MSVC/JUCE build. Every numeric result here
-// is computed from the taps/pole coefficients in DetachedPoleFilter.h -
-// nothing is hardcoded from the article, or from the Case F validation
-// spec, except the tolerances used to compare against that header's own
-// published-figure constants.
+// fast CI gate before the real MSVC/JUCE build.
+//
+// This plugin is now a single parametric constrained-least-squares FIR
+// lowpass (see SourceDetachedPole/ParametricFIR.h for the design method)
+// rather than the fixed four-mode A/B/C/F comparator it used to be, so
+// this test verifies:
+//   1. designParametricFIR() itself, across all four supported sample
+//      rates (44.1/48/96/192 kHz) and a range of cutoff/attenuation/
+//      stopband-rejection combinations - unity DC gain, passband
+//      trajectory fidelity, and true (densely-verified, not just
+//      grid-sampled) stopband compliance.
+//   2. padTapsToFixedLength() - every design, however many taps it
+//      actually used, must zero-pad to exactly maxTapCount with its
+//      centre tap at the same fixed index (maxHalfLength), and must
+//      produce bit-identical convolution output to the original
+//      (unpadded) taps. This is what keeps the host-reported latency
+//      constant across every slider and sample-rate combination.
+//   3. The plugin's own crossfade mechanism (mirrored here exactly, the
+//      same way the old A/B/C/F comparator's MiniProcessor mirrored
+//      PluginProcessor::process()): starts fully on the old filter,
+//      ends fully on the new one, and never produces a value outside the
+//      range spanned by the two filters' own outputs at any given sample.
 
 #include "../SourceDetachedPole/DetachedPoleFilter.h"
+#include "../SourceDetachedPole/ParametricFIR.h"
 
-#include <array>
 #include <cmath>
 #include <complex>
 #include <cstdio>
-#include <functional>
 #include <vector>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 using namespace bbk::detachedpole;
+using namespace bbk::parametric;
 
 namespace
 {
@@ -51,251 +64,85 @@ void checkNear (double actual, double expected, double tol, const char* name)
 
 using Complex = std::complex<double>;
 
-Complex firResponseAt (double freqHz)
+Complex responseAt (const std::vector<double>& taps, double freqHz, double sampleRateHz)
 {
-    const auto& taps = firTaps();
-    const double w = 2.0 * M_PI * freqHz / static_cast<double> (sampleRateHz);
+    const double w = 2.0 * M_PI * freqHz / sampleRateHz;
     Complex acc (0.0, 0.0);
-    for (int k = 0; k < firTapCount; ++k)
+    for (std::size_t k = 0; k < taps.size(); ++k)
     {
         const double phase = -w * static_cast<double> (k);
-        acc += taps[static_cast<std::size_t> (k)] * Complex (std::cos (phase), std::sin (phase));
+        acc += taps[k] * Complex (std::cos (phase), std::sin (phase));
     }
     return acc;
 }
 
-Complex poleResponseAt (double freqHz)
+Complex responseAt (const std::array<double, maxTapCount>& taps, double freqHz, double sampleRateHz)
 {
-    const double w = 2.0 * M_PI * freqHz / static_cast<double> (sampleRateHz);
-    const Complex zInv (std::cos (-w), std::sin (-w));
-    const Complex numerator = poleB0 + poleB1 * zInv;
-    const Complex denominator = 1.0 + poleA1 * zInv;
-    return numerator / denominator;
+    std::vector<double> v (taps.begin(), taps.end());
+    return responseAt (v, freqHz, sampleRateHz);
 }
 
-Complex mergedResponseAt (double freqHz)
+// Same transition-width estimate ParametricFIR.h uses internally, so the
+// dense stopband check below measures from the real (enforced) stopband
+// edge rather than from the cutoff itself, which would just report
+// transition-zone droop, not a genuine stopband violation.
+double estimateStopEdge (const FilterSpec& spec, int tapCount)
 {
-    return firResponseAt (freqHz) * poleResponseAt (freqHz);
+    const double nyquist = spec.sampleRateHz * 0.5;
+    double transitionWidth = spec.sampleRateHz * (spec.stopbandRejectionDb - 7.95) / (14.36 * static_cast<double> (tapCount));
+    if (transitionWidth < 0.0) transitionWidth = 0.0;
+    double stopEdge = spec.cutoffHz + transitionWidth;
+    const double minSpan = (nyquist - spec.cutoffHz) * 0.02;
+    if (stopEdge > nyquist - minSpan) stopEdge = nyquist - minSpan;
+    return stopEdge;
 }
 
-// Case F transfer function: a plain 19-tap FIR evaluation, exactly like
-// firResponseAt() above but over the independent Case F coefficient set.
-// No pole term anywhere in this expression.
-Complex caseFResponseAt (double freqHz)
+double denseWorstDbInBand (const std::vector<double>& taps, double sampleRateHz, double loHz, double hiHz, int numPoints = 20001)
 {
-    const auto& taps = caseFFirTaps();
-    const double w = 2.0 * M_PI * freqHz / static_cast<double> (sampleRateHz);
-    Complex acc (0.0, 0.0);
-    for (int k = 0; k < firTapCount; ++k)
-    {
-        const double phase = -w * static_cast<double> (k);
-        acc += taps[static_cast<std::size_t> (k)] * Complex (std::cos (phase), std::sin (phase));
-    }
-    return acc;
-}
-
-double groupDelaySamplesAt (const std::function<Complex (double)>& h, double freqHz)
-{
-    const double eps = 1.0;
-    const double phasePlus = std::arg (h (freqHz + eps));
-    const double phaseMinus = std::arg (h (freqHz - eps));
-    double dPhase = phasePlus - phaseMinus;
-    while (dPhase > M_PI) dPhase -= 2.0 * M_PI;
-    while (dPhase < -M_PI) dPhase += 2.0 * M_PI;
-    const double dOmega = 2.0 * M_PI * (2.0 * eps) / static_cast<double> (sampleRateHz);
-    return -dPhase / dOmega;
-}
-
-double meanGroupDelaySamples (const std::function<Complex (double)>& h, double bandHz)
-{
-    const int numPoints = 41;
-    double sum = 0.0;
-    for (int i = 0; i < numPoints; ++i)
-    {
-        const double f = bandHz * static_cast<double> (i) / static_cast<double> (numPoints - 1);
-        sum += groupDelaySamplesAt (h, f);
-    }
-    return sum / static_cast<double> (numPoints);
-}
-
-double worstLevelDbInBand (const std::function<Complex (double)>& h, double loHz, double hiHz)
-{
-    const int numPoints = 401;
     double worst = -1.0e300;
     for (int i = 0; i < numPoints; ++i)
     {
         const double f = loHz + (hiHz - loHz) * static_cast<double> (i) / static_cast<double> (numPoints - 1);
-        const double mag = std::abs (h (f));
-        const double db = 20.0 * std::log10 (mag);
-        if (db > worst)
-            worst = db;
+        const double db = 20.0 * std::log10 (std::abs (responseAt (taps, f, sampleRateHz)) + 1.0e-300);
+        if (db > worst) worst = db;
     }
     return worst;
-}
-
-// Dense stopband sweep, as requested for Case F specifically: many more
-// points than worstLevelDbInBand() above, purely to find the true
-// worst-case maximum across 76-96 kHz rather than trusting a coarse grid
-// or just the 76 kHz endpoint.
-double denseWorstLevelDbInBand (const std::function<Complex (double)>& h, double loHz, double hiHz, int numPoints)
-{
-    double worst = -1.0e300;
-    double worstFreq = loHz;
-    for (int i = 0; i < numPoints; ++i)
-    {
-        const double f = loHz + (hiHz - loHz) * static_cast<double> (i) / static_cast<double> (numPoints - 1);
-        const double mag = std::abs (h (f));
-        const double db = 20.0 * std::log10 (mag);
-        if (db > worst)
-        {
-            worst = db;
-            worstFreq = f;
-        }
-    }
-    std::printf ("  (dense sweep: worst = %.3f dB at f = %.1f Hz, %d points)\n", worst, worstFreq, numPoints);
-    return worst;
-}
-
-struct Metrics
-{
-    double rpeakPercent = 0.0;
-    double ezcPercent = 0.0;
-    int durationSamples = 0;
-};
-
-// Zero-crossing-bounded ringing metric, used identically for Case B,
-// Case C and Case F:
-//   1. Find the central impulse peak.
-//   2. Move left from the peak until the first sign change.
-//   3. Move right from the peak until the first sign change.
-//   4. Everything between those zero-crossing boundaries is the main lobe.
-//   5. Find the maximum absolute sample outside that region (Rpeak).
-//   6. Total energy outside that region, as a fraction of total energy (EZC).
-Metrics metricsFromImpulseResponse (const std::vector<double>& resp)
-{
-    const int n = static_cast<int> (resp.size());
-
-    int peakIndex = 0;
-    double peakValue = 0.0;
-    for (int i = 0; i < n; ++i)
-    {
-        const double a = std::fabs (resp[static_cast<std::size_t> (i)]);
-        if (a > peakValue)
-        {
-            peakValue = a;
-            peakIndex = i;
-        }
-    }
-
-    int leftBoundary = peakIndex;
-    while (leftBoundary > 0)
-    {
-        const double a = resp[static_cast<std::size_t> (leftBoundary)];
-        const double b = resp[static_cast<std::size_t> (leftBoundary - 1)];
-        if ((a >= 0.0) != (b >= 0.0))
-            break;
-        --leftBoundary;
-    }
-
-    int rightBoundary = peakIndex;
-    while (rightBoundary < n - 1)
-    {
-        const double a = resp[static_cast<std::size_t> (rightBoundary)];
-        const double b = resp[static_cast<std::size_t> (rightBoundary + 1)];
-        if ((a >= 0.0) != (b >= 0.0))
-            break;
-        ++rightBoundary;
-    }
-
-    double outsidePeak = 0.0;
-    double outsideEnergy = 0.0;
-    double totalEnergy = 0.0;
-    for (int i = 0; i < n; ++i)
-    {
-        const double v = resp[static_cast<std::size_t> (i)];
-        totalEnergy += v * v;
-        if (i < leftBoundary || i > rightBoundary)
-        {
-            outsideEnergy += v * v;
-            if (std::fabs (v) > outsidePeak)
-                outsidePeak = std::fabs (v);
-        }
-    }
-
-    const double threshold = 0.001 * peakValue;
-    int firstAbove = -1;
-    int lastAbove = -1;
-    for (int i = 0; i < n; ++i)
-    {
-        if (std::fabs (resp[static_cast<std::size_t> (i)]) >= threshold)
-        {
-            if (firstAbove < 0)
-                firstAbove = i;
-            lastAbove = i;
-        }
-    }
-
-    Metrics m;
-    m.rpeakPercent = 100.0 * outsidePeak / peakValue;
-    m.ezcPercent = 100.0 * outsideEnergy / totalEnergy;
-    m.durationSamples = lastAbove - firstAbove;
-    return m;
 }
 
 // Mirrors BBKDetachedPoleAudioProcessor::process() exactly (same history
-// buffer, same FIR convolutions, same one-pole update, same dry-path
-// delay), so this class is the single source of truth both for the
-// impulse-response checks below and for the mode-dispatch checks. wetF is
-// computed purely from caseFFirTaps() over the shared history buffer and
-// never reads poleW1/poleY1 (those are Case C's own state only).
+// buffer, same fixed-length padded convolution, same linear crossfade),
+// so this is the single source of truth for the crossfade-behaviour
+// checks below.
 struct MiniProcessor
 {
     std::array<double, historyLength> history {};
     int writeIndex = 0;
-    double poleW1 = 0.0;
-    double poleY1 = 0.0;
 
-    struct Output { double dry; double wetB; double wetC; double wetF; };
-
-    Output tick (double x)
+    double convolve (const std::array<double, maxTapCount>& taps) const
     {
-        const auto& taps = firTaps();
-        const auto& caseFTaps = caseFFirTaps();
-        history[static_cast<std::size_t> (writeIndex)] = x;
-
         double w = 0.0;
-        for (int k = 0; k < firTapCount; ++k)
+        for (int k = 0; k < maxTapCount; ++k)
         {
             int index = writeIndex - k;
-            if (index < 0)
-                index += historyLength;
+            if (index < 0) index += historyLength;
             w += taps[static_cast<std::size_t> (k)] * history[static_cast<std::size_t> (index)];
         }
+        return w;
+    }
 
-        const double wetC = poleB0 * w + poleB1 * poleW1 - poleA1 * poleY1;
-        poleW1 = w;
-        poleY1 = wetC;
-
-        const double wetB = w;
-
-        double wF = 0.0;
-        for (int k = 0; k < firTapCount; ++k)
+    double tick (double x, const std::array<double, maxTapCount>& fromTaps,
+                 const std::array<double, maxTapCount>& toTaps, double crossfadeAmount, bool crossfading)
+    {
+        history[static_cast<std::size_t> (writeIndex)] = x;
+        const double wOld = convolve (fromTaps);
+        double out = wOld;
+        if (crossfading)
         {
-            int index = writeIndex - k;
-            if (index < 0)
-                index += historyLength;
-            wF += caseFTaps[static_cast<std::size_t> (k)] * history[static_cast<std::size_t> (index)];
+            const double wNew = convolve (toTaps);
+            out = wOld + crossfadeAmount * (wNew - wOld);
         }
-
-        int dryIndex = writeIndex - latencySamples;
-        if (dryIndex < 0)
-            dryIndex += historyLength;
-        const double dry = history[static_cast<std::size_t> (dryIndex)];
-
-        if (++writeIndex == historyLength)
-            writeIndex = 0;
-
-        return { dry, wetB, wetC, wF };
+        if (++writeIndex == historyLength) writeIndex = 0;
+        return out;
     }
 };
 
@@ -303,291 +150,207 @@ struct MiniProcessor
 
 int main()
 {
-    // --- FIR stage sanity (Case B / Case C shared taps) -----------------
+    // --- padTapsToFixedLength() sanity -------------------------------------
     {
-        const auto& taps = firTaps();
-        bool symmetric = true;
-        for (int i = 0; i < firTapCount; ++i)
-            if (std::fabs (taps[static_cast<std::size_t> (i)] - taps[static_cast<std::size_t> (firTapCount - 1 - i)]) > 1.0e-12)
-                symmetric = false;
-        check (symmetric, "FIR taps are symmetric (Type I linear phase)");
+        std::vector<double> shortTaps = { 0.1, 0.3, 0.2, 0.3, 0.1 }; // M=2, N=5
+        auto padded = padTapsToFixedLength (shortTaps);
+        check (static_cast<int> (padded.size()) == maxTapCount, "Padded array always has length maxTapCount");
 
         double sum = 0.0;
-        for (int i = 0; i < firTapCount; ++i)
-            sum += taps[static_cast<std::size_t> (i)];
-        checkNear (sum, 1.0, 1.0e-9, "FIR taps sum to unity (DC gain 1.0)");
-    }
+        for (double v : padded) sum += v;
+        checkNear (sum, 1.0, 1.0e-12, "Zero-padding preserves DC gain exactly (sum unchanged)");
 
-    // --- Case F FIR stage sanity ------------------------------------------
-    {
-        const auto& taps = caseFFirTaps();
+        // Centre tap of the original 5-tap filter (index 2, value 0.2) must
+        // land exactly at maxHalfLength in the padded array.
+        checkNear (padded[static_cast<std::size_t> (maxHalfLength)], 0.2, 1.0e-15, "Centre tap lands at the fixed maxHalfLength index");
+        checkNear (padded[static_cast<std::size_t> (maxHalfLength - 2)], 0.1, 1.0e-15, "Left edge tap lands at the correct offset");
+        checkNear (padded[static_cast<std::size_t> (maxHalfLength + 2)], 0.1, 1.0e-15, "Right edge tap lands at the correct offset");
 
-        bool symmetric = true;
-        for (int i = 0; i < firTapCount; ++i)
-            if (std::fabs (taps[static_cast<std::size_t> (i)] - taps[static_cast<std::size_t> (firTapCount - 1 - i)]) > 1.0e-12)
-                symmetric = false;
-        check (symmetric, "Case F taps are symmetric (Type I linear phase)");
+        bool restIsZero = true;
+        for (int i = 0; i < maxTapCount; ++i)
+            if (i < maxHalfLength - 2 || i > maxHalfLength + 2)
+                if (std::fabs (padded[static_cast<std::size_t> (i)]) > 1.0e-15)
+                    restIsZero = false;
+        check (restIsZero, "Everything outside the original filter's span is exactly zero");
 
-        double sum = 0.0;
-        for (int i = 0; i < firTapCount; ++i)
-            sum += taps[static_cast<std::size_t> (i)];
-        std::printf ("Case F coefficient sum: %.12f\n", sum);
-        checkNear (sum, 1.0, 1.0e-9, "Case F taps sum to unity (DC gain 1.0)");
-    }
-
-    // --- Case B (FIR only) / Case C / Case F impulse responses ----------
-    std::vector<double> caseBResponse;
-    std::vector<double> caseCResponse;
-    std::vector<double> caseFResponse;
-    {
+        // Convolving the padded array against a fixed-size history window
+        // must give the same result as convolving the original (shorter,
+        // correctly-delayed) taps directly - i.e. padding changes nothing
+        // except where the non-zero coefficients sit.
         MiniProcessor proc;
-        const int responseLength = 80;
-        for (int n = 0; n < responseLength; ++n)
+        std::array<double, maxTapCount> fromTaps {}; // all zero - irrelevant, no crossfade
+        std::vector<double> impulse;
+        // Must be long enough to see the impulse land at maxHalfLength +/-
+        // the short filter's own half-width, not just a handful of samples.
+        const int len = maxHalfLength + 10;
+        for (int n = 0; n < len; ++n)
         {
             const double x = (n == 0) ? 1.0 : 0.0;
-            const auto out = proc.tick (x);
-            caseBResponse.push_back (out.wetB);
-            caseCResponse.push_back (out.wetC);
-            caseFResponse.push_back (out.wetF);
+            impulse.push_back (proc.tick (x, padded, fromTaps, 0.0, false));
         }
-    }
-
-    {
-        const auto m = metricsFromImpulseResponse (caseBResponse);
-        checkNear (m.rpeakPercent, caseBPeakSidelobePercent, 0.05, "Case B peak sidelobe matches article figure");
-        checkNear (m.ezcPercent, caseBTotalRingingEnergyPercent, 0.05, "Case B total ringing energy matches article figure");
-        check (m.durationSamples == caseBDurationSamples, "Case B duration matches article figure (18 samples)");
-    }
-
-    {
-        const auto m = metricsFromImpulseResponse (caseCResponse);
-        checkNear (m.rpeakPercent, peakSidelobePercent, 0.05, "Case C peak sidelobe matches article figure");
-        checkNear (m.ezcPercent, totalRingingEnergyPercent, 0.05, "Case C total ringing energy matches article figure");
-        check (m.durationSamples == durationSamples, "Case C duration matches article figure (15 samples)");
-    }
-
-    {
-        const auto m = metricsFromImpulseResponse (caseFResponse);
-        checkNear (m.rpeakPercent, caseFPeakSidelobePercent, 0.02, "Case F peak sidelobe matches validation spec (~3.5007%)");
-        checkNear (m.ezcPercent, caseFTotalRingingEnergyPercent, 0.02, "Case F total ringing energy matches validation spec (~0.484%)");
-        check (m.durationSamples == caseFDurationSamples, "Case F duration matches validation spec (18 samples)");
-    }
-
-    // --- Case F impulse-test mode: dump and verify first 40 samples ------
-    // Requirement: feeding x[0]=1, x[n>0]=0 into Case F must return
-    // exactly the 19 supplied FIR coefficients (apart from the plugin's
-    // own fixed 10-sample latency offset applied only to the dry path -
-    // Case F's own wet output has no extra delay beyond the FIR's own
-    // structural centre tap). We print the first 40 samples and verify:
-    // no hidden processing before/after the FIR, exactly 19 non-zero
-    // samples, symmetric impulse, no IIR tail, and every sample equal to
-    // its corresponding coefficient.
-    {
-        const auto& taps = caseFFirTaps();
-        std::printf ("\nCase F impulse response, first 40 samples:\n");
-        bool matchesCoefficients = true;
-        bool tailIsZero = true;
-        for (int n = 0; n < 40; ++n)
+        // The impulse response of a filter whose centre tap sits at index
+        // maxHalfLength must appear starting at sample maxHalfLength.
+        bool matches = true;
+        for (int i = 0; i < static_cast<int> (shortTaps.size()); ++i)
         {
-            const double v = caseFResponse[static_cast<std::size_t> (n)];
-            std::printf ("  y[%2d] = % .12f\n", n, v);
-            if (n < firTapCount)
+            const int n = maxHalfLength + i - 2; // shortTaps' own centre index is 2
+            if (n < 0 || n >= len || std::fabs (impulse[static_cast<std::size_t> (n)] - shortTaps[static_cast<std::size_t> (i)]) > 1.0e-12)
+                matches = false;
+        }
+        check (matches, "Padded-taps convolution reproduces the original filter, delayed to the fixed centre index");
+    }
+
+    // --- designParametricFIR() across all four supported sample rates -----
+    struct Case { const char* name; FilterSpec spec; };
+    const Case cases[] = {
+        { "192k-original-like", { 192000.0, 20000.0, 0.50, 98.0 } },
+        { "44.1k",              { 44100.0,  18000.0, 0.50, 90.0 } },
+        { "48k",                { 48000.0,  20000.0, 0.50, 90.0 } },
+        { "96k",                { 96000.0,  20000.0, 0.50, 96.0 } },
+        { "192k",               { 192000.0, 20000.0, 0.50, 98.0 } },
+        { "44.1k-tight",        { 44100.0,  20000.0, 0.20, 100.0 } },
+        { "48k-deep",           { 48000.0,  20000.0, 0.50, 110.0 } },
+        { "192k-loose",         { 192000.0, 20000.0, 1.00, 60.0 } },
+    };
+
+    for (const auto& c : cases)
+    {
+        auto result = designParametricFIR (c.spec, maxTapCount);
+        char nameBuf[256];
+
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] tap count is odd (Type-I linear phase)", c.name);
+        check (result.tapCount % 2 == 1, nameBuf);
+
+        bool symmetric = true;
+        for (int i = 0; i < result.tapCount; ++i)
+            if (std::fabs (result.taps[static_cast<std::size_t> (i)] - result.taps[static_cast<std::size_t> (result.tapCount - 1 - i)]) > 1.0e-9)
+                symmetric = false;
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] taps are symmetric (Type-I linear phase)", c.name);
+        check (symmetric, nameBuf);
+
+        double dc = 0.0;
+        for (double h : result.taps) dc += h;
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] DC gain is unity", c.name);
+        checkNear (dc, 1.0, 1.0e-6, nameBuf);
+
+        // Passband trajectory: straight line in dB from 0 at DC to
+        // -attenuationAtCutoffDb at the cutoff frequency. The tolerance is
+        // deliberately generous right at the cutoff point itself: for
+        // specs where Nyquist sits close to the cutoff (e.g. 48 kHz
+        // sample rate with a 20 kHz cutoff - only 4 kHz of headroom to
+        // Nyquist), the transition width a deep stopband target needs can
+        // consume most of that headroom, leaving genuinely less room to
+        // pin the exact edge sample tightly - a real physical trade-off,
+        // not a design bug.
+        bool passbandOk = true;
+        for (double frac : { 0.0, 0.25, 0.5, 0.75, 1.0 })
+        {
+            const double f = c.spec.cutoffHz * frac;
+            const double db = 20.0 * std::log10 (std::abs (responseAt (result.taps, f, c.spec.sampleRateHz)));
+            const double target = -c.spec.attenuationAtCutoffDb * frac;
+            const double tol = (frac >= 1.0) ? 1.0 : 0.3;
+            if (std::fabs (db - target) > tol)
+                passbandOk = false;
+        }
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] passband follows the requested trajectory (DC to cutoff)", c.name);
+        check (passbandOk, nameBuf);
+
+        // True stopband compliance: dense sweep (not just the design's own
+        // internal grid) across the real enforced-stopband region. This is
+        // an inequality, not a near-equality - the design is allowed (and
+        // often does, when a small tap count already clears the bound
+        // comfortably) to *exceed* the requested rejection.
+        const double stopEdge = estimateStopEdge (c.spec, result.tapCount);
+        const double nyquist = c.spec.sampleRateHz * 0.5;
+        const double worst = denseWorstDbInBand (result.taps, c.spec.sampleRateHz, stopEdge, nyquist);
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] true (densely-verified) stopband meets or exceeds the requested rejection", c.name);
+        check (worst <= -c.spec.stopbandRejectionDb + 0.5, nameBuf);
+        if (worst > -c.spec.stopbandRejectionDb + 0.5)
+            std::printf ("  (worst=%.3f dB, required <= %.3f dB)\n", worst, -c.spec.stopbandRejectionDb + 0.5);
+
+        std::snprintf (nameBuf, sizeof (nameBuf), "[%s] design reports its own targets as met", c.name);
+        check (result.constraintsMet, nameBuf);
+
+        std::printf ("  [%s] Fs=%.0f fc=%.0f atten=%.2fdB stopband>=%.1fdB -> taps=%d attempts=%d worst=%.2fdB\n",
+            c.name, c.spec.sampleRateHz, c.spec.cutoffHz, c.spec.attenuationAtCutoffDb, c.spec.stopbandRejectionDb,
+            result.tapCount, result.designAttempts, worst);
+    }
+
+    // --- Fixed latency invariance across wildly different tap counts ------
+    {
+        auto small = designParametricFIR ({ 192000.0, 20000.0, 1.00, 60.0 }, maxTapCount);
+        auto large = designParametricFIR ({ 44100.0, 20000.0, 0.20, 100.0 }, maxTapCount);
+
+        auto paddedSmall = padTapsToFixedLength (small.taps);
+        auto paddedLarge = padTapsToFixedLength (large.taps);
+
+        check (small.tapCount != large.tapCount, "Sanity: the two specs used here really do need different tap counts");
+        check (static_cast<int> (paddedSmall.size()) == maxTapCount && static_cast<int> (paddedLarge.size()) == maxTapCount,
+               "Both designs pad to the exact same fixed length regardless of how many taps they actually needed");
+
+        // Group delay = index of the padded array's own centre of
+        // symmetry, which padTapsToFixedLength always places at
+        // maxHalfLength - i.e. the reported host latency is identical for
+        // both, even though the underlying filters are very different.
+        bool smallSymmetricAtCentre = true, largeSymmetricAtCentre = true;
+        for (int i = 1; i <= maxHalfLength; ++i)
+        {
+            if (std::fabs (paddedSmall[static_cast<std::size_t> (maxHalfLength - i)] - paddedSmall[static_cast<std::size_t> (maxHalfLength + i)]) > 1.0e-9)
+                smallSymmetricAtCentre = false;
+            if (std::fabs (paddedLarge[static_cast<std::size_t> (maxHalfLength - i)] - paddedLarge[static_cast<std::size_t> (maxHalfLength + i)]) > 1.0e-9)
+                largeSymmetricAtCentre = false;
+        }
+        check (smallSymmetricAtCentre, "Small design's padded array is symmetric about the fixed centre index");
+        check (largeSymmetricAtCentre, "Large design's padded array is symmetric about the fixed centre index");
+    }
+
+    // --- Crossfade mechanism (mirrors PluginProcessor::process()) ---------
+    {
+        auto designA = designParametricFIR ({ 192000.0, 20000.0, 0.5, 98.0 }, maxTapCount);
+        auto designB = designParametricFIR ({ 192000.0, 15000.0, 0.5, 98.0 }, maxTapCount);
+        auto tapsA = padTapsToFixedLength (designA.taps);
+        auto tapsB = padTapsToFixedLength (designB.taps);
+
+        MiniProcessor procRef; // always plays tapsA, no crossfade - reference
+        MiniProcessor procFade; // crossfades from tapsA to tapsB
+        MiniProcessor procTarget; // always plays tapsB, no crossfade - reference
+
+        const int totalSamples = 2000;
+        const int fadeSamples = 200; // arbitrary ramp length for this test
+        bool startsAtOld = true, endsAtNew = true, staysInBetween = true;
+
+        for (int n = 0; n < totalSamples; ++n)
+        {
+            const double x = std::sin (2.0 * M_PI * 3000.0 * n / 192000.0);
+            const double refOut = procRef.tick (x, tapsA, tapsA, 0.0, false);
+            const double targetOut = procTarget.tick (x, tapsB, tapsB, 0.0, false);
+
+            const bool crossfading = n < fadeSamples;
+            const double amount = crossfading ? static_cast<double> (n) / static_cast<double> (fadeSamples - 1) : 1.0;
+            // Mirrors PluginProcessor::process(): once the ramp finishes,
+            // the "active" filter actually becomes the new one (activeTaps
+            // = incomingTaps) - it isn't just a crossfade amount frozen at
+            // 1.0 while still nominally reading the old filter as "from".
+            const double fadeOut = crossfading
+                ? procFade.tick (x, tapsA, tapsB, amount, true)
+                : procFade.tick (x, tapsB, tapsB, 0.0, false);
+
+            if (n == 0 && std::fabs (fadeOut - refOut) > 1.0e-9)
+                startsAtOld = false;
+            if (n == fadeSamples && std::fabs (fadeOut - targetOut) > 1.0e-6)
+                endsAtNew = false;
+            if (crossfading)
             {
-                if (std::fabs (v - taps[static_cast<std::size_t> (n)]) > 1.0e-9)
-                    matchesCoefficients = false;
-            }
-            else
-            {
-                if (std::fabs (v) > 1.0e-12)
-                    tailIsZero = false;
+                const double lo = std::min (refOut, targetOut) - 1.0e-6;
+                const double hi = std::max (refOut, targetOut) + 1.0e-6;
+                if (fadeOut < lo || fadeOut > hi)
+                    staysInBetween = false;
             }
         }
-        check (matchesCoefficients, "Case F impulse response's first 19 samples exactly match the supplied coefficients");
-        check (tailIsZero, "Case F impulse response has no tail beyond sample 18 (no hidden IIR/pole processing)");
-    }
 
-    // --- Frequency-domain checks (Case B / Case C) ------------------------
-    {
-        const double dcMagFir = std::abs (firResponseAt (0.0));
-        checkNear (dcMagFir, 1.0, 1.0e-9, "Case B (FIR alone) DC gain is unity");
-
-        const double dcMagMerged = std::abs (mergedResponseAt (0.0));
-        checkNear (dcMagMerged, 1.0, 1.0e-9, "Case C (FIR + pole) DC gain is unity");
-
-        const double droopDb = 20.0 * std::log10 (std::abs (mergedResponseAt (passbandEdgeHz)));
-        checkNear (droopDb, passbandDroopDbAt20k, 0.05, "Case C droop at 20 kHz matches article figure");
-
-        const double flatDb = 20.0 * std::log10 (std::abs (firResponseAt (passbandEdgeHz)));
-        checkNear (flatDb, 0.0, 0.05, "Case B (FIR alone) has no droop at 20 kHz");
-
-        const double stopbandB = worstLevelDbInBand (firResponseAt, stopbandEdgeHz, 96000.0);
-        checkNear (stopbandB, caseBWorstStopbandLevelDb, 0.5, "Case B worst-case stopband level matches article figure");
-
-        const double stopbandC = worstLevelDbInBand (mergedResponseAt, stopbandEdgeHz, 96000.0);
-        checkNear (stopbandC, worstStopbandLevelDb, 0.5, "Case C worst-case stopband level matches article figure");
-    }
-
-    // --- Frequency-domain diagnostic (Case F) -----------------------------
-    // Evaluate at the specific points requested by the validation spec:
-    // 0, 5k, 10k, 15k, 20k, 29.06k, 76k, 80k, 90k, 96k Hz, printed for
-    // manual inspection. The 0-20 kHz points are checked against the
-    // nominal trajectory T_dB(f) = -0.5*f/20000 with the spec's own
-    // +/-0.1 dB freedom envelope (0 dB at DC and -0.5 dB at 20 kHz are
-    // pinned exactly). Points at/after 76 kHz are checked as coarse
-    // stopband spot values; the true worst case comes from the dense
-    // sweep below, not from these endpoints alone.
-    {
-        const double checkFreqs[] = { 0.0, 5000.0, 10000.0, 15000.0, 20000.0,
-                                       29060.0, 76000.0, 80000.0, 90000.0, 96000.0 };
-        std::printf ("\nCase F frequency response diagnostic:\n");
-        for (double f : checkFreqs)
-        {
-            const double db = 20.0 * std::log10 (std::abs (caseFResponseAt (f)));
-            std::printf ("  H(%8.1f Hz) = % .4f dB\n", f, db);
-        }
-
-        const double dcDb = 20.0 * std::log10 (std::abs (caseFResponseAt (0.0)));
-        checkNear (dcDb, 0.0, 0.01, "Case F DC gain is exactly 0 dB (unity)");
-
-        const double at20kDb = 20.0 * std::log10 (std::abs (caseFResponseAt (passbandEdgeHz)));
-        checkNear (at20kDb, caseFDroopDbAt20k, 0.02, "Case F gain at 20 kHz is exactly -0.5 dB (pinned trajectory endpoint)");
-
-        // Passband trajectory envelope check at 5k/10k/15k: nominal
-        // straight line from 0 dB at DC to -0.5 dB at 20 kHz, +/-0.1 dB
-        // freedom, per the validation spec.
-        const double envelopeFreqs[] = { 5000.0, 10000.0, 15000.0 };
-        bool allWithinEnvelope = true;
-        for (double f : envelopeFreqs)
-        {
-            const double db = 20.0 * std::log10 (std::abs (caseFResponseAt (f)));
-            const double trajectory = -0.5 * f / 20000.0;
-            if (db < trajectory - 0.1 - 1.0e-9 || db > trajectory + 0.1 + 1.0e-9)
-                allWithinEnvelope = false;
-        }
-        check (allWithinEnvelope, "Case F passband stays within +/-0.1 dB of the nominal trajectory at 5k/10k/15k Hz");
-
-        const double minus3dBActualDb = 20.0 * std::log10 (std::abs (caseFResponseAt (caseFMinus3dBHz)));
-        checkNear (minus3dBActualDb, -3.0, 0.05, "Case F gain near 29.06 kHz is approximately -3 dB");
-
-        // Coarse stopband spot checks at the requested points.
-        const double stopbandSpotFreqs[] = { 76000.0, 80000.0, 90000.0, 96000.0 };
-        bool allBelowMinus90 = true;
-        for (double f : stopbandSpotFreqs)
-        {
-            const double db = 20.0 * std::log10 (std::abs (caseFResponseAt (f)));
-            if (db > -90.0)
-                allBelowMinus90 = false;
-        }
-        check (allBelowMinus90, "Case F stopband spot checks (76k/80k/90k/96k Hz) are all below -90 dB");
-
-        // Dense sweep for the true worst-case stopband maximum across the
-        // full 76-96 kHz band, not just the endpoint(s) above.
-        const double stopbandF = denseWorstLevelDbInBand (caseFResponseAt, stopbandEdgeHz, 96000.0, 20001);
-        checkNear (stopbandF, caseFWorstStopbandLevelDb, 0.5, "Case F true worst-case stopband level (dense sweep) matches validation spec (~-98.29 dB)");
-    }
-
-    // --- Group delay ------------------------------------------------------
-    {
-        const std::function<Complex (double)> firFn = firResponseAt;
-        const std::function<Complex (double)> mergedFn = mergedResponseAt;
-        const std::function<Complex (double)> caseFFn = caseFResponseAt;
-
-        const double gdB = meanGroupDelaySamples (firFn, passbandEdgeHz);
-        checkNear (gdB, static_cast<double> (caseBGroupDelaySamples), 0.02, "Case B group delay is exactly (N-1)/2 samples");
-
-        const double gdC = meanGroupDelaySamples (mergedFn, passbandEdgeHz);
-        checkNear (gdC, groupDelaySamples, 0.05, "Case C mean group delay across passband matches article figure");
-
-        const double gdF = meanGroupDelaySamples (caseFFn, passbandEdgeHz);
-        checkNear (gdF, static_cast<double> (caseFGroupDelaySamples), 0.02, "Case F group delay is exactly (N-1)/2 = 9 samples (no pole)");
-    }
-
-    // --- Mode dispatch and channel independence ---------------------------
-    {
-        MiniProcessor procBypass;
-        MiniProcessor procCaseB;
-        MiniProcessor procCaseC;
-        MiniProcessor procCaseF;
-
-        const std::vector<double> testSignal = { 0.0, 1.0, -0.5, 0.25, 0.0, -0.75, 0.9, 0.1, 0.0, 0.0 };
-
-        bool bypassMatchesDry = true;
-        bool caseBMatchesWetB = true;
-        bool caseCMatchesWetC = true;
-        bool caseFMatchesWetF = true;
-
-        for (double x : testSignal)
-        {
-            const auto outBypass = procBypass.tick (x);
-            const auto outCaseB = procCaseB.tick (x);
-            const auto outCaseC = procCaseC.tick (x);
-            const auto outCaseF = procCaseF.tick (x);
-
-            if (std::fabs (outBypass.dry - outBypass.dry) > 0.0) bypassMatchesDry = false; // trivially true, documents intent
-            if (std::fabs (outCaseB.wetB - outCaseB.wetB) > 0.0) caseBMatchesWetB = false;
-            if (std::fabs (outCaseC.wetC - outCaseC.wetC) > 0.0) caseCMatchesWetC = false;
-            if (std::fabs (outCaseF.wetF - outCaseF.wetF) > 0.0) caseFMatchesWetF = false;
-        }
-
-        check (bypassMatchesDry, "Mode::bypass output field is the dry (latency-matched) signal");
-        check (caseBMatchesWetB, "Mode::caseB output field is the FIR-only signal");
-        check (caseCMatchesWetC, "Mode::caseC output field is the FIR+pole signal");
-        check (caseFMatchesWetF, "Mode::caseF output field is the joint-optimized-FIR-only signal");
-
-        // Two independent instances fed different signals must never
-        // influence each other own internal state.
-        MiniProcessor chanA;
-        MiniProcessor chanB;
-        for (int n = 0; n < 5; ++n)
-            chanA.tick (1.0);
-        double afterA = chanA.tick (0.0).wetC;
-        double freshB = chanB.tick (0.0).wetC;
-        check (afterA != 0.0 || freshB == 0.0, "Independent processor instances do not share state");
-        check (freshB == 0.0, "A freshly-constructed channel has zero output for zero input with no history");
-
-        // Regression test for pole-state leakage into Case F specifically.
-        // Both instances are first fed an identical warmup signal, so
-        // their history buffers, write indices AND pole states all start
-        // identical. Then only one instance's pole state (poleW1/poleY1)
-        // is artificially poisoned (the history buffer, which is what
-        // wetF actually reads, is left untouched and identical in both).
-        // Because wetF is computed purely from caseFFirTaps() over the
-        // shared raw input history and never reads poleW1/poleY1, feeding
-        // both instances the same subsequent input must still produce
-        // bit-identical wetF sequences - "any residual pole state would
-        // invalidate the impulse test" is exactly what this isolates and
-        // guards against.
-        MiniProcessor hotPole;
-        MiniProcessor coldPole;
-        const std::vector<double> warmup = { 0.8, -0.6, 0.8, -0.6, 0.8, -0.6, 0.8, -0.6 };
-        for (double x : warmup)
-        {
-            hotPole.tick (x);
-            coldPole.tick (x);
-        }
-        hotPole.poleW1 = 123.456; // poison only the pole state, not the history buffer
-        hotPole.poleY1 = -789.012;
-        check (hotPole.poleW1 != coldPole.poleW1, "Sanity: the 'hot' instance has poisoned pole state the 'cold' instance lacks");
-
-        bool caseFUnaffectedByPoleState = true;
-        const std::vector<double> probeSignal = { 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.5, 0.0, 0.0, 0.0 };
-        for (double x : probeSignal)
-        {
-            const double hotWetF = hotPole.tick (x).wetF;
-            const double coldWetF = coldPole.tick (x).wetF;
-            if (std::fabs (hotWetF - coldWetF) > 1.0e-15)
-                caseFUnaffectedByPoleState = false;
-        }
-        check (caseFUnaffectedByPoleState, "Case F output is bit-identical regardless of Case C's pole-state history (no state leakage)");
-    }
-
-    // --- Sample-rate validity threshold (matches prepareToPlay logic) ------
-    {
-        const double target = static_cast<double> (sampleRateHz);
-        check (std::fabs (192000.0 - target) < 0.5, "Exact 192000 Hz is accepted as valid");
-        check (std::fabs (192000.4 - target) < 0.5, "192000.4 Hz (within tolerance) is accepted as valid");
-        check (! (std::fabs (191999.0 - target) < 0.5), "191999 Hz (outside tolerance) is correctly rejected");
-        check (! (std::fabs (96000.0 - target) < 0.5), "96000 Hz (half rate) is correctly rejected");
+        check (startsAtOld, "Crossfade starts exactly on the old design's own output");
+        check (endsAtNew, "Crossfade ends exactly on the new design's own output");
+        check (staysInBetween, "Crossfade output never exceeds the range spanned by the two designs at any sample");
     }
 
     std::printf ("\n%d/%d checks passed\n", checksRun - checksFailed, checksRun);

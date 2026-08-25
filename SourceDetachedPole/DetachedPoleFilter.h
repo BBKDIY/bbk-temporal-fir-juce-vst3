@@ -1,169 +1,57 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <vector>
 
-// BBK Detached Pole: reproduces "Case C" from the accompanying article's
-// Part Two, "A Practical Challenge to the FIR Frontier: The Detached Real
-// Pole" - a 19-tap Type-I linear-phase FIR (Parks-McClellan, 20 kHz
-// passband / 76 kHz stopband edges, unity DC gain) cascaded with a single
-// first-order real IIR pole whose cut-off (47 kHz) is deliberately
-// decoupled from the FIR's own passband edge rather than tied to it. This
-// combination reaches lower peak-sidelobe amplitude and total ringing
-// energy, and a shorter response duration, than any pure-FIR design at
-// this article's tested tap counts - at the cost of a small (~0.5 dB)
-// passband droop.
+// BBK Detached Pole: shared constants for the single parametric
+// constrained-least-squares FIR lowpass (see ParametricFIR.h for the
+// design method itself). This plugin used to host a fixed A/B/C/F
+// loopback comparator at a hard-locked 192 kHz; it now auto-detects the
+// host sample rate and exposes three live controls - cutoff, attenuation
+// at cutoff, and minimum stopband rejection - each of which triggers a
+// background redesign (see PluginProcessor.cpp).
 //
-// Found by the article's own bounded grid search over passband edge and
-// pole cut-off (Part Two Methodology, "Case C was located by a grid
-// search over passband edge fp ... and real-pole cut-off fc ..."),
-// reproduced independently here via scipy.signal.remez(19, [0, 20000,
-// 76000, 96000], [1, 0], weight=[1, 1], fs=192000) for the FIR stage and
-// scipy.signal.bilinear with frequency pre-warping for the pole stage,
-// and verified to match the article's own published Case C figures
-// (Rpeak=9.251%, EZC=1.552%, duration=15 samples/0.078 ms, worst-case
-// stopband -116.17 dB, droop -0.50 dB at 20 kHz) to within numerical
-// precision.
+// maxHalfLength bounds how many taps a design may use (2*maxHalfLength+1
+// at most). Every design, however few taps it actually needed, is
+// zero-padded out to that fixed length and centred on the same middle
+// index (see padTapsToFixedLength() below), so the host-reported latency
+// (maxHalfLength samples) never changes at runtime regardless of slider
+// values or sample rate - only the number of non-zero taps does.
 namespace bbk::detachedpole
 {
-constexpr int sampleRateHz = 192000;
-constexpr int firTapCount = 19;
-constexpr int firCentreIndex = 9; // (firTapCount - 1) / 2
+constexpr int maxHalfLength = 80;
+constexpr int maxTapCount = 2 * maxHalfLength + 1; // 161
+constexpr int latencySamples = maxHalfLength;
 
-constexpr double passbandEdgeHz = 20000.0;
-constexpr double stopbandEdgeHz = 76000.0;
-constexpr double poleCutoffHz = 47000.0;
+// History buffer must cover maxTapCount taps read back from the current
+// write position, with headroom for the write index wrapping mid-block.
+constexpr int historyLength = 512;
 
-// 19-tap Type-I linear-phase FIR stage, unity DC gain.
-inline const std::array<double, firTapCount>& firTaps()
+constexpr double defaultCutoffHz = 20000.0;
+constexpr double defaultAttenuationDb = 0.5;
+constexpr double defaultStopbandRejectionDb = 98.0;
+
+constexpr double minCutoffHz = 1000.0;
+constexpr double maxCutoffHz = 40000.0;
+constexpr double minAttenuationDb = 0.0;
+constexpr double maxAttenuationDb = 3.0;
+constexpr double minStopbandRejectionDb = 40.0;
+constexpr double maxStopbandRejectionDb = 140.0;
+
+// Build a fixed-length (maxTapCount), zero-padded, centre-aligned tap
+// array from a design's own (possibly much shorter) symmetric taps. This
+// is what keeps the group delay - and therefore the host-reported latency
+// - constant across every slider and sample-rate combination: only the
+// span of non-zero taps changes, never the array length or its centre.
+inline std::array<double, maxTapCount> padTapsToFixedLength (const std::vector<double>& taps)
 {
-    static const std::array<double, firTapCount> taps = { {
-        0.0007140731720717181,
-        -3.996346537482728e-06,
-        -0.005516281247398584,
-        1.949491617795857e-05,
-        0.023137533212360898,
-        -4.955388278021481e-05,
-        -0.07462639836592817,
-        8.22815332045434e-05,
-        0.306292317743205,
-        0.4999010585312485,
-        0.306292317743205,
-        8.22815332045434e-05,
-        -0.07462639836592817,
-        -4.955388278021481e-05,
-        0.023137533212360898,
-        1.949491617795857e-05,
-        -0.005516281247398584,
-        -3.996346537482728e-06,
-        0.0007140731720717181
-    } };
-    return taps;
+    std::array<double, maxTapCount> padded {};
+    const int n = static_cast<int> (taps.size());
+    const int m = (n - 1) / 2;
+    const int offset = maxHalfLength - m;
+    for (int i = 0; i < n; ++i)
+        padded[static_cast<std::size_t> (offset + i)] = taps[static_cast<std::size_t> (i)];
+    return padded;
 }
-
-// First-order real-pole IIR stage: y[n] = poleB0*w[n] + poleB1*w[n-1] -
-// poleA1*y[n-1], where w[n] is the FIR stage's own output. Designed from
-// an analogue H(s) = wc/(s+wc) at poleCutoffHz, frequency pre-warped
-// (wc_prewarped = 2*Fs*tan(pi*fc/Fs)) and bilinear-transformed at
-// sampleRateHz - matches scipy.signal.bilinear with pre-warping, the same
-// convention used throughout the accompanying article's Methodology.
-constexpr double poleB0 = 0.4918180389323442;
-constexpr double poleB1 = 0.4918180389323442;
-constexpr double poleA1 = -0.01636392213531156;
-
-// Verified metrics for this exact design, reproduced independently from
-// the taps/pole coefficients above (see Tests/DSPTestDetachedPole.cpp)
-// and matching the article's own published Case C figures.
-constexpr double peakSidelobePercent = 9.251;
-constexpr double totalRingingEnergyPercent = 1.552;
-constexpr int durationSamples = 15;
-constexpr double durationMicroseconds = durationSamples * 1.0e6 / static_cast<double> (sampleRateHz);
-constexpr double worstStopbandLevelDb = -116.17;
-constexpr double passbandDroopDbAt20k = -0.50;
-constexpr double groupDelaySamples = 9.515; // mean across 0-20 kHz, flat to within +/-0.002 samples
-
-// Case B (the same 19-tap FIR above, used alone with no pole stage) -
-// verified metrics matching the article's own published Case B figures
-// (Part Two): Rpeak=14.93%, EZC=2.73%, worst-case stopband -105.94 dB,
-// exactly flat passband (no droop - Case B has no pole), exact group
-// delay of (firTapCount-1)/2 = 9 samples (plain linear-phase FIR).
-constexpr double caseBPeakSidelobePercent = 14.928;
-constexpr double caseBTotalRingingEnergyPercent = 2.728;
-constexpr int caseBDurationSamples = 18;
-constexpr double caseBWorstStopbandLevelDb = -105.94;
-constexpr int caseBGroupDelaySamples = firCentreIndex; // exactly 9, no pole
-
-// Case F (19-tap joint passband/transition-optimized FIR) - a separate,
-// independently-optimized 19-tap Type-I linear-phase FIR supplied here as
-// a fixed, externally-verified coefficient set (not re-derived inside
-// this plugin, so the implementation being measured is exactly the same
-// numerical solution that produced the analytical result). It was
-// optimized at 192 kHz with the 0-20 kHz passband held within +/-0.1 dB
-// of a straight-line trajectory from 0 dB at DC to -0.5 dB at 20 kHz,
-// the 20-76 kHz transition band left completely unconstrained (the
-// optimizer chose the transition shape freely), and the 76-96 kHz
-// stopband held to approximately -98.1 dB. The objective was to minimize
-// the largest impulse-response sample outside the zero-crossing-bounded
-// main lobe relative to the centre tap. No pole, no oversampling, and no
-// coefficient renormalization beyond floating-point roundoff at the
-// 1e-12 level are applied here or at load time.
-inline const std::array<double, firTapCount>& caseFFirTaps()
-{
-    static const std::array<double, firTapCount> taps = { {
-         0.003155439812,
-         0.010428539232,
-         0.005651821553,
-        -0.014349256024,
-        -0.014349256024,
-        -0.002697321491,
-        -0.014349356024,
-         0.051673448469,
-         0.269888428340,
-         0.409895024314,
-         0.269888428340,
-         0.051673448469,
-        -0.014349356024,
-        -0.002697321491,
-        -0.014349256024,
-        -0.014349256024,
-         0.005651821553,
-         0.010428539232,
-         0.003155439812
-    } };
-    return taps;
-}
-
-// Verified metrics for the Case F coefficients above, reproduced
-// independently from the taps themselves (see
-// Tests/DSPTestDetachedPole.cpp) - nothing here is hardcoded from the
-// validation spec except the tolerances used to compare against it:
-// Rpeak=3.5007%, EZC=0.484%, duration=18 samples (full 19-tap span,
-// same convention as Case B), worst-case stopband ~-98.29 dB across
-// 76-96 kHz, exact group delay of (firTapCount-1)/2 = 9 samples (plain
-// linear-phase FIR, no pole), -0.50 dB droop at 20 kHz (built into the
-// FIR's own shape, not a pole stage), and a -3 dB point near 29.06 kHz.
-constexpr double caseFPeakSidelobePercent = 3.5007;
-constexpr double caseFTotalRingingEnergyPercent = 0.484;
-constexpr int caseFDurationSamples = 18;
-constexpr double caseFWorstStopbandLevelDb = -98.29;
-constexpr double caseFDroopDbAt20k = -0.50;
-constexpr int caseFGroupDelaySamples = firCentreIndex; // exactly 9, no pole
-constexpr double caseFMinus3dBHz = 29060.0;
-
-// Latency reported to the host: the nearest integer to Case C's own
-// near-flat group delay (~9.515 samples across the passband) - the same
-// figure used uniformly across all wet modes (Case B, Case C, Case F all
-// have an actual group delay within one sample of this value) so the
-// reported host latency never changes at runtime regardless of which
-// mode is selected. The dry (bypass) path is delayed by exactly this
-// many samples so toggling bypass never clicks.
-constexpr int latencySamples = 10;
-
-// History buffer length: must cover the FIR's own tap count (19) and the
-// dry-path delay (10), plus headroom. The pole's own state is tracked
-// separately (it is IIR, not part of this buffer). Case B, Case C and
-// Case F all read from this same shared input-sample history, but each
-// case's own wet output is computed independently every sample from its
-// own coefficients (and, for Case C only, its own separate pole state) -
-// no case ever reads another case's coefficients, pole state, or output.
-constexpr int historyLength = 32;
 }

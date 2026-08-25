@@ -15,18 +15,30 @@ public:
 
 private:
     void timerCallback() override;
+    void toggleCoefficientsPopup();
+    void refreshCoefficientsText (const BBKDetachedPoleAudioProcessor::DesignSnapshot&);
 
     BBKDetachedPoleAudioProcessor& processor;
 
     juce::Label title;
     juce::Label subtitle;
     juce::Label sampleRate;
-    juce::Label status;
-    juce::ComboBox modeBox;
+
+    juce::Label cutoffLabel;
+    juce::Slider cutoffSlider;
+    juce::Label attenuationLabel;
+    juce::Slider attenuationSlider;
+    juce::Label stopbandLabel;
+    juce::Slider stopbandSlider;
 
     juce::Label metricsReadout;
+    juce::TextButton coefficientsButton { "Show Coefficients" };
+    juce::TextEditor coefficientsBox;
+    bool coefficientsVisible = false;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };

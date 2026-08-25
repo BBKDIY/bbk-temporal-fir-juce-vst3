@@ -13,6 +13,7 @@ target_compile_features(BBKTemporalFIR_DSPTest PRIVATE cxx_std_17)
 add_executable(BBKDetachedPole_DSPTest
     Tests/DSPTestDetachedPole.cpp
     SourceDetachedPole/DetachedPoleFilter.h
+    SourceDetachedPole/ParametricFIR.h
 )
 target_compile_features(BBKDetachedPole_DSPTest PRIVATE cxx_std_17)
 
@@ -96,6 +97,7 @@ juce_add_plugin(BBKDetachedPole
 
 target_sources(BBKDetachedPole PRIVATE
     SourceDetachedPole/DetachedPoleFilter.h
+    SourceDetachedPole/ParametricFIR.h
     SourceDetachedPole/PluginProcessor.h
     SourceDetachedPole/PluginProcessor.cpp
     SourceDetachedPole/PluginEditor.h
