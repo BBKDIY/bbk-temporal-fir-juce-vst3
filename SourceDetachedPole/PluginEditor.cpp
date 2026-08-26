@@ -38,6 +38,17 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "bypass", bypassButton);
 
+    // Opt-in trade-off (see ParametricFIR.h): off by default. On, the
+    // whole cutoff-to-Nyquist span becomes one free transition zone
+    // instead of the paper's flat mirror-band mask - better temporal
+    // concentration, but most of that span sits well above the stopband
+    // floor until right at Nyquist, safe only if nothing downstream can
+    // fold that energy back into the audible band.
+    freeTransitionButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (freeTransitionButton);
+    freeTransitionAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "freeTransition", freeTransitionButton);
+
     prepareLabel (cutoffLabel, 13.0f, false, juce::Justification::centredLeft);
     cutoffLabel.setText ("Cutoff", juce::dontSendNotification);
     addAndMakeVisible (cutoffLabel);
@@ -78,7 +89,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 510);
+    setSize (680, 560);
     startTimerHz (4);
     timerCallback();
 }
@@ -117,8 +128,11 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     sliderRow (attenuationLabel, attenuationSlider);
     sliderRow (stopbandLabel, stopbandSlider);
 
+    freeTransitionButton.setBounds (area.removeFromTop (24));
+    area.removeFromTop (6);
+
     area.removeFromTop (10);
-    metricsReadout.setBounds (area.removeFromTop (140));
+    metricsReadout.setBounds (area.removeFromTop (160));
 
     area.removeFromTop (8);
     coefficientsButton.setBounds (area.removeFromTop (26).removeFromLeft (200));
@@ -176,13 +190,20 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         if (bypassParam->load() > 0.5f)
             text << "BYPASSED (dry signal, delay-matched - no filtering audible)\n";
 
+    const bool freeTransition = snap.stopbandMode == bbk::parametric::StopbandMode::FreeTransition;
+
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
          << "Target: cutoff " << juce::String (snap.cutoffHz, 0) << " Hz, "
          << juce::String (snap.attenuationAtCutoffDb, 2) << " dB at cutoff, "
          << juce::String (snap.stopbandRejectionDb, 1) << " dB min. stopband rejection\n"
-         << "Achieved worst-case stopband level: " << juce::String (snap.achievedStopbandDb, 2) << " dB (Nyquist = "
-         << juce::String (nyquist, 0) << " Hz)\n"
+         << "Stopband mode: " << (freeTransition
+              ? "Free transition - only a narrow guard band right at Nyquist is held to the floor; most of "
+                "cutoff-Nyquist may sit well above it. Safe only if nothing downstream can fold that energy back."
+              : "Flat mask (paper-faithful) - the floor is held across the whole mirror band, not just at Nyquist.")
+         << "\n"
+         << "Achieved worst-case level in the enforced region: " << juce::String (snap.achievedStopbandDb, 2)
+         << " dB (Nyquist = " << juce::String (nyquist, 0) << " Hz)\n"
          << "Design attempts (tap-count search): " << snap.designAttempts << "\n"
          << "Temporal concentration (from the article's own metrics):\n"
          << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "

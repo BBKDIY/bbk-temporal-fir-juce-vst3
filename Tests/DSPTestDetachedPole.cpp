@@ -29,6 +29,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 using namespace bbk::detachedpole;
@@ -118,6 +119,20 @@ std::vector<double> stopEdgeCandidates (const FilterSpec& spec, int tapCount)
     if (narrowStopEdge < fc) narrowStopEdge = fc;
 
     return { mirrorStopEdge, kaiserStopEdge, narrowStopEdge };
+}
+
+// Mirrors the guard-band formula in ParametricFIR.h's attemptDesign()
+// for StopbandMode::FreeTransition: min(2000 Hz, 3% of available span),
+// floored at 200 Hz, capped at the available span itself.
+std::pair<double, double> freeTransitionGuardBand (const FilterSpec& spec)
+{
+    const double nyquist = spec.sampleRateHz * 0.5;
+    double totalAvailable = nyquist - spec.cutoffHz;
+    if (totalAvailable < 1.0) totalAvailable = 1.0;
+    double guardWidth = std::min (2000.0, totalAvailable * 0.03);
+    guardWidth = std::max (guardWidth, 200.0);
+    guardWidth = std::min (guardWidth, totalAvailable);
+    return { nyquist - guardWidth, nyquist };
 }
 
 double denseWorstDbInBand (const std::vector<double>& taps, double sampleRateHz, double loHz, double hiHz, int numPoints = 20001)
@@ -401,6 +416,52 @@ int main()
 
         std::printf ("  [Case C via engine] taps=%d worst(76-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% (paper reference: 19 taps, -98.29dB, 3.5007%%, 0.4839%%)\n",
             engineResult.tapCount, engineWorst, engineResult.temporal.rPeakPercent, engineResult.temporal.eZcPercent);
+    }
+
+    // --- StopbandMode::FreeTransition (opt-in mode, off by default) -------
+    // Same practical spec as the Case C comparison above, but with the
+    // whole cutoff-Nyquist span treated as one free transition zone
+    // instead of the paper's flat mirror-band mask. Checks: (1) the hard
+    // floor is still met, but only in the narrow guard band right at
+    // Nyquist, matching attemptDesign()'s own guard-width formula; (2)
+    // the mid-transition response is *not* required to (and in general
+    // will not) reach the floor - that is the accepted, documented cost
+    // of this mode, not a bug; (3) since FreeTransition's hard-enforced
+    // region is a strict subset of FlatMask's (a narrow guard band inside
+    // the wider mirror band), any FlatMask-feasible solution at a given M
+    // is trivially FreeTransition-feasible too, so FreeTransition's own
+    // ringing metrics should be at least as good, not worse.
+    {
+        FilterSpec freeSpec { 192000.0, 20000.0, 0.50, 98.0 };
+        freeSpec.stopbandMode = StopbandMode::FreeTransition;
+        auto freeResult = designParametricFIR (freeSpec, maxTapCount);
+        check (freeResult.constraintsMet, "[FreeTransition] design reports its own targets as met");
+
+        const auto guard = freeTransitionGuardBand (freeSpec);
+        const double guardWorst = denseWorstDbInBand (freeResult.taps, freeSpec.sampleRateHz, guard.first, guard.second);
+        check (guardWorst <= -freeSpec.stopbandRejectionDb + 0.5,
+            "[FreeTransition] the narrow guard band right at Nyquist meets the requested rejection");
+        std::printf ("  [FreeTransition] guard band %.0f-%.0f Hz worst=%.3fdB (target <= %.3fdB)\n",
+            guard.first, guard.second, guardWorst, -freeSpec.stopbandRejectionDb + 0.5);
+
+        // Mid-transition: explicitly NOT required to meet the floor - this
+        // documents the trade-off rather than silently assuming it.
+        const double midFreq = 0.5 * (freeSpec.cutoffHz + freeSpec.sampleRateHz * 0.5);
+        const double midDb = 20.0 * std::log10 (std::abs (responseAt (freeResult.taps, midFreq, freeSpec.sampleRateHz)) + 1.0e-300);
+        std::printf ("  [FreeTransition] mid-transition (%.0f Hz) response=%.3fdB (no floor required here by design)\n", midFreq, midDb);
+
+        FilterSpec flatSpec = freeSpec;
+        flatSpec.stopbandMode = StopbandMode::FlatMask;
+        auto flatResult = designParametricFIR (flatSpec, maxTapCount);
+
+        check (freeResult.temporal.rPeakPercent <= flatResult.temporal.rPeakPercent + 0.5,
+            "[FreeTransition] R_peak is at least as good as FlatMask for the same spec (subset-constraint guarantee)");
+        check (freeResult.temporal.eZcPercent <= flatResult.temporal.eZcPercent + 0.1,
+            "[FreeTransition] E_ZC is at least as good as FlatMask for the same spec (subset-constraint guarantee)");
+        std::printf ("  [FreeTransition vs FlatMask] taps=%d/%d R_peak=%.3f%%/%.3f%% E_ZC=%.4f%%/%.4f%%\n",
+            freeResult.tapCount, flatResult.tapCount,
+            freeResult.temporal.rPeakPercent, flatResult.temporal.rPeakPercent,
+            freeResult.temporal.eZcPercent, flatResult.temporal.eZcPercent);
     }
 
     // --- Fixed latency invariance across wildly different tap counts ------

@@ -100,6 +100,25 @@
 // ~98 dB stopband target - matching, and in these cases slightly
 // beating, the article's own results from an independently-written
 // solver. See Tests/DSPTestDetachedPole.cpp for the exact comparison.
+//
+// StopbandMode::FreeTransition is a second, explicitly opt-in mode: the
+// article's own Case A/B/C geometry (flat -stopbandRejectionDb enforced
+// across the whole mirror band [Nyquist-cutoff, Nyquist]) is replaced by
+// treating the *entire* [cutoff, Nyquist] span as one free transition
+// zone, with -stopbandRejectionDb only enforced in a narrow guard band
+// immediately below Nyquist (a few hundred Hz to a couple of kHz, not a
+// single point - a literal one-point constraint is not numerically
+// meaningful and doesn't bound the response just below it). This trades
+// away the flat band's margin for better temporal concentration at the
+// same tap count, at a real, accepted cost: most of the transition can
+// sit far above -stopbandRejectionDb (often only 20-40 dB down) until
+// very close to Nyquist. That is only safe when nothing between this
+// plugin and final reconstruction can fold that near-Nyquist energy back
+// into the audible band - any downstream nonlinearity (saturation,
+// compression, dither, a further sample-rate conversion) can alias it
+// straight back down. FlatMask remains the default for exactly that
+// reason; FreeTransition is a deliberate, informed trade the user opts
+// into, not a replacement.
 
 #include <algorithm>
 #include <chrono>
@@ -115,12 +134,20 @@
 namespace bbk::parametric
 {
 
+// See the top-of-file comment for the trade-off between these two modes.
+enum class StopbandMode
+{
+    FlatMask,       // default: paper-faithful, -stopbandRejectionDb held flat across [Nyquist-cutoff, Nyquist] (or a Kaiser/narrow fallback)
+    FreeTransition  // opt-in: [cutoff, Nyquist] is one free transition zone, -stopbandRejectionDb only enforced in a narrow guard band right at Nyquist
+};
+
 struct FilterSpec
 {
     double sampleRateHz = 192000.0;
     double cutoffHz = 20000.0;
     double attenuationAtCutoffDb = 0.5;
     double stopbandRejectionDb = 98.0;
+    StopbandMode stopbandMode = StopbandMode::FlatMask;
 };
 
 // The paper's own time-domain concentration metrics (Section 8.1),
@@ -679,6 +706,30 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         return { a, sbCompliant && pbCompliant, worstStopbandDb };
     };
 
+    double totalAvailable = nyquist - fc;
+    if (totalAvailable < 1.0) totalAvailable = 1.0;
+
+    // FreeTransition mode (see top-of-file comment): skip the paper's
+    // fixed mirror-rule candidate search entirely. solveForStopEdge
+    // already treats [stopEdge, Nyquist] as the only hard-enforced
+    // region and everything below stopEdge as a free transition with no
+    // pointwise frequency constraint of its own (only the passband band
+    // and the sidelobe/rho ringing bound reach that far) - so this mode
+    // is just a single solveForStopEdge call with stopEdge pushed to a
+    // narrow guard band right at Nyquist, reusing the exact same solver.
+    // Guard width: at least 200 Hz (so the LP row and dense-verify sweep
+    // stay numerically meaningful, not a single point), at most 2 kHz or
+    // 3% of the available [cutoff, Nyquist] span, whichever is smaller.
+    if (spec.stopbandMode == StopbandMode::FreeTransition)
+    {
+        double guardWidth = std::min (2000.0, totalAvailable * 0.03);
+        guardWidth = std::max (guardWidth, 200.0);
+        guardWidth = std::min (guardWidth, totalAvailable); // never exceed the available span itself
+        double freeStopEdge = nyquist - guardWidth;
+        if (freeStopEdge < fc) freeStopEdge = fc;
+        return solveForStopEdge (freeStopEdge);
+    }
+
     // Fixed geometric rule (see top-of-file comment): reserve an
     // enforced-stopband width equal to the passband's own width, clamped
     // to [5%, 60%] of the available [cutoff, Nyquist] band. This
@@ -693,8 +744,6 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
     // re-solving at every step of a geometric series - for every M the
     // outer search tries, up to the 161-tap cap - is what made an
     // earlier version of this function hang for such specs.
-    double totalAvailable = nyquist - fc;
-    if (totalAvailable < 1.0) totalAvailable = 1.0;
 
     double mirrorEnforcedWidth = fc;
     mirrorEnforcedWidth = std::min (mirrorEnforcedWidth, totalAvailable * 0.6);

@@ -76,6 +76,7 @@ public:
         double cutoffHz = 0.0;
         double attenuationAtCutoffDb = 0.0;
         double stopbandRejectionDb = 0.0;
+        bbk::parametric::StopbandMode stopbandMode = bbk::parametric::StopbandMode::FlatMask;
         int tapCount = 0;
         double achievedStopbandDb = 0.0;
         bool constraintsMet = false;
