@@ -22,7 +22,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     : AudioProcessorEditor (&p), processor (p)
 {
     prepareLabel (title, 22.0f, true);
-    title.setText ("BBK Parametric FIR to Nyquist", juce::dontSendNotification);
+    title.setText ("BBK Parametric FIR", juce::dontSendNotification);
     addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);

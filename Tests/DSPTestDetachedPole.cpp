@@ -1,5 +1,4 @@
-// Framework-independent DSP verification for the BBK Parametric FIR to
-// Nyquist plugin.
+// Framework-independent DSP verification for the BBK Parametric FIR plugin.
 // Builds and runs with plain g++ (no JUCE dependency) so it can act as a
 // fast CI gate before the real MSVC/JUCE build.
 //

@@ -7,7 +7,7 @@
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
 
-// BBK Parametric FIR to Nyquist: a single parametric constrained-least-squares FIR
+// BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
 // controls - cutoff, attenuation at cutoff, and minimum stopband
 // rejection - are handed straight to bbk::parametric::designParametricFIR().
@@ -41,7 +41,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "BBK Parametric FIR to Nyquist"; }
+    const juce::String getName() const override { return "BBK Parametric FIR"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
