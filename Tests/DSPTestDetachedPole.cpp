@@ -1,4 +1,5 @@
-// Framework-independent DSP verification for the BBK Parametric FIR plugin.
+// Framework-independent DSP verification for the BBK Parametric FIR to
+// Nyquist plugin.
 // Builds and runs with plain g++ (no JUCE dependency) so it can act as a
 // fast CI gate before the real MSVC/JUCE build.
 //
@@ -418,7 +419,12 @@ int main()
             engineResult.tapCount, engineWorst, engineResult.temporal.rPeakPercent, engineResult.temporal.eZcPercent);
     }
 
-    // --- StopbandMode::FreeTransition (opt-in mode, off by default) -------
+    // --- StopbandMode::FreeTransition (the plugin's fixed, only mode) -----
+    // The plugin itself now always designs with this mode (see
+    // PluginProcessor.cpp::specFromParameters()) - FlatMask remains in
+    // the engine purely so the Case C reference comparison above can
+    // keep validating directly against the article's own published
+    // numbers, not because the plugin still offers a runtime choice.
     // Same practical spec as the Case C comparison above, but with the
     // whole cutoff-Nyquist span treated as one free transition zone
     // instead of the paper's flat mirror-band mask. Checks: (1) the hard

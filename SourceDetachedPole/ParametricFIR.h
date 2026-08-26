@@ -101,24 +101,27 @@
 // beating, the article's own results from an independently-written
 // solver. See Tests/DSPTestDetachedPole.cpp for the exact comparison.
 //
-// StopbandMode::FreeTransition is a second, explicitly opt-in mode: the
-// article's own Case A/B/C geometry (flat -stopbandRejectionDb enforced
-// across the whole mirror band [Nyquist-cutoff, Nyquist]) is replaced by
-// treating the *entire* [cutoff, Nyquist] span as one free transition
-// zone, with -stopbandRejectionDb only enforced in a narrow guard band
-// immediately below Nyquist (a few hundred Hz to a couple of kHz, not a
-// single point - a literal one-point constraint is not numerically
-// meaningful and doesn't bound the response just below it). This trades
-// away the flat band's margin for better temporal concentration at the
-// same tap count, at a real, accepted cost: most of the transition can
-// sit far above -stopbandRejectionDb (often only 20-40 dB down) until
-// very close to Nyquist. That is only safe when nothing between this
-// plugin and final reconstruction can fold that near-Nyquist energy back
-// into the audible band - any downstream nonlinearity (saturation,
-// compression, dither, a further sample-rate conversion) can alias it
-// straight back down. FlatMask remains the default for exactly that
-// reason; FreeTransition is a deliberate, informed trade the user opts
-// into, not a replacement.
+// StopbandMode::FreeTransition is a second mode - now the plugin's fixed,
+// only behaviour (see PluginProcessor.cpp::specFromParameters()), though
+// FlatMask remains here in the engine since it is what the Case B/C
+// validation above still checks directly against the article's own
+// published numbers. Where FlatMask enforces -stopbandRejectionDb flat
+// across the whole mirror band [Nyquist-cutoff, Nyquist] (the article's
+// own Case A/B/C geometry), FreeTransition treats the *entire* [cutoff,
+// Nyquist] span as one free transition zone, with -stopbandRejectionDb
+// only enforced in a narrow guard band immediately below Nyquist (a few
+// hundred Hz to a couple of kHz, not a single point - a literal one-point
+// constraint is not numerically meaningful and doesn't bound the response
+// just below it). This trades away the flat band's margin for better
+// temporal concentration at the same tap count, at a real, accepted cost:
+// most of the transition can sit far above -stopbandRejectionDb (often
+// only 20-40 dB down) until very close to Nyquist. That is only safe when
+// nothing between this plugin and final reconstruction can fold that
+// near-Nyquist energy back into the audible band - any downstream
+// nonlinearity (saturation, compression, dither, a further sample-rate
+// conversion) can alias it straight back down. This is a deliberate,
+// informed trade, made explicitly (see the discussion that led to it),
+// not an oversight.
 
 #include <algorithm>
 #include <chrono>

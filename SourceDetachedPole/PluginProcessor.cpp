@@ -11,7 +11,6 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("cutoff", &paramListener);
     parameters.addParameterListener ("attenuation", &paramListener);
     parameters.addParameterListener ("stopband", &paramListener);
-    parameters.addParameterListener ("freeTransition", &paramListener);
 
     startThread();
 }
@@ -26,7 +25,6 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("cutoff", &paramListener);
     parameters.removeParameterListener ("attenuation", &paramListener);
     parameters.removeParameterListener ("stopband", &paramListener);
-    parameters.removeParameterListener ("freeTransition", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -56,16 +54,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "bypass", 1 }, "Bypass", false));
 
-    // Opt-in trade-off, off by default (see ParametricFIR.h top-of-file
-    // comment and StopbandMode): when on, the entire cutoff-to-Nyquist
-    // span becomes one free transition zone instead of the paper's flat
-    // mirror-band mask, trading stopband margin for temporal
-    // concentration. Only safe when nothing downstream can fold the
-    // (mostly weakly-attenuated) near-Nyquist energy back into the
-    // audible band.
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "freeTransition", 1 }, "Free Transition (fc to Nyquist)", false));
-
     return layout;
 }
 
@@ -85,9 +73,17 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     spec.cutoffHz = juce::jmin (cutoffParam, nyquist * 0.9);
     spec.attenuationAtCutoffDb = static_cast<double> (parameters.getRawParameterValue ("attenuation")->load());
     spec.stopbandRejectionDb = static_cast<double> (parameters.getRawParameterValue ("stopband")->load());
-    const bool freeTransitionOn = parameters.getRawParameterValue ("freeTransition")->load() > 0.5f;
-    spec.stopbandMode = freeTransitionOn ? bbk::parametric::StopbandMode::FreeTransition
-                                          : bbk::parametric::StopbandMode::FlatMask;
+
+    // Fixed, not user-switchable: the whole cutoff-to-Nyquist span is
+    // always treated as one free transition zone (see ParametricFIR.h's
+    // StopbandMode::FreeTransition), with -stopbandRejectionDb enforced
+    // only in a narrow guard band right at Nyquist. This was previously
+    // an opt-in toggle; it is now the plugin's only behaviour. FlatMask
+    // (the paper's own flat mirror-band mask) remains in the engine and
+    // is still exercised by Tests/DSPTestDetachedPole.cpp as the direct
+    // validation against the article's published Case B/C numbers, but
+    // is no longer reachable from the plugin itself.
+    spec.stopbandMode = bbk::parametric::StopbandMode::FreeTransition;
     return spec;
 }
 

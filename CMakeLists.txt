@@ -90,7 +90,7 @@ juce_add_plugin(BBKDetachedPole
     PLUGIN_MANUFACTURER_CODE Bbk1
     PLUGIN_CODE Dpol
     FORMATS VST3
-    PRODUCT_NAME "BBK Parametric FIR"
+    PRODUCT_NAME "BBK Parametric FIR to Nyquist"
     NEEDS_WEB_BROWSER FALSE
     NEEDS_CURL FALSE
 )

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <vector>
 
-// BBK Parametric FIR: shared constants for the single parametric
+// BBK Parametric FIR to Nyquist: shared constants for the single parametric
 // constrained-least-squares FIR lowpass (see ParametricFIR.h for the
 // design method itself). This plugin used to host a fixed A/B/C/F
 // loopback comparator at a hard-locked 192 kHz; it now auto-detects the

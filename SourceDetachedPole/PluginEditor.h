@@ -24,7 +24,6 @@ private:
     juce::Label subtitle;
     juce::Label sampleRate;
     juce::ToggleButton bypassButton { "Bypass" };
-    juce::ToggleButton freeTransitionButton { "Free Transition (fc to Nyquist)" };
 
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
@@ -42,7 +41,6 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> freeTransitionAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };
