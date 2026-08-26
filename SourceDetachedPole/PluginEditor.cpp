@@ -62,6 +62,16 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     attenuationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "attenuation", attenuationSlider);
 
+    // On: the slider above is used as typed (spectrally relaxed, Case
+    // C-style). Off: the slider is ignored entirely and the exact
+    // calibrated near-flat Case B point is used instead - deterministic,
+    // not dependent on typing or host rounding at 0.0001 dB precision
+    // (see DetachedPoleFilter.h::caseBNearFlatAttenuationDb).
+    amplitudeRelaxationButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (amplitudeRelaxationButton);
+    amplitudeRelaxationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "amplitudeRelaxation", amplitudeRelaxationButton);
+
     prepareLabel (stopbandLabel, 13.0f, false, juce::Justification::centredLeft);
     stopbandLabel.setText ("Min. Stopband Rejection", juce::dontSendNotification);
     addAndMakeVisible (stopbandLabel);
@@ -86,7 +96,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 530);
+    setSize (680, 575);
     startTimerHz (4);
     timerCallback();
 }
@@ -123,10 +133,14 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
 
     sliderRow (cutoffLabel, cutoffSlider);
     sliderRow (attenuationLabel, attenuationSlider);
+
+    amplitudeRelaxationButton.setBounds (area.removeFromTop (24));
+    area.removeFromTop (6);
+
     sliderRow (stopbandLabel, stopbandSlider);
 
     area.removeFromTop (10);
-    metricsReadout.setBounds (area.removeFromTop (160));
+    metricsReadout.setBounds (area.removeFromTop (175));
 
     area.removeFromTop (8);
     coefficientsButton.setBounds (area.removeFromTop (26).removeFromLeft (200));
@@ -179,6 +193,12 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     const double nyquist = snap.sampleRateHz * 0.5;
 
+    // The attenuation slider is a no-op while relaxation is off (the
+    // engine uses the fixed calibrated constant instead - see
+    // specFromParameters()), so grey it out rather than leave it looking
+    // live and misleading.
+    attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
+
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
         if (bypassParam->load() > 0.5f)
@@ -186,8 +206,13 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
+         << "Amplitude relaxation: " << (snap.amplitudeRelaxationOn
+              ? "ON - attenuation slider used as set (Case C-style spectral relaxation)"
+              : "OFF - attenuation slider ignored, fixed at the calibrated near-flat Case B "
+                "point (deterministic, not typed)")
+         << "\n"
          << "Target: cutoff " << juce::String (snap.cutoffHz, 0) << " Hz, "
-         << juce::String (snap.attenuationAtCutoffDb, 2) << " dB at cutoff, "
+         << juce::String (snap.attenuationAtCutoffDb, 4) << " dB at cutoff, "
          << juce::String (snap.stopbandRejectionDb, 1) << " dB min. stopband rejection\n"
          << "Stopband mode: free transition, cutoff to Nyquist - only a narrow guard band right at "
             "Nyquist is held to the floor; most of that span may sit well above it. Safe only if "

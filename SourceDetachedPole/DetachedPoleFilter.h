@@ -32,6 +32,23 @@ constexpr double defaultCutoffHz = 20000.0;
 constexpr double defaultAttenuationDb = 0.5;
 constexpr double defaultStopbandRejectionDb = 98.0;
 
+// The exact "near-flat passband, hard 98 dB stopband" operating point
+// (192 kHz / 20 kHz cutoff / 94 kHz stopband edge, 19 taps) that
+// reproduces the article's own published Case B numbers: -97.98 dB
+// worst-case stopband, 3.33% R_peak, 0.61% E_ZC, 0.094 ms settling.
+// The article never quantifies "near-flat" numerically (unlike Case
+// C's explicit -0.50 dB), so this was found by sweeping
+// attenuationAtCutoffDb and matching those published metrics - see
+// the "Case B (calibrated near-flat)" block in
+// Tests/DSPTestDetachedPole.cpp for the verification. Deliberately not
+// user-typable via the attenuation slider: at this scale (0.0027 dB)
+// any host's own value display/automation rounding can silently land
+// on a different, non-reproducible point (including exactly 0.0 dB,
+// which has no feasible 19-tap solution at all - see ParametricFIR.h),
+// so the "Amplitude Relaxation" toggle in the UI selects this exact
+// constant instead of relying on typed precision.
+constexpr double caseBNearFlatAttenuationDb = 0.0027;
+
 // The slider's own range covers every supported sample rate's Nyquist
 // (up to 192 kHz -> 96 kHz), so the user can push the cutoff as high as
 // "half the sampling rate of the material" at whichever rate is

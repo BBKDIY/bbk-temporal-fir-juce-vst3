@@ -469,6 +469,41 @@ int main()
             freeResult.temporal.eZcPercent, flatResult.temporal.eZcPercent);
     }
 
+    // --- Case B (calibrated near-flat) via the "Amplitude Relaxation off"
+    // path ------------------------------------------------------------
+    // The rev3 article's Case B is defined qualitatively ("near-flat
+    // passband, 98 dB stopband hard constraint") without a numeric
+    // attenuation-at-cutoff figure - unlike Case C's explicit -0.50 dB.
+    // bbk::detachedpole::caseBNearFlatAttenuationDb (0.0027 dB) was found
+    // by sweeping that parameter until the engine's own reported metrics
+    // matched the article's published Case B numbers at its 20-94 kHz
+    // operating point (192 kHz, 19 taps): -97.98 dB worst-case stopband,
+    // 3.33% R_peak, 0.61% E_ZC, 0.094 ms settling. This is exactly the
+    // spec PluginProcessor::specFromParameters() uses when the
+    // "Amplitude Relaxation" toggle is off, so this test is the
+    // engine-level guarantee behind that UI switch.
+    {
+        FilterSpec caseBSpec { 192000.0, 20000.0, bbk::detachedpole::caseBNearFlatAttenuationDb, 98.0 };
+        caseBSpec.stopbandMode = StopbandMode::FreeTransition;
+        auto caseB = designParametricFIR (caseBSpec, maxTapCount);
+
+        check (caseB.constraintsMet, "[Case B calibrated] design reports its own targets as met");
+        check (caseB.tapCount == 19, "[Case B calibrated] naturally lands on the article's own 19 taps");
+
+        const auto guard = freeTransitionGuardBand (caseBSpec);
+        checkNear (guard.first, 94000.0, 1.0, "[Case B calibrated] guard band starts at 94 kHz, matching the article's stopband edge");
+
+        const double worst = denseWorstDbInBand (caseB.taps, caseBSpec.sampleRateHz, guard.first, guard.second);
+        check (worst <= -97.5, "[Case B calibrated] worst-case stopband over 94-96 kHz meets the article's -97.98 dB");
+
+        checkNear (caseB.temporal.rPeakPercent, 3.33, 0.5, "[Case B calibrated] R_peak matches the article's published 3.33%");
+        checkNear (caseB.temporal.eZcPercent, 0.61, 0.15, "[Case B calibrated] E_ZC matches the article's published 0.61%");
+        checkNear (caseB.temporal.settlingMs, 0.094, 0.005, "[Case B calibrated] settling duration matches the article's published 0.094 ms");
+
+        std::printf ("  [Case B calibrated] atten=%.4fdB taps=%d worst(94-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% settling=%.5fms (article: 3.33%%, 0.61%%, 0.094ms)\n",
+            caseBSpec.attenuationAtCutoffDb, caseB.tapCount, worst, caseB.temporal.rPeakPercent, caseB.temporal.eZcPercent, caseB.temporal.settlingMs);
+    }
+
     // --- Fixed latency invariance across wildly different tap counts ------
     {
         auto small = designParametricFIR ({ 192000.0, 20000.0, 1.00, 60.0 }, maxTapCount);

@@ -11,6 +11,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("cutoff", &paramListener);
     parameters.addParameterListener ("attenuation", &paramListener);
     parameters.addParameterListener ("stopband", &paramListener);
+    parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
 
     startThread();
 }
@@ -25,6 +26,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("cutoff", &paramListener);
     parameters.removeParameterListener ("attenuation", &paramListener);
     parameters.removeParameterListener ("stopband", &paramListener);
+    parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -62,6 +64,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "bypass", 1 }, "Bypass", false));
 
+    // On (default): the attenuation slider above is used as-is (a Case
+    // C-style spectrally relaxed design). Off: the attenuation slider is
+    // ignored and the exact caseBNearFlatAttenuationDb constant is used
+    // instead - a deterministic Case B reproduction that never depends on
+    // typed slider precision (see DetachedPoleFilter.h for why that
+    // matters at this scale).
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "amplitudeRelaxation", 1 }, "Amplitude Relaxation", true));
+
     return layout;
 }
 
@@ -79,7 +90,10 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     // 22.05 kHz) - clamp well inside it so a real transition band always
     // has room to exist.
     spec.cutoffHz = juce::jmin (cutoffParam, nyquist * 0.9);
-    spec.attenuationAtCutoffDb = static_cast<double> (parameters.getRawParameterValue ("attenuation")->load());
+    const bool relaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
+    spec.attenuationAtCutoffDb = relaxationOn
+        ? static_cast<double> (parameters.getRawParameterValue ("attenuation")->load())
+        : bbk::detachedpole::caseBNearFlatAttenuationDb;
     spec.stopbandRejectionDb = static_cast<double> (parameters.getRawParameterValue ("stopband")->load());
 
     // Fixed, not user-switchable: the whole cutoff-to-Nyquist span is
@@ -130,6 +144,7 @@ void BBKDetachedPoleAudioProcessor::redesignSynchronously (const bbk::parametric
         uiSnapshot.attenuationAtCutoffDb = spec.attenuationAtCutoffDb;
         uiSnapshot.stopbandRejectionDb = spec.stopbandRejectionDb;
         uiSnapshot.stopbandMode = spec.stopbandMode;
+        uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
         uiSnapshot.tapCount = result.tapCount;
         uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
         uiSnapshot.constraintsMet = result.constraintsMet;
@@ -203,6 +218,7 @@ void BBKDetachedPoleAudioProcessor::run()
             uiSnapshot.attenuationAtCutoffDb = specToRun.attenuationAtCutoffDb;
             uiSnapshot.stopbandRejectionDb = specToRun.stopbandRejectionDb;
             uiSnapshot.stopbandMode = specToRun.stopbandMode;
+            uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
             uiSnapshot.tapCount = result.tapCount;
             uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
             uiSnapshot.constraintsMet = result.constraintsMet;
