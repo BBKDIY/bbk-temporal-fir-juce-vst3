@@ -50,6 +50,14 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     attenuationLabel.setText ("Attenuation at Cutoff", juce::dontSendNotification);
     addAndMakeVisible (attenuationLabel);
     prepareSlider (attenuationSlider);
+    // 4 decimal places (not the default 2) and a wider text box: the
+    // parameter's own step is now 0.0001 dB (see
+    // PluginProcessor.cpp::createParameterLayout()) specifically so
+    // research operating points like 0.0027 dB are reachable - a 2-decimal
+    // display would visually round that right back to "0.00" even though
+    // the stored value is exact, which is confusing to type against.
+    attenuationSlider.setNumDecimalPlacesToDisplay (4);
+    attenuationSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 110, 22);
     addAndMakeVisible (attenuationSlider);
     attenuationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "attenuation", attenuationSlider);

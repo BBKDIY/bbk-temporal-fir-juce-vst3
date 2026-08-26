@@ -41,9 +41,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::NormalisableRange<float> (static_cast<float> (minCutoffHz), static_cast<float> (maxCutoffHz), 1.0f),
         static_cast<float> (defaultCutoffHz)));
 
+    // Step was 0.01 dB; too coarse for the sub-0.01 dB "near-flat passband"
+    // operating points the paper's Case B needs (e.g. 0.0027 dB) - any
+    // value typed with more precision than the step silently snapped to
+    // the nearest multiple of it (0.0027 -> 0.00), which is exactly what
+    // 0.00 dB can't do: a literal zero-tolerance passband has no feasible
+    // 19-tap solution at all (see ParametricFIR.h). 0.0001 dB gives two
+    // more decades of precision, enough to hit that point exactly, while
+    // still being a defined step rather than a fully continuous range.
     layout.add (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID { "attenuation", 1 }, "Attenuation at Cutoff",
-        juce::NormalisableRange<float> (static_cast<float> (minAttenuationDb), static_cast<float> (maxAttenuationDb), 0.01f),
+        juce::NormalisableRange<float> (static_cast<float> (minAttenuationDb), static_cast<float> (maxAttenuationDb), 0.0001f),
         static_cast<float> (defaultAttenuationDb)));
 
     layout.add (std::make_unique<juce::AudioParameterFloat> (
