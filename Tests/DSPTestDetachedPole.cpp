@@ -274,6 +274,14 @@ int main()
         { "44.1k-tight",        { 44100.0,  20000.0, 0.20, 100.0 } },
         { "48k-deep",           { 48000.0,  20000.0, 0.50, 110.0 } },
         { "192k-loose",         { 192000.0, 20000.0, 1.00, 60.0 } },
+        // No hardcoded sample-rate ceiling anywhere in this file or
+        // PluginProcessor.cpp - both just read whatever Fs the host (or,
+        // via Audirvana upstream, whatever upsampled rate it forwards)
+        // reports at prepareToPlay() and design against that Fs's own
+        // Nyquist. 384 kHz is a real target: e.g. Audirvana's own
+        // "maximum sampling rate of the audio device" upsampling mode
+        // against a DAC with a 384 kHz PCM ceiling (Naim, for instance).
+        { "384k",               { 384000.0, 20000.0, 0.50, 98.0 } },
     };
 
     for (const auto& c : cases)
@@ -474,7 +482,7 @@ int main()
     // The rev3 article's Case B is defined qualitatively ("near-flat
     // passband, 98 dB stopband hard constraint") without a numeric
     // attenuation-at-cutoff figure - unlike Case C's explicit -0.50 dB.
-    // bbk::detachedpole::caseBNearFlatAttenuationDb (0.0027 dB) was found
+    // bbk::detachedpole::caseBNearFlatAttenuationDb (0.0026 dB) was found
     // by sweeping that parameter until the engine's own reported metrics
     // matched the article's published Case B numbers at its 20-94 kHz
     // operating point (192 kHz, 19 taps): -97.98 dB worst-case stopband,
@@ -502,6 +510,43 @@ int main()
 
         std::printf ("  [Case B calibrated] atten=%.4fdB taps=%d worst(94-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% settling=%.5fms (article: 3.33%%, 0.61%%, 0.094ms)\n",
             caseBSpec.attenuationAtCutoffDb, caseB.tapCount, worst, caseB.temporal.rPeakPercent, caseB.temporal.eZcPercent, caseB.temporal.settlingMs);
+    }
+
+    // --- 384 kHz operating point (upstream upsampling scenario) -----------
+    // Locks in the actual numbers behind the "wider Nyquist via upstream
+    // sinc upsampling" discussion: same cutoff/attenuation/relaxation
+    // settings a user would leave untouched in the plugin, only Fs
+    // changes (e.g. Audirvana upsampling to a 384 kHz-capable DAC before
+    // the plugin ever sees the stream - no plugin-side change needed,
+    // since specFromParameters() only ever reads whatever Fs the host
+    // reports). Both relaxation-on and relaxation-off operating points
+    // should improve substantially over their 192 kHz counterparts
+    // (regression guard: this is a one-way ratchet - if a future change
+    // makes 384 kHz worse than or equal to 192 kHz here, something is
+    // wrong, since strictly more transition headroom should never hurt).
+    {
+        FilterSpec relaxedOn192 { 192000.0, 20000.0, 0.50, 98.0 };
+        relaxedOn192.stopbandMode = StopbandMode::FreeTransition;
+        FilterSpec relaxedOn384 = relaxedOn192; relaxedOn384.sampleRateHz = 384000.0;
+        auto on192 = designParametricFIR (relaxedOn192, maxTapCount);
+        auto on384 = designParametricFIR (relaxedOn384, maxTapCount);
+
+        FilterSpec relaxedOff192 { 192000.0, 20000.0, bbk::detachedpole::caseBNearFlatAttenuationDb, 98.0 };
+        relaxedOff192.stopbandMode = StopbandMode::FreeTransition;
+        FilterSpec relaxedOff384 = relaxedOff192; relaxedOff384.sampleRateHz = 384000.0;
+        auto off192 = designParametricFIR (relaxedOff192, maxTapCount);
+        auto off384 = designParametricFIR (relaxedOff384, maxTapCount);
+
+        check (on384.constraintsMet && off384.constraintsMet, "[384kHz] both relaxation-on and relaxation-off designs meet their own targets");
+        check (on384.temporal.rPeakPercent < on192.temporal.rPeakPercent, "[384kHz] relaxation-on R_peak improves over the 192kHz operating point");
+        check (on384.temporal.eZcPercent < on192.temporal.eZcPercent, "[384kHz] relaxation-on E_ZC improves over the 192kHz operating point");
+        check (off384.temporal.rPeakPercent < off192.temporal.rPeakPercent, "[384kHz] relaxation-off R_peak improves over the 192kHz operating point");
+        check (off384.temporal.eZcPercent < off192.temporal.eZcPercent, "[384kHz] relaxation-off E_ZC improves over the 192kHz operating point");
+
+        std::printf ("  [384kHz relaxation ON]  192k: taps=%d R_peak=%.3f%% E_ZC=%.4f%%  |  384k: taps=%d R_peak=%.3f%% E_ZC=%.4f%%\n",
+            on192.tapCount, on192.temporal.rPeakPercent, on192.temporal.eZcPercent, on384.tapCount, on384.temporal.rPeakPercent, on384.temporal.eZcPercent);
+        std::printf ("  [384kHz relaxation OFF] 192k: taps=%d R_peak=%.3f%% E_ZC=%.4f%%  |  384k: taps=%d R_peak=%.3f%% E_ZC=%.4f%%\n",
+            off192.tapCount, off192.temporal.rPeakPercent, off192.temporal.eZcPercent, off384.tapCount, off384.temporal.rPeakPercent, off384.temporal.eZcPercent);
     }
 
     // --- Fixed latency invariance across wildly different tap counts ------

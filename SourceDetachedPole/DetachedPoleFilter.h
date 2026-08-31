@@ -41,13 +41,25 @@ constexpr double defaultStopbandRejectionDb = 98.0;
 // attenuationAtCutoffDb and matching those published metrics - see
 // the "Case B (calibrated near-flat)" block in
 // Tests/DSPTestDetachedPole.cpp for the verification. Deliberately not
-// user-typable via the attenuation slider: at this scale (0.0027 dB)
-// any host's own value display/automation rounding can silently land
-// on a different, non-reproducible point (including exactly 0.0 dB,
-// which has no feasible 19-tap solution at all - see ParametricFIR.h),
-// so the "Amplitude Relaxation" toggle in the UI selects this exact
-// constant instead of relying on typed precision.
-constexpr double caseBNearFlatAttenuationDb = 0.0027;
+// user-typable via the attenuation slider: at this scale (thousandths
+// of a dB) any host's own value display/automation rounding can
+// silently land on a different, non-reproducible point (including
+// exactly 0.0 dB, which has no feasible 19-tap solution at all - see
+// ParametricFIR.h), so the "Amplitude Relaxation" toggle in the UI
+// selects this exact constant instead of relying on typed precision.
+//
+// Recalibrated after the ParametricFIR.h peak-dominance fix (the LP
+// previously left inner taps unconstrained relative to a[0], letting
+// some tap counts settle on a spectrally-compliant but non-peak-at-
+// centre solution; constraining |a[i]| <= a[0] for every inner tap
+// shifted the feasibility landscape near this near-flat point). At
+// this scale the achieved-metric-vs-attenuation curve has narrow good/
+// bad islands rather than one smooth cliff, so this value was chosen
+// by sweeping in 0.000001 dB steps and centring in the widest verified
+// stable island (bad neighbours confirmed at 0.002525, 0.002550-0.002565,
+// 0.002633-0.002634, 0.002638-0.002641 dB; this constant sits mid-island,
+// ~0.00003 dB from either edge) rather than picked at an island boundary.
+constexpr double caseBNearFlatAttenuationDb = 0.0026;
 
 // The slider's own range covers every supported sample rate's Nyquist
 // (up to 192 kHz -> 96 kHz), so the user can push the cutoff as high as

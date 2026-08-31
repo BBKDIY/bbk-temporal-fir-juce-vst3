@@ -582,6 +582,34 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
                 A.push_back (up); b.push_back (rho * c0 - ci);      // a[i] - rho*a[0] <= 0
                 A.push_back (lo); b.push_back (rho * c0 + ci);      // -a[i] - rho*a[0] <= 0
             }
+
+            // Peak-dominance: a[0] must actually BE the peak, not just
+            // have small sidelobes *outside* the self-consistent main
+            // lobe. Nothing above constrains the taps *inside* that
+            // boundary (indices 1..mainLobeStart-1) relative to a[0], so
+            // for some M the LP could (and, verified directly, did) find
+            // a solution where an inner same-sign tap grows larger than
+            // a[0] while staying spectrally compliant - since that tap
+            // sits inside the notional main lobe, the rho objective above
+            // never sees it, so minimizing rho no longer means minimizing
+            // the article's actual R_peak (which is defined from the
+            // array's real global peak, not from a[0] by assumption).
+            // Hard-bind every inner tap to a[0] (rho fixed at 1, not the
+            // bisected value) to make that assumption an enforced fact
+            // rather than an unchecked one.
+            for (int i = 1; i < mainLobeStart; ++i)
+            {
+                std::vector<double> zi; double ci;
+                indexToLinear (i, zi, ci);
+                std::vector<double> up (zi.size()), lo (zi.size());
+                for (std::size_t k = 0; k < zi.size(); ++k)
+                {
+                    up[k] = zi[k] - z0[k];
+                    lo[k] = -zi[k] - z0[k];
+                }
+                A.push_back (up); b.push_back (c0 - ci);             // a[i] - a[0] <= 0
+                A.push_back (lo); b.push_back (c0 + ci);             // -a[i] - a[0] <= 0
+            }
         }
         return solveLPFeasibility (A, b, reducedVars);
     };
