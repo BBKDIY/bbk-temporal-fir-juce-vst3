@@ -482,7 +482,7 @@ int main()
     // The rev3 article's Case B is defined qualitatively ("near-flat
     // passband, 98 dB stopband hard constraint") without a numeric
     // attenuation-at-cutoff figure - unlike Case C's explicit -0.50 dB.
-    // bbk::detachedpole::caseBNearFlatAttenuationDb (0.0026 dB) was found
+    // bbk::detachedpole::caseBNearFlatAttenuationDb (0.0023 dB) was found
     // by sweeping that parameter until the engine's own reported metrics
     // matched the article's published Case B numbers at its 20-94 kHz
     // operating point (192 kHz, 19 taps): -97.98 dB worst-case stopband,
