@@ -26,7 +26,8 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);
-    subtitle.setText ("Parametric constrained-least-squares FIR lowpass - auto-detects sample rate (44.1/48/96/192 kHz)",
+    subtitle.setText ("Parametric constrained-least-squares FIR lowpass - auto-detects sample rate "
+                       "(44.1/48/88.2/96/176.4/192/384 kHz, or any other rate the host reports)",
                        juce::dontSendNotification);
     addAndMakeVisible (subtitle);
 
