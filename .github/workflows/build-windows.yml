@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Run DSP verification (framework-independent)
         shell: pwsh
@@ -50,19 +50,19 @@ jobs:
           Copy-Item $found2.FullName -Destination "dist/BBK Parametric FIR.vst3" -Recurse
 
       - name: Upload BBK Temporal FIR artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: BBK-TemporalFIR-Windows-VST3-JUCE-MSVC
           path: dist/BBK Temporal FIR.vst3
 
       - name: Upload BBK Parametric FIR artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: BBK-ParametricFIR-Windows-VST3-JUCE-MSVC
           path: dist/BBK Parametric FIR.vst3
 
       - name: Upload coefficient generation artifacts (sweep data / metrics)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: BBK-TemporalFIR-CoefficientGeneration
           path: |
