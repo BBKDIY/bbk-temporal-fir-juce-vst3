@@ -109,51 +109,6 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     return spec;
 }
 
-void BBKDetachedPoleAudioProcessor::redesignSynchronously (const bbk::parametric::FilterSpec& spec)
-{
-    // Only ever called from prepareToPlay(), which the host guarantees is
-    // never concurrent with processBlock() - safe to touch the
-    // audio-thread-owned tap arrays and consumedVersion directly here.
-    auto result = bbk::parametric::designParametricFIR (spec, bbk::detachedpole::maxTapCount);
-    const auto padded = bbk::detachedpole::padTapsToFixedLength (result.taps);
-
-    activeTaps = padded;
-    incomingTaps = padded;
-    crossfading = false;
-    designCrossfade.setCurrentAndTargetValue (0.0);
-
-    int newVersion;
-    {
-        const juce::SpinLock::ScopedLockType sl (specLock);
-        newVersion = ++versionCounter;
-        requestedSpec = spec;
-        requestedVersion = newVersion;
-    }
-    {
-        const juce::SpinLock::ScopedLockType sl (resultLock);
-        latestResult = result;
-        latestSpec = spec;
-        latestVersion = newVersion;
-    }
-    consumedVersion = newVersion;
-
-    {
-        const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
-        uiSnapshot.sampleRateHz = spec.sampleRateHz;
-        uiSnapshot.cutoffHz = spec.cutoffHz;
-        uiSnapshot.attenuationAtCutoffDb = spec.attenuationAtCutoffDb;
-        uiSnapshot.stopbandRejectionDb = spec.stopbandRejectionDb;
-        uiSnapshot.stopbandMode = spec.stopbandMode;
-        uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
-        uiSnapshot.tapCount = result.tapCount;
-        uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
-        uiSnapshot.constraintsMet = result.constraintsMet;
-        uiSnapshot.designAttempts = result.designAttempts;
-        uiSnapshot.taps = result.taps;
-        uiSnapshot.temporal = result.temporal;
-    }
-}
-
 void BBKDetachedPoleAudioProcessor::requestBackgroundRedesign()
 {
     // May be called from the message thread (typical - a slider moved) or
@@ -193,11 +148,13 @@ void BBKDetachedPoleAudioProcessor::run()
 
         // Only publish if this is still the newest request - a stale
         // in-flight design finishing after a newer one was already
-        // requested (or after redesignSynchronously ran on the message
-        // thread while this was mid-design) must never overwrite a newer
-        // result. Since this worker only ever runs one design at a time
-        // and always re-reads the latest request before starting the next
-        // one, the only way to see a stale version here is that race.
+        // requested (e.g. two sample-rate changes in quick succession -
+        // see prepareToPlay()) must never overwrite a newer result. Since
+        // this worker only ever runs one design at a time and always
+        // re-reads the latest request before starting the next one, the
+        // only way to see a stale version here is that race - and even
+        // then, processBlock() separately guards against crossfading in a
+        // design published for a sample rate that is no longer current.
         bool isNewest = false;
         {
             const juce::SpinLock::ScopedLockType sl (resultLock);
@@ -247,6 +204,11 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
                              || std::abs (sampleRate - lastPreparedSampleRate) > 0.5
                              || static_cast<int> (channels.size()) < channelsToAllocate;
 
+    // Set before requestBackgroundRedesign() below, which gates on it -
+    // this call is always itself the moment "prepared" becomes true, so
+    // there is no reason to make that method wait for a later statement.
+    hasPrepared.store (true);
+
     if (formatChanged)
     {
         channels.resize (static_cast<std::size_t> (channelsToAllocate));
@@ -261,16 +223,35 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
         bypassCrossfade.setCurrentAndTargetValue (lastBypassParam ? 1.0 : 0.0);
 
         // A sample-rate (or first-ever) change is a natural discontinuity
-        // anyway - the host already expects a pause here - so the initial
-        // design for the new rate is computed synchronously rather than
-        // handed to the background thread, and applied immediately with
-        // no crossfade (there is nothing meaningful to crossfade from: the
-        // history buffers were just cleared above).
-        redesignSynchronously (specFromParameters());
+        // anyway, but the real design for that rate can legitimately take
+        // several seconds for some cutoff/rate combinations pushed close
+        // to Nyquist (see ParametricFIR.h) - far too long to block
+        // prepareToPlay, which hosts expect back in milliseconds and may
+        // treat as a hung plugin otherwise. Install the safe identity
+        // pass-through immediately (this is directly on the audio-thread-
+        // owned tap arrays, safe here specifically because the host
+        // guarantees prepareToPlay is never concurrent with
+        // processBlock()), then hand the real design for this rate to the
+        // same background worker and crossfade already used for live
+        // slider changes - see DetachedPoleFilter.h::identityTaps().
+        activeTaps = bbk::detachedpole::identityTaps();
+        incomingTaps = activeTaps;
+
+        // Mark the UI snapshot as stale (tapCount==0 already means
+        // "no completed design yet" to the editor - see timerCallback(),
+        // which shows a "Designing..." message for exactly this case) so
+        // it stops showing the *previous* rate's now-irrelevant tap
+        // count / achieved-stopband / temporal metrics while the identity
+        // pass-through above is what is actually playing.
+        {
+            const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
+            uiSnapshot.tapCount = 0;
+        }
+
+        requestBackgroundRedesign();
     }
 
     lastPreparedSampleRate = sampleRate;
-    hasPrepared.store (true);
 
     // maxHalfLength samples, always - see DetachedPoleFilter.h. Every
     // design is zero-padded to this same fixed length, so the
@@ -315,11 +296,25 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
         const juce::SpinLock::ScopedTryLockType tl (resultLock);
         if (tl.isLocked() && latestVersion != consumedVersion)
         {
-            incomingTaps = padTapsToFixedLength (latestResult.taps);
             consumedVersion = latestVersion;
-            crossfading = true;
-            designCrossfade.setCurrentAndTargetValue (0.0);
-            designCrossfade.setTargetValue (1.0);
+
+            // A design published for a sample rate that is no longer the
+            // host's current one can only happen if the host changed
+            // rates again before this background design finished (see
+            // prepareToPlay(), which is now fully async and can overlap
+            // like this in principle, however briefly) - crossfading it
+            // in would apply the wrong cutoff, since its taps encode a
+            // frequency response normalised to the *old* rate. Silently
+            // discard it instead; the redesign already requested for the
+            // current rate carries a higher version number and will
+            // still be picked up normally once it publishes.
+            if (std::abs (latestSpec.sampleRateHz - currentSampleRate.load()) <= 0.5)
+            {
+                incomingTaps = padTapsToFixedLength (latestResult.taps);
+                crossfading = true;
+                designCrossfade.setCurrentAndTargetValue (0.0);
+                designCrossfade.setTargetValue (1.0);
+            }
         }
     }
 

@@ -188,7 +188,13 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     if (snap.tapCount == 0)
     {
-        metricsReadout.setText ("Designing initial filter...", juce::dontSendNotification);
+        // Shown at cold start and again on every sample-rate change - the
+        // redesign for the new rate runs entirely in the background (it
+        // can take several seconds for some cutoff/rate combinations) and
+        // never blocks playback; audio passes through unfiltered (delay-
+        // matched, no clicks) until it completes and crossfades in.
+        metricsReadout.setText ("Designing filter for " + juce::String (processor.getCurrentSampleRateForUI(), 0)
+                                 + " Hz... (unfiltered pass-through meanwhile)", juce::dontSendNotification);
         return;
     }
 

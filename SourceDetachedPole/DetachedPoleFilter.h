@@ -104,4 +104,25 @@ inline std::array<double, maxTapCount> padTapsToFixedLength (const std::vector<d
         padded[static_cast<std::size_t> (offset + i)] = taps[static_cast<std::size_t> (i)];
     return padded;
 }
+
+// The "do nothing but delay" tap set: unity at the fixed centre index,
+// zero everywhere else - a pure latencySamples-sample delay, no filtering
+// at all. Used as a safe immediate placeholder when the sample rate
+// changes: the real design for the new rate can legitimately take several
+// seconds for some cutoff/rate combinations (a cutoff pushed close to a
+// low sample rate's Nyquist demands a very narrow, hard-to-satisfy guard
+// band - see ParametricFIR.h), far too long to block prepareToPlay, which
+// hosts expect back in milliseconds. Rather than either blocking the host
+// or briefly running a design computed for the *previous* sample rate
+// (whose cutoff would land at the wrong frequency entirely once
+// reinterpreted at the new rate), the plugin installs this identity
+// pass-through immediately and hands the real design to the same
+// background worker and crossfade mechanism already used for live slider
+// changes - see PluginProcessor::prepareToPlay().
+inline std::array<double, maxTapCount> identityTaps()
+{
+    std::array<double, maxTapCount> taps {};
+    taps[static_cast<std::size_t> (maxHalfLength)] = 1.0;
+    return taps;
+}
 }

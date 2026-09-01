@@ -688,6 +688,40 @@ int main()
         }
     }
 
+    // --- identityTaps() (the safe placeholder installed on a sample-rate
+    // change - see PluginProcessor::prepareToPlay()) ---
+    {
+        auto id = identityTaps();
+
+        int nonZero = 0;
+        for (int i = 0; i < maxTapCount; ++i)
+            if (id[static_cast<std::size_t> (i)] != 0.0) ++nonZero;
+        check (nonZero == 1 && id[static_cast<std::size_t> (maxHalfLength)] == 1.0,
+               "identityTaps() is exactly one unity sample at the fixed centre index, zero elsewhere");
+
+        // Run through the *plain* (non-bypass) tick path - this is exactly
+        // how prepareToPlay() uses it, as activeTaps/incomingTaps in
+        // ordinary processing, not through the separate bypass blend -
+        // and confirm it is a pure latencySamples-sample delay with no
+        // filtering whatsoever, matching what a genuine bypass produces.
+        {
+            MiniProcessor proc;
+            const int len = latencySamples + 30;
+            std::vector<double> input (static_cast<std::size_t> (len));
+            for (int n = 0; n < len; ++n)
+                input[static_cast<std::size_t> (n)] = std::sin (2.0 * M_PI * 5000.0 * n / 192000.0) + (n == 3 ? 1.0 : 0.0);
+
+            bool matchesDelay = true;
+            std::vector<double> outputs;
+            for (int n = 0; n < len; ++n)
+                outputs.push_back (proc.tick (input[static_cast<std::size_t> (n)], id, id, 0.0, false));
+            for (int n = latencySamples; n < len; ++n)
+                if (std::fabs (outputs[static_cast<std::size_t> (n)] - input[static_cast<std::size_t> (n - latencySamples)]) > 1.0e-12)
+                    matchesDelay = false;
+            check (matchesDelay, "identityTaps() processed normally is an exact latencySamples-sample delay (no filtering)");
+        }
+    }
+
     std::printf ("\n%d/%d checks passed\n", checksRun - checksFailed, checksRun);
     return checksFailed == 0 ? 0 : 1;
 }

@@ -14,14 +14,21 @@
 // The plugin auto-detects the host sample rate (44.1/48/96/192 kHz and
 // anything else the host reports) rather than hard-locking to 192 kHz.
 //
-// A redesign never runs on the audio thread: it happens either
-// synchronously in prepareToPlay() (cold start / sample-rate change - the
-// host already expects a pause there) or on a dedicated background
-// juce::Thread when a slider changes during playback, with the audio
-// thread crossfading smoothly from the previous design into the new one
+// A redesign never runs on the audio thread, and never blocks the host
+// either - not even on a sample-rate change or the very first
+// prepareToPlay(). Every redesign, including those, is handed to a
+// dedicated background juce::Thread; prepareToPlay() installs a safe
+// identity pass-through (pure delay, no filtering - see
+// DetachedPoleFilter.h::identityTaps()) immediately and returns, and the
+// audio thread crossfades smoothly from whatever was previously active
+// into the newly completed design once the background thread finishes
 // (same 15 ms linear crossfade mechanism this plugin has always used for
 // its mode switches, now generalised to two arbitrary tap sets instead of
-// four fixed ones) so a live redesign never clicks.
+// four fixed ones) so a redesign never clicks - and, just as importantly,
+// prepareToPlay() itself always returns in milliseconds regardless of how
+// long the actual design takes (some cutoff/sample-rate combinations
+// pushed close to Nyquist can legitimately take several seconds - see
+// ParametricFIR.h - which is far too long for a host to wait on).
 class BBKDetachedPoleAudioProcessor final : public juce::AudioProcessor,
                                              private juce::Thread
 {
@@ -102,7 +109,6 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
     bbk::parametric::FilterSpec specFromParameters() const;
-    void redesignSynchronously (const bbk::parametric::FilterSpec& spec);
     void requestBackgroundRedesign();
 
     juce::AudioProcessorValueTreeState parameters;
