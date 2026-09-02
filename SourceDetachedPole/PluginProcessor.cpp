@@ -12,6 +12,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("attenuation", &paramListener);
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
+    parameters.addParameterListener ("prolateBasis", &paramListener);
 
     startThread();
 }
@@ -27,6 +28,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("attenuation", &paramListener);
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
+    parameters.removeParameterListener ("prolateBasis", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -73,6 +75,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "amplitudeRelaxation", 1 }, "Amplitude Relaxation", true));
 
+    // Off (default): the article's own minimax method (see
+    // ParametricFIR.h). On: the same minimax LP, but restricted to a
+    // small span of leading even discrete prolate spheroidal (Slepian)
+    // directions instead of the full space of free taps - trading some
+    // classical R_peak/E_ZC sidelobe suppression for a continuous-time
+    // (sinc-reconstructed) impulse response that is inherently energy-
+    // concentrated near t=0 by construction, rather than only bounding
+    // discrete-sample sidelobes. Exists so the two can be A/B'd live
+    // against real music rather than compared only by numbers.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "prolateBasis", 1 }, "Prolate/DPSS Basis", false));
+
     return layout;
 }
 
@@ -106,6 +120,10 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     // validation against the article's published Case B/C numbers, but
     // is no longer reachable from the plugin itself.
     spec.stopbandMode = bbk::parametric::StopbandMode::FreeTransition;
+
+    const bool prolateBasisOn = parameters.getRawParameterValue ("prolateBasis")->load() > 0.5f;
+    spec.designMethod = prolateBasisOn ? bbk::parametric::DesignMethod::ProlateBasis
+                                        : bbk::parametric::DesignMethod::Minimax;
     return spec;
 }
 
@@ -175,6 +193,7 @@ void BBKDetachedPoleAudioProcessor::run()
             uiSnapshot.attenuationAtCutoffDb = specToRun.attenuationAtCutoffDb;
             uiSnapshot.stopbandRejectionDb = specToRun.stopbandRejectionDb;
             uiSnapshot.stopbandMode = specToRun.stopbandMode;
+            uiSnapshot.designMethod = specToRun.designMethod;
             uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
             uiSnapshot.tapCount = result.tapCount;
             uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;

@@ -10,9 +10,11 @@
 // BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
 // controls - cutoff, attenuation at cutoff, and minimum stopband
-// rejection - are handed straight to bbk::parametric::designParametricFIR().
-// The plugin auto-detects the host sample rate (44.1/48/96/192 kHz and
-// anything else the host reports) rather than hard-locking to 192 kHz.
+// rejection - are handed straight to bbk::parametric::designParametricFIR(),
+// along with a fourth toggle (Prolate/DPSS Basis) selecting which of the
+// two design methods ParametricFIR.h implements. The plugin auto-detects
+// the host sample rate (44.1/48/96/192 kHz and anything else the host
+// reports) rather than hard-locking to 192 kHz.
 //
 // A redesign never runs on the audio thread, and never blocks the host
 // either - not even on a sample-rate change or the very first
@@ -84,6 +86,7 @@ public:
         double attenuationAtCutoffDb = 0.0;
         double stopbandRejectionDb = 0.0;
         bbk::parametric::StopbandMode stopbandMode = bbk::parametric::StopbandMode::FlatMask;
+        bbk::parametric::DesignMethod designMethod = bbk::parametric::DesignMethod::Minimax;
         bool amplitudeRelaxationOn = true;
         int tapCount = 0;
         double achievedStopbandDb = 0.0;

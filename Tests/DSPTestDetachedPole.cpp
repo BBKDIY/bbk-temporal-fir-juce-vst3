@@ -29,6 +29,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -719,6 +720,141 @@ int main()
                 if (std::fabs (outputs[static_cast<std::size_t> (n)] - input[static_cast<std::size_t> (n - latencySamples)]) > 1.0e-12)
                     matchesDelay = false;
             check (matchesDelay, "identityTaps() processed normally is an exact latencySamples-sample delay (no filtering)");
+        }
+    }
+
+    // --- DesignMethod::ProlateBasis (DPSS/prolate-spheroidal basis
+    // restriction - see ParametricFIR.h for the full method) ---
+    {
+        // jacobiEigenSymmetric() on a small hand-picked matrix with known
+        // eigenvalues/eigenvectors (a 3x3 diagonal-plus-symmetric example),
+        // verified independently of the DPSS machinery that depends on it.
+        {
+            std::vector<std::vector<double>> A = {
+                { 2.0, 1.0, 0.0 },
+                { 1.0, 2.0, 0.0 },
+                { 0.0, 0.0, 5.0 }
+            };
+            // Known eigenvalues: 5 (twice - from the (2,2) block's own 3
+            // and the 1-2 block's 3, plus the 1-2 block's 1) - actually
+            // for [[2,1],[1,2]] eigenvalues are 1 and 3, so this 3x3
+            // matrix's eigenvalues are {1, 3, 5}.
+            std::vector<double> eigvals;
+            std::vector<std::vector<double>> eigvecs;
+            detail::jacobiEigenSymmetric (A, eigvals, eigvecs);
+            checkNear (eigvals[0], 5.0, 1.0e-8, "[Jacobi eigensolver] largest eigenvalue of a known 3x3 matrix is 5");
+            checkNear (eigvals[1], 3.0, 1.0e-8, "[Jacobi eigensolver] middle eigenvalue of a known 3x3 matrix is 3");
+            checkNear (eigvals[2], 1.0, 1.0e-8, "[Jacobi eigensolver] smallest eigenvalue of a known 3x3 matrix is 1");
+
+            // Eigenvector orthonormality: columns of eigvecs must be unit
+            // norm and mutually orthogonal for a symmetric matrix.
+            bool orthonormal = true;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                {
+                    double dot = 0.0;
+                    for (int k = 0; k < 3; ++k) dot += eigvecs[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)] * eigvecs[static_cast<std::size_t> (k)][static_cast<std::size_t> (j)];
+                    double expected = (i == j) ? 1.0 : 0.0;
+                    if (std::fabs (dot - expected) > 1.0e-8) orthonormal = false;
+                }
+            check (orthonormal, "[Jacobi eigensolver] eigenvectors of a known 3x3 matrix are orthonormal");
+        }
+
+        // computeEvenDpssHalfVectors(): every returned half-vector must
+        // reconstruct to a genuinely even full sequence (h[m]=h[-m]) - the
+        // whole reason the tridiagonal (not the raw sinc-matrix) formula
+        // is used is to keep this parity split clean even at large M,
+        // where the raw sinc matrix's near-degenerate eigenvalues were
+        // verified (during development) to mix even/odd content together.
+        {
+            const int M = 80; // the plugin's own maxHalfLength - the size that broke the raw sinc-matrix approach
+            const double W = 20000.0 / 192000.0;
+            auto dpss = detail::computeEvenDpssHalfVectors (M, W, M);
+            check (dpss.size() >= 3, "[DPSS] at least a handful of even directions are available at the plugin's max tap count");
+
+            // Reconstruct each returned half-vector to its full symmetric
+            // form and verify DC-normalised evenness indirectly via the
+            // half-vector's own internal consistency (it was extracted as
+            // half[m] = eigvec[center+m]; evenness of the *source*
+            // eigenvector was already asserted at extraction time inside
+            // computeEvenDpssHalfVectors - here we sanity-check the
+            // returned shapes are non-degenerate, distinct, and peak near
+            // the centre, as a genuinely concentrated lowpass basis should).
+            bool allNonTrivial = true, topPeaksAtCentre = true;
+            for (std::size_t k = 0; k < dpss.size(); ++k)
+            {
+                double norm = 0.0;
+                for (double v : dpss[k]) norm += v * v;
+                if (norm < 1.0e-6) allNonTrivial = false;
+            }
+            {
+                double maxAbs = 0.0; int maxIdx = 0;
+                for (int i = 0; i < static_cast<int> (dpss[0].size()); ++i)
+                    if (std::fabs (dpss[0][static_cast<std::size_t> (i)]) > maxAbs) { maxAbs = std::fabs (dpss[0][static_cast<std::size_t> (i)]); maxIdx = i; }
+                if (maxIdx != 0) topPeaksAtCentre = false; // half[0] is the centre tap
+            }
+            check (allNonTrivial, "[DPSS] every returned half-vector is non-degenerate (non-zero norm)");
+            check (topPeaksAtCentre, "[DPSS] the leading (most concentrated) DPSS half-vector peaks at the centre tap, as a lowpass shape should");
+        }
+
+        // Full designParametricFIR() with DesignMethod::ProlateBasis, at
+        // the plugin's own standard operating point (matching the
+        // FreeTransition test above). Unlike Minimax, ProlateBasis is not
+        // expected to beat Minimax's own R_peak/E_ZC - those are discrete-
+        // tap metrics, and the DPSS objective targets continuous-time
+        // concentration instead (the article's own metrics simply aren't
+        // what this mode is optimising for) - so this only checks genuine
+        // correctness (unity DC gain, passband/stopband compliance), not
+        // an R_peak/E_ZC comparison against Minimax.
+        {
+            FilterSpec prolateSpec { 192000.0, 20000.0, 0.50, 98.0 };
+            prolateSpec.stopbandMode = StopbandMode::FreeTransition;
+            prolateSpec.designMethod = DesignMethod::ProlateBasis;
+            auto prolateResult = designParametricFIR (prolateSpec, maxTapCount);
+
+            check (prolateResult.constraintsMet, "[ProlateBasis] design reports its own targets as met");
+
+            double dcSum = prolateResult.taps.empty() ? 0.0 : std::accumulate (prolateResult.taps.begin(), prolateResult.taps.end(), 0.0);
+            checkNear (dcSum, 1.0, 1.0e-6, "[ProlateBasis] unity DC gain (taps sum to 1)");
+
+            const auto guard = freeTransitionGuardBand (prolateSpec);
+            const double guardWorst = denseWorstDbInBand (prolateResult.taps, prolateSpec.sampleRateHz, guard.first, guard.second);
+            check (guardWorst <= -prolateSpec.stopbandRejectionDb + 0.5,
+                "[ProlateBasis] the narrow guard band right at Nyquist meets the requested rejection");
+
+            const double gainFloor = std::pow (10.0, -prolateSpec.attenuationAtCutoffDb / 20.0);
+            bool passbandOk = true;
+            for (int i = 0; i <= 200; ++i)
+            {
+                double f = prolateSpec.cutoffHz * static_cast<double> (i) / 200.0;
+                double resp = std::abs (responseAt (prolateResult.taps, f, prolateSpec.sampleRateHz));
+                if (resp > 1.0 + 0.01 || resp < gainFloor - 0.02) passbandOk = false;
+            }
+            check (passbandOk, "[ProlateBasis] passband stays within [gainFloor, 1] across [0, cutoff]");
+
+            std::printf ("  [ProlateBasis] taps=%d R_peak=%.3f%% E_ZC=%.3f%% T_0.1%%=%.4fms (Minimax at the same spec: see [FreeTransition] block above)\n",
+                prolateResult.tapCount, prolateResult.temporal.rPeakPercent, prolateResult.temporal.eZcPercent, prolateResult.temporal.settlingMs);
+        }
+
+        // Default (Minimax) must be completely unaffected by the presence
+        // of DesignMethod::ProlateBasis - re-running the exact same
+        // FreeTransition spec used earlier in this file with an explicit
+        // designMethod = Minimax must reproduce identical taps.
+        {
+            FilterSpec explicitMinimax { 192000.0, 20000.0, 0.50, 98.0 };
+            explicitMinimax.stopbandMode = StopbandMode::FreeTransition;
+            explicitMinimax.designMethod = DesignMethod::Minimax;
+            auto a = designParametricFIR (explicitMinimax, maxTapCount);
+
+            FilterSpec defaultMethod { 192000.0, 20000.0, 0.50, 98.0 };
+            defaultMethod.stopbandMode = StopbandMode::FreeTransition;
+            auto b = designParametricFIR (defaultMethod, maxTapCount);
+
+            bool identical = a.taps.size() == b.taps.size();
+            if (identical)
+                for (std::size_t i = 0; i < a.taps.size(); ++i)
+                    if (a.taps[i] != b.taps[i]) identical = false;
+            check (identical, "[ProlateBasis] FilterSpec's default designMethod is Minimax - explicit and implicit Minimax specs produce identical taps");
         }
     }
 

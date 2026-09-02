@@ -81,6 +81,19 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     stopbandAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "stopband", stopbandSlider);
 
+    // Off (default): the article's own minimax design (unchanged). On:
+    // the same LP restricted to a DPSS/prolate-spheroidal basis instead
+    // of the full tap space - see PluginProcessor.cpp::createParameterLayout()
+    // and ParametricFIR.h for the full rationale. Meant to be flipped
+    // live while listening to real music, not judged from the metrics
+    // readout alone (R_peak/E_ZC are discrete-tap metrics; this mode
+    // targets continuous-time concentration instead, which they don't
+    // fully capture).
+    prolateBasisButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (prolateBasisButton);
+    prolateBasisAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "prolateBasis", prolateBasisButton);
+
     prepareLabel (metricsReadout, 13.0f, false, juce::Justification::centredLeft);
     addAndMakeVisible (metricsReadout);
 
@@ -97,7 +110,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 575);
+    setSize (680, 630);
     startTimerHz (4);
     timerCallback();
 }
@@ -140,8 +153,11 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
 
     sliderRow (stopbandLabel, stopbandSlider);
 
+    prolateBasisButton.setBounds (area.removeFromTop (24));
+    area.removeFromTop (6);
+
     area.removeFromTop (10);
-    metricsReadout.setBounds (area.removeFromTop (175));
+    metricsReadout.setBounds (area.removeFromTop (195));
 
     area.removeFromTop (8);
     coefficientsButton.setBounds (area.removeFromTop (26).removeFromLeft (200));
@@ -213,6 +229,12 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
+         << "Design method: " << (snap.designMethod == bbk::parametric::DesignMethod::ProlateBasis
+              ? "Prolate/DPSS basis (experimental) - taps restricted to a span of leading even "
+                "discrete prolate spheroidal directions, biased toward continuous-time energy "
+                "concentration rather than only discrete-sample sidelobe suppression"
+              : "Minimax (default) - the article's own minimum-peak-sidelobe method")
+         << "\n"
          << "Amplitude relaxation: " << (snap.amplitudeRelaxationOn
               ? "ON - attenuation slider used as set (Case C-style spectral relaxation)"
               : "OFF - attenuation slider ignored, fixed at the calibrated near-flat Case B "

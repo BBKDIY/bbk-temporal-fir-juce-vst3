@@ -25,6 +25,7 @@ private:
     juce::Label sampleRate;
     juce::ToggleButton bypassButton { "Bypass" };
     juce::ToggleButton amplitudeRelaxationButton { "Amplitude Relaxation" };
+    juce::ToggleButton prolateBasisButton { "Prolate/DPSS Basis (experimental - A/B against Minimax by ear)" };
 
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
@@ -43,6 +44,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> prolateBasisAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };

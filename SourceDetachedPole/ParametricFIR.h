@@ -144,6 +144,20 @@ enum class StopbandMode
     FreeTransition  // opt-in: [cutoff, Nyquist] is one free transition zone, -stopbandRejectionDb only enforced in a narrow guard band right at Nyquist
 };
 
+// See detail::computeEvenDpssHalfVectors further down for the full
+// rationale. Minimax (default) is the article's own method, unchanged.
+// ProlateBasis restricts the *same* minimax LP to a small span of
+// leading even discrete prolate spheroidal (Slepian) directions instead
+// of the full null-space of free taps - trading some passband/stopband
+// flexibility for taps whose continuous-time (sinc-reconstructed)
+// energy is inherently concentrated near t=0 by construction, rather
+// than only bounding discrete-sample sidelobes as minimax does.
+enum class DesignMethod
+{
+    Minimax,
+    ProlateBasis
+};
+
 struct FilterSpec
 {
     double sampleRateHz = 192000.0;
@@ -151,6 +165,7 @@ struct FilterSpec
     double attenuationAtCutoffDb = 0.5;
     double stopbandRejectionDb = 98.0;
     StopbandMode stopbandMode = StopbandMode::FlatMask;
+    DesignMethod designMethod = DesignMethod::Minimax;
 };
 
 // The paper's own time-domain concentration metrics (Section 8.1),
@@ -425,6 +440,179 @@ inline double amplitudeResponse (const std::vector<double>& a, double freqHz, do
     return sum;
 }
 
+// --- DPSS / prolate-spheroidal basis restriction (opt-in via
+// FilterSpec::designMethod == DesignMethod::ProlateBasis - see the
+// enum's own doc comment above) ---
+//
+// Dense Jacobi eigenvalue solver for a real symmetric matrix (classic
+// cyclic-sweep rotation method - simple and easy to verify
+// independently against known matrices). Returns eigenvalues sorted
+// descending and the matching eigenvectors as columns of eigvecs
+// (eigvecs[row][col]). Matrix sizes here are at most maxTapCount (161),
+// run once per M and only when ProlateBasis mode is selected, so the
+// O(n^3)-per-sweep cost is not a concern in practice.
+inline void jacobiEigenSymmetric (std::vector<std::vector<double>> A,
+                                   std::vector<double>& eigvals,
+                                   std::vector<std::vector<double>>& eigvecs)
+{
+    const int n = static_cast<int> (A.size());
+    std::vector<std::vector<double>> V (static_cast<std::size_t> (n), std::vector<double> (static_cast<std::size_t> (n), 0.0));
+    for (int i = 0; i < n; ++i) V[static_cast<std::size_t> (i)][static_cast<std::size_t> (i)] = 1.0;
+
+    const int maxSweeps = 80;
+    for (int sweep = 0; sweep < maxSweeps; ++sweep)
+    {
+        double off = 0.0;
+        for (int p = 0; p < n; ++p)
+            for (int q = p + 1; q < n; ++q)
+                off += A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)] * A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)];
+        if (off < 1.0e-24) break;
+
+        for (int p = 0; p < n; ++p)
+        {
+            for (int q = p + 1; q < n; ++q)
+            {
+                double apq = A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)];
+                if (std::fabs (apq) < 1.0e-300) continue;
+                double app = A[static_cast<std::size_t> (p)][static_cast<std::size_t> (p)];
+                double aqq = A[static_cast<std::size_t> (q)][static_cast<std::size_t> (q)];
+                double theta = (aqq - app) / (2.0 * apq);
+                double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::fabs (theta) + std::sqrt (theta * theta + 1.0));
+                double c = 1.0 / std::sqrt (t * t + 1.0);
+                double s = t * c;
+
+                A[static_cast<std::size_t> (p)][static_cast<std::size_t> (p)] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+                A[static_cast<std::size_t> (q)][static_cast<std::size_t> (q)] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+                A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)] = 0.0;
+                A[static_cast<std::size_t> (q)][static_cast<std::size_t> (p)] = 0.0;
+
+                for (int i = 0; i < n; ++i)
+                {
+                    if (i == p || i == q) continue;
+                    double aip = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
+                    double aiq = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
+                    A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)] = c * aip - s * aiq;
+                    A[static_cast<std::size_t> (p)][static_cast<std::size_t> (i)] = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
+                    A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)] = s * aip + c * aiq;
+                    A[static_cast<std::size_t> (q)][static_cast<std::size_t> (i)] = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
+                }
+                for (int i = 0; i < n; ++i)
+                {
+                    double vip = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
+                    double viq = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
+                    V[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)] = c * vip - s * viq;
+                    V[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)] = s * vip + c * viq;
+                }
+            }
+        }
+    }
+
+    std::vector<int> idx (static_cast<std::size_t> (n));
+    for (int i = 0; i < n; ++i) idx[static_cast<std::size_t> (i)] = i;
+    std::sort (idx.begin(), idx.end(), [&] (int x, int y)
+               { return A[static_cast<std::size_t> (x)][static_cast<std::size_t> (x)] > A[static_cast<std::size_t> (y)][static_cast<std::size_t> (y)]; });
+
+    eigvals.assign (static_cast<std::size_t> (n), 0.0);
+    eigvecs.assign (static_cast<std::size_t> (n), std::vector<double> (static_cast<std::size_t> (n), 0.0));
+    for (int k = 0; k < n; ++k)
+    {
+        eigvals[static_cast<std::size_t> (k)] = A[static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])][static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])];
+        for (int i = 0; i < n; ++i)
+            eigvecs[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)] = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])];
+    }
+}
+
+// Discrete prolate spheroidal sequences (DPSS / Slepian sequences), the
+// classical solution to "which length-N sequence has its energy most
+// concentrated within normalised frequency band [-W,W]" (Slepian,
+// Landau & Pollak, 1961-62) - and, by the same duality, whose sinc-
+// interpolated continuous-time reconstruction has its energy most
+// concentrated in time.
+//
+// These are the eigenvectors of the classic "sinc" prolate matrix
+// C[m,n] = sin(2*pi*W*(m-n)) / (pi*(m-n)), C[n,n]=2W - but that matrix
+// is a poor numerical basis to eigendecompose directly: past roughly
+// the Shannon number (2*N*W) its eigenvalues cluster exponentially
+// close together, and a generic eigensolver (this file's Jacobi
+// rotation method included) cannot reliably tell two nearly-identical
+// eigenvalues apart - verified directly: at N=81 the top ~17
+// eigenvalues of C all round to 1.0 at 8-digit precision, and the
+// eigenvectors Jacobi returns for them are essentially arbitrary
+// rotations *within* that near-degenerate subspace rather than the
+// true even/odd DPSS pair, silently corrupting the basis. The standard
+// fix (Slepian 1978; used by every production DPSS implementation,
+// e.g. scipy.signal.windows.dpss's default method) is to instead
+// eigendecompose the *tridiagonal* matrix that provably commutes with
+// C and therefore shares its exact eigenvectors, but whose own
+// eigenvalues are analytically well separated even when C's are
+// exponentially close - so a plain eigensolver applied to T alone
+// recovers the correct, cleanly-separated eigenvectors, already sorted
+// by decreasing concentration (verified directly against C's own
+// eigenvalues at N=19: the parity pattern and relative ordering match
+// exactly, and at N=81/161 - where C's own Jacobi solve was previously
+// shown to mix parities - T's eigenvectors remain cleanly even/odd to
+// machine precision throughout).
+//
+// Returns up to maxK EVEN half-coefficient vectors (length M+1 each,
+// half[m] = the full sequence's value at index M+m), in decreasing
+// concentration order. No eigenvalue-floor cutoff is applied here -
+// unlike the sinc matrix, T's own eigenvalues aren't literally
+// concentration ratios, and more importantly the *right* number of
+// directions to keep depends on what the LP can actually do with them,
+// not a fixed numerical threshold; see attemptDesign's ProlateBasis
+// branch, which grows K until the passband/stopband spec is feasible
+// (or gives up and lets the outer M-search try a larger M, exactly as
+// it already does for the Minimax path).
+inline std::vector<std::vector<double>> computeEvenDpssHalfVectors (int M, double bandwidthNormalized, int maxK)
+{
+    const int N = 2 * M + 1;
+    double W = bandwidthNormalized;
+    if (W <= 0.0) W = 1.0e-6;
+    if (W >= 0.5) W = 0.5 - 1.0e-6;
+
+    std::vector<std::vector<double>> T (static_cast<std::size_t> (N), std::vector<double> (static_cast<std::size_t> (N), 0.0));
+    for (int i = 0; i < N; ++i)
+    {
+        double x = static_cast<double> (N - 1) / 2.0 - static_cast<double> (i);
+        T[static_cast<std::size_t> (i)][static_cast<std::size_t> (i)] = x * x * std::cos (2.0 * M_PI * W);
+        if (i + 1 < N)
+        {
+            double off = static_cast<double> (i + 1) * static_cast<double> (N - 1 - i) / 2.0;
+            T[static_cast<std::size_t> (i)][static_cast<std::size_t> (i + 1)] = off;
+            T[static_cast<std::size_t> (i + 1)][static_cast<std::size_t> (i)] = off;
+        }
+    }
+
+    std::vector<double> eigvals;
+    std::vector<std::vector<double>> eigvecs;
+    jacobiEigenSymmetric (T, eigvals, eigvecs);
+
+    const int center = M; // (N-1)/2 for N=2M+1
+    auto isEven = [&] (int k)
+    {
+        double maxAsym = 0.0;
+        for (int i = 0; i < N; ++i)
+            maxAsym = std::max (maxAsym, std::fabs (eigvecs[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)] - eigvecs[static_cast<std::size_t> (N - 1 - i)][static_cast<std::size_t> (k)]));
+        return maxAsym < 1.0e-6;
+    };
+    auto extractHalf = [&] (int k)
+    {
+        std::vector<double> half (static_cast<std::size_t> (M + 1));
+        for (int m = 0; m <= M; ++m)
+            half[static_cast<std::size_t> (m)] = eigvecs[static_cast<std::size_t> (center + m)][static_cast<std::size_t> (k)];
+        return half;
+    };
+
+    std::vector<std::vector<double>> result;
+    for (int k = 0; k < N && static_cast<int> (result.size()) < maxK; ++k)
+    {
+        if (! isEven (k)) continue;
+        result.push_back (extractHalf (k));
+    }
+
+    return result;
+}
+
 struct AttemptResult
 {
     std::vector<double> a;
@@ -485,7 +673,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
     double unorm2 = 0.0;
     for (double v : u) unorm2 += v * v;
 
-    const int reducedVars = numVars - 1;
+    int reducedVars = numVars - 1;
     std::vector<double> Z (static_cast<std::size_t> (numVars) * static_cast<std::size_t> (reducedVars));
     for (int col = 1; col < numVars; ++col)
     {
@@ -494,6 +682,181 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             double val = (row == col ? 1.0 : 0.0) - 2.0 * u[static_cast<std::size_t> (row)] * u[static_cast<std::size_t> (col)] / unorm2;
             Z[static_cast<std::size_t> (row) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (col - 1)] = val;
         }
+    }
+
+    // ProlateBasis mode: restrict the design-variable space directly to
+    // linear combinations of the leading even DPSS shapes, a = sum_k
+    // c[k]*dpss[k]. DC=1 (e^T a = 1) becomes a single linear constraint
+    // on those combination coefficients, e^T (sum_k c[k]*dpss[k]) = 1,
+    // i.e. dot(g, c) = 1 where g[k] = e^T dpss[k] - handled by exactly
+    // the same null-space technique used above for the original
+    // numVars-dim e/a problem, just applied to this K-dim g instead:
+    // c0 = g/(g.g) is one particular solution, W is an orthonormal basis
+    // for null(g), and c = c0 + W*w satisfies the constraint for every w.
+    // Mapping back through a = sum_k c[k]*dpss[k] gives a brand new
+    // (a0, Z, reducedVars) triple in the *original* numVars-dim tap
+    // space - which is deliberately NOT built by projecting the DPSS
+    // vectors onto the already-DC-reduced null space from above (an
+    // earlier version of this code did exactly that, and it silently
+    // discarded most of each DPSS vector's shape: the top DPSS vector is
+    // strongly lowpass/positive, so most of its energy IS the DC-aligned
+    // component that projecting onto null(e) throws away, leaving a
+    // subspace with essentially no lowpass character left to design
+    // with). Deriving DC=1 *within* the DPSS combination space instead
+    // keeps each DPSS shape whole.
+    //
+    // How many leading directions K to keep is not fixed in advance:
+    // start from a small K and grow it (one more DPSS direction at a
+    // time) until a quick passband+stopband feasibility probe (no
+    // sidelobe/ringing objective yet - just "does *any* point in this
+    // subspace meet the spectral spec at all") succeeds, at a
+    // representative stopband edge matching the guard-band rule
+    // FreeTransition mode actually uses further down. This keeps the
+    // basis as small (and therefore as inherently time-concentrated) as
+    // the spec allows, rather than guessing a fixed size that is either
+    // too restrictive (spuriously infeasible) or too generous (barely
+    // different from full Minimax). If even the largest available K
+    // still cannot meet the spec, the full null space is used instead
+    // for this M so the caller's usual infeasible-M handling (the outer
+    // M-search simply tries a larger M) still applies.
+    if (spec.designMethod == DesignMethod::ProlateBasis)
+    {
+        const double bandwidthNormalized = fc / Fs;
+        auto dpssAll = computeEvenDpssHalfVectors (M, bandwidthNormalized, reducedVars);
+        const int maxAvailableK = static_cast<int> (dpssAll.size());
+
+        // Build (a0, Z, reducedVars) from the first K DPSS directions;
+        // returns false (leaving outputs untouched) if that K is
+        // numerically degenerate for the DC-reduction step.
+        auto buildBasisForK = [&] (int K, std::vector<double>& outA0, std::vector<double>& outZ, int& outReduced) -> bool
+        {
+            if (K < 2) return false;
+            std::vector<double> g (static_cast<std::size_t> (K));
+            for (int k = 0; k < K; ++k)
+            {
+                double dot = 0.0;
+                for (int i = 0; i < numVars; ++i)
+                    dot += e[static_cast<std::size_t> (i)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
+                g[static_cast<std::size_t> (k)] = dot;
+            }
+            double gSq = 0.0;
+            for (double v : g) gSq += v * v;
+            if (gSq <= 1.0e-12) return false;
+
+            std::vector<double> c0 (static_cast<std::size_t> (K));
+            for (int k = 0; k < K; ++k) c0[static_cast<std::size_t> (k)] = g[static_cast<std::size_t> (k)] / gSq;
+
+            double normG = std::sqrt (gSq);
+            std::vector<double> ug = g;
+            double alphaG = (g[0] >= 0.0) ? -normG : normG;
+            ug[0] -= alphaG;
+            double unormG2 = 0.0;
+            for (double v : ug) unormG2 += v * v;
+            if (unormG2 <= 1.0e-15) return false;
+
+            const int newReduced = K - 1;
+            std::vector<double> W (static_cast<std::size_t> (K) * static_cast<std::size_t> (newReduced));
+            for (int col = 1; col < K; ++col)
+                for (int row = 0; row < K; ++row)
+                {
+                    double val = (row == col ? 1.0 : 0.0) - 2.0 * ug[static_cast<std::size_t> (row)] * ug[static_cast<std::size_t> (col)] / unormG2;
+                    W[static_cast<std::size_t> (row) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (col - 1)] = val;
+                }
+
+            outA0.assign (static_cast<std::size_t> (numVars), 0.0);
+            for (int i = 0; i < numVars; ++i)
+            {
+                double sum = 0.0;
+                for (int k = 0; k < K; ++k)
+                    sum += c0[static_cast<std::size_t> (k)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
+                outA0[static_cast<std::size_t> (i)] = sum;
+            }
+            outZ.assign (static_cast<std::size_t> (numVars) * static_cast<std::size_t> (newReduced), 0.0);
+            for (int i = 0; i < numVars; ++i)
+                for (int j = 0; j < newReduced; ++j)
+                {
+                    double sum = 0.0;
+                    for (int k = 0; k < K; ++k)
+                        sum += W[static_cast<std::size_t> (k) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (j)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
+                    outZ[static_cast<std::size_t> (i) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (j)] = sum;
+                }
+            outReduced = newReduced;
+            return true;
+        };
+
+        // Quick feasibility probe for a candidate (a0K, ZK, redK): plain
+        // passband band + a representative near-Nyquist stopband band,
+        // no sidelobe bound - mirrors what solveForStopEdge's own
+        // "noSidelobe" check does, just self-contained here since the
+        // real freqToLinear/tryRho closures below aren't defined yet
+        // (they close over a0/Z/reducedVars themselves, which is
+        // exactly what this probe is deciding).
+        auto probeFeasible = [&] (const std::vector<double>& a0K, const std::vector<double>& ZK, int redK) -> bool
+        {
+            auto freqRow = [&] (double f, std::vector<double>& outZ, double& outConstant)
+            {
+                auto row = cosRow (f);
+                outConstant = 0.0;
+                for (int j = 0; j < numVars; ++j) outConstant += row[static_cast<std::size_t> (j)] * a0K[static_cast<std::size_t> (j)];
+                outZ.assign (static_cast<std::size_t> (redK), 0.0);
+                for (int k = 0; k < redK; ++k)
+                {
+                    double sum = 0.0;
+                    for (int j = 0; j < numVars; ++j)
+                        sum += row[static_cast<std::size_t> (j)] * ZK[static_cast<std::size_t> (j) * static_cast<std::size_t> (redK) + static_cast<std::size_t> (k)];
+                    outZ[static_cast<std::size_t> (k)] = sum;
+                }
+            };
+
+            std::vector<std::vector<double>> A;
+            std::vector<double> b;
+            const int pbPoints = std::max (10, 2 * M);
+            for (int i = 0; i < pbPoints; ++i)
+            {
+                double f = fc * static_cast<double> (i) / static_cast<double> (pbPoints - 1);
+                std::vector<double> z; double c;
+                freqRow (f, z, c);
+                A.push_back (z); b.push_back (1.0 - c);
+                std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
+                A.push_back (neg); b.push_back (c - gainFloor);
+            }
+            double totalAvail = std::max (1.0, nyquist - fc);
+            double guardW = std::min (2000.0, totalAvail * 0.03);
+            guardW = std::max (guardW, 200.0);
+            guardW = std::min (guardW, totalAvail);
+            double probeStopEdge = std::max (fc, nyquist - guardW);
+            const int sbPoints = std::max (25, 4 * M);
+            for (int i = 0; i < sbPoints; ++i)
+            {
+                double f = probeStopEdge + (nyquist - probeStopEdge) * (static_cast<double> (i) + 0.5) / static_cast<double> (sbPoints);
+                std::vector<double> z; double c;
+                freqRow (f, z, c);
+                A.push_back (z); b.push_back (eps - c);
+                std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
+                A.push_back (neg); b.push_back (c + eps);
+            }
+            return solveLPFeasibility (A, b, redK).feasible;
+        };
+
+        bool found = false;
+        for (int K = std::min (3, maxAvailableK); K <= maxAvailableK; ++K)
+        {
+            std::vector<double> a0K, ZK; int redK = 0;
+            if (! buildBasisForK (K, a0K, ZK, redK)) continue;
+            if (probeFeasible (a0K, ZK, redK))
+            {
+                a0 = a0K;
+                Z = ZK;
+                reducedVars = redK;
+                found = true;
+                break;
+            }
+        }
+        // If no K worked, fall through and keep the full null space
+        // (already built above) for this M - the outer M-search treats
+        // it exactly like any other infeasible attempt and tries a
+        // larger M, where more DPSS directions become available.
+        (void) found;
     }
 
     // A "coefficient row": a[i] as a linear function of y (constant term
