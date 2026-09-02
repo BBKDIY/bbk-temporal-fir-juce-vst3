@@ -858,6 +858,105 @@ int main()
         }
     }
 
+    // --- FilterSpec::sidelobeDecayRatio (distance-dependent sidelobe
+    // penalty - see ParametricFIR.h for the full rationale) ---
+    {
+        // Default (1.0) must be an exact no-op: identical taps to a spec
+        // that never sets the field at all.
+        {
+            FilterSpec explicitFlat { 192000.0, 20000.0, 0.50, 98.0 };
+            explicitFlat.stopbandMode = StopbandMode::FreeTransition;
+            explicitFlat.sidelobeDecayRatio = 1.0;
+            auto a = designParametricFIR (explicitFlat, maxTapCount);
+
+            FilterSpec defaultDecay { 192000.0, 20000.0, 0.50, 98.0 };
+            defaultDecay.stopbandMode = StopbandMode::FreeTransition;
+            auto b = designParametricFIR (defaultDecay, maxTapCount);
+
+            bool identical = a.taps.size() == b.taps.size();
+            if (identical)
+                for (std::size_t i = 0; i < a.taps.size(); ++i)
+                    if (a.taps[i] != b.taps[i]) identical = false;
+            check (identical, "[sidelobeDecayRatio] 1.0 is an exact no-op - identical taps to the default (unset) spec");
+        }
+
+        // A decayed design must still be a fully valid, spectrally
+        // compliant filter (unity DC gain, passband/stopband met) - the
+        // whole point of routing this through the same
+        // dense-verify-and-refine pipeline as every other spec.
+        {
+            FilterSpec decayed { 192000.0, 20000.0, 0.50, 98.0 };
+            decayed.stopbandMode = StopbandMode::FreeTransition;
+            decayed.sidelobeDecayRatio = 0.3;
+            auto r = designParametricFIR (decayed, maxTapCount);
+
+            check (r.constraintsMet, "[sidelobeDecayRatio] a decayed design (0.3) still reports its own targets as met");
+
+            double dcSum = r.taps.empty() ? 0.0 : std::accumulate (r.taps.begin(), r.taps.end(), 0.0);
+            checkNear (dcSum, 1.0, 1.0e-6, "[sidelobeDecayRatio] a decayed design (0.3) keeps unity DC gain");
+
+            const auto guard = freeTransitionGuardBand (decayed);
+            const double guardWorst = denseWorstDbInBand (r.taps, decayed.sampleRateHz, guard.first, guard.second);
+            check (guardWorst <= -decayed.stopbandRejectionDb + 0.5,
+                "[sidelobeDecayRatio] a decayed design (0.3) still meets the guard-band rejection target");
+
+            const double gainFloor = std::pow (10.0, -decayed.attenuationAtCutoffDb / 20.0);
+            bool passbandOk = true;
+            for (int i = 0; i <= 200; ++i)
+            {
+                double f = decayed.cutoffHz * static_cast<double> (i) / 200.0;
+                double resp = std::abs (responseAt (r.taps, f, decayed.sampleRateHz));
+                if (resp > 1.0 + 0.01 || resp < gainFloor - 0.02) passbandOk = false;
+            }
+            check (passbandOk, "[sidelobeDecayRatio] a decayed design (0.3) keeps the passband within [gainFloor, 1]");
+
+            // The whole point: settling span should genuinely shorten
+            // relative to the undecayed baseline at the same spec, not
+            // just move R_peak around.
+            FilterSpec undecayed = decayed;
+            undecayed.sidelobeDecayRatio = 1.0;
+            auto flat = designParametricFIR (undecayed, maxTapCount);
+            check (r.temporal.settlingSampleSpan < flat.temporal.settlingSampleSpan,
+                "[sidelobeDecayRatio] a decayed design (0.3) has a strictly shorter settling span than the undecayed baseline");
+            std::printf ("  [sidelobeDecayRatio] decay=1.0: T_0.1%%=%d samples, R_peak=%.3f%%  |  decay=0.3: T_0.1%%=%d samples, R_peak=%.3f%%\n",
+                flat.temporal.settlingSampleSpan, flat.temporal.rPeakPercent,
+                r.temporal.settlingSampleSpan, r.temporal.rPeakPercent);
+        }
+
+        // A very aggressive decay ratio must never silently ship a
+        // non-compliant filter - this is exactly the risk identified
+        // during development (a quick refine-loop-free probe let an
+        // aggressive ratio "cheat" the sparse constraint grid while
+        // genuinely violating the passband/stopband spec between grid
+        // points); the real engine's existing dense-verify-and-refine
+        // loop in solveForStopEdge must catch this for ANY
+        // sidelobeDecayRatio, the same way it already does for the
+        // undecayed case, so a dense re-check here must come back clean
+        // regardless of how small the ratio is.
+        {
+            FilterSpec aggressive { 192000.0, 20000.0, 0.50, 98.0 };
+            aggressive.stopbandMode = StopbandMode::FreeTransition;
+            aggressive.sidelobeDecayRatio = 0.001;
+            auto r = designParametricFIR (aggressive, maxTapCount);
+            check (r.constraintsMet, "[sidelobeDecayRatio] an aggressive decay ratio (0.001) still reports its own targets as met");
+
+            const auto guard = freeTransitionGuardBand (aggressive);
+            const double guardWorst = denseWorstDbInBand (r.taps, aggressive.sampleRateHz, guard.first, guard.second);
+            check (guardWorst <= -aggressive.stopbandRejectionDb + 0.5,
+                "[sidelobeDecayRatio] an aggressive decay ratio (0.001) is genuinely (densely) stopband-compliant, not just grid-compliant");
+
+            const double gainFloor = std::pow (10.0, -aggressive.attenuationAtCutoffDb / 20.0);
+            bool passbandOk = true;
+            for (int i = 0; i <= 2000; ++i)
+            {
+                double f = aggressive.cutoffHz * static_cast<double> (i) / 2000.0;
+                double resp = std::abs (responseAt (r.taps, f, aggressive.sampleRateHz));
+                if (resp > 1.0 + 0.01 || resp < gainFloor - 0.02) passbandOk = false;
+            }
+            check (passbandOk, "[sidelobeDecayRatio] an aggressive decay ratio (0.001) is genuinely (densely) passband-compliant, not just grid-compliant");
+        }
+    }
+
     std::printf ("\n%d/%d checks passed\n", checksRun - checksFailed, checksRun);
     return checksFailed == 0 ? 0 : 1;
 }

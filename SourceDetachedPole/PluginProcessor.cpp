@@ -13,6 +13,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("prolateBasis", &paramListener);
+    parameters.addParameterListener ("sidelobeDecay", &paramListener);
 
     startThread();
 }
@@ -29,6 +30,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("prolateBasis", &paramListener);
+    parameters.removeParameterListener ("sidelobeDecay", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -87,6 +89,24 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "prolateBasis", 1 }, "Prolate/DPSS Basis", false));
 
+    // 1.0 (default, top of the range): the flat sidelobe bound used
+    // above - an exact no-op (see ParametricFIR.h::FilterSpec::
+    // sidelobeDecayRatio). Lower values progressively tighten the bound
+    // on taps farther from the main lobe, concentrating ringing closer
+    // to the centre followed by a quieter tail instead of a flat
+    // plateau out to the tap boundary. Range extends down to 0.02
+    // (verified directly against the engine's own dense-verify-and-
+    // refine pipeline across this whole range, including well past it,
+    // down to 0.001 - always comes back genuinely spectrally compliant,
+    // never a silently-broken filter, though returns diminish sharply
+    // below roughly 0.15-0.3 for a typical operating point). A skew
+    // below 1 gives finer control in the lower, more perceptually
+    // active part of the range without shrinking the reachable span.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "sidelobeDecay", 1 }, "Sidelobe Decay",
+        juce::NormalisableRange<float> (0.02f, 1.0f, 0.001f, 0.5f),
+        1.0f));
+
     return layout;
 }
 
@@ -124,6 +144,8 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     const bool prolateBasisOn = parameters.getRawParameterValue ("prolateBasis")->load() > 0.5f;
     spec.designMethod = prolateBasisOn ? bbk::parametric::DesignMethod::ProlateBasis
                                         : bbk::parametric::DesignMethod::Minimax;
+
+    spec.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
     return spec;
 }
 
@@ -194,6 +216,7 @@ void BBKDetachedPoleAudioProcessor::run()
             uiSnapshot.stopbandRejectionDb = specToRun.stopbandRejectionDb;
             uiSnapshot.stopbandMode = specToRun.stopbandMode;
             uiSnapshot.designMethod = specToRun.designMethod;
+            uiSnapshot.sidelobeDecayRatio = specToRun.sidelobeDecayRatio;
             uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
             uiSnapshot.tapCount = result.tapCount;
             uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;

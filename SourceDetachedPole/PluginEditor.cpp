@@ -81,6 +81,15 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     stopbandAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "stopband", stopbandSlider);
 
+    prepareLabel (sidelobeDecayLabel, 13.0f, false, juce::Justification::centredLeft);
+    sidelobeDecayLabel.setText ("Sidelobe Decay", juce::dontSendNotification);
+    addAndMakeVisible (sidelobeDecayLabel);
+    prepareSlider (sidelobeDecaySlider);
+    sidelobeDecaySlider.setNumDecimalPlacesToDisplay (3);
+    addAndMakeVisible (sidelobeDecaySlider);
+    sidelobeDecayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "sidelobeDecay", sidelobeDecaySlider);
+
     // Off (default): the article's own minimax design (unchanged). On:
     // the same LP restricted to a DPSS/prolate-spheroidal basis instead
     // of the full tap space - see PluginProcessor.cpp::createParameterLayout()
@@ -110,7 +119,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 630);
+    setSize (680, 660);
     startTimerHz (4);
     timerCallback();
 }
@@ -152,6 +161,7 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     area.removeFromTop (6);
 
     sliderRow (stopbandLabel, stopbandSlider);
+    sliderRow (sidelobeDecayLabel, sidelobeDecaySlider);
 
     prolateBasisButton.setBounds (area.removeFromTop (24));
     area.removeFromTop (6);
@@ -234,6 +244,12 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
                 "discrete prolate spheroidal directions, biased toward continuous-time energy "
                 "concentration rather than only discrete-sample sidelobe suppression"
               : "Minimax (default) - the article's own minimum-peak-sidelobe method")
+         << "\n"
+         << "Sidelobe decay: " << juce::String (snap.sidelobeDecayRatio, 3)
+         << (snap.sidelobeDecayRatio >= 0.999
+              ? " (flat, no decay - unchanged behaviour)"
+              : " - taps farther from the main lobe are bounded more tightly, concentrating "
+                "ringing near the centre with a shorter, quieter tail")
          << "\n"
          << "Amplitude relaxation: " << (snap.amplitudeRelaxationOn
               ? "ON - attenuation slider used as set (Case C-style spectral relaxation)"

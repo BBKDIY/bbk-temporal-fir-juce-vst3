@@ -33,6 +33,8 @@ private:
     juce::Slider attenuationSlider;
     juce::Label stopbandLabel;
     juce::Slider stopbandSlider;
+    juce::Label sidelobeDecayLabel;
+    juce::Slider sidelobeDecaySlider;
 
     juce::Label metricsReadout;
     juce::TextButton coefficientsButton { "Show Coefficients" };
@@ -42,6 +44,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sidelobeDecayAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> prolateBasisAttachment;

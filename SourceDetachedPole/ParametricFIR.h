@@ -166,6 +166,41 @@ struct FilterSpec
     double stopbandRejectionDb = 98.0;
     StopbandMode stopbandMode = StopbandMode::FlatMask;
     DesignMethod designMethod = DesignMethod::Minimax;
+
+    // Distance-dependent penalty on the sidelobe/rho bound: outer tap i
+    // (i steps from the main lobe boundary) is bounded by
+    // rho*a[0]*sidelobeDecayRatio^i instead of the flat rho*a[0] used
+    // when this is 1.0 (the default - byte-identical to the original
+    // flat-envelope minimax with no special-casing needed, since
+    // pow(1.0, anything) == 1.0). Values < 1.0 progressively tighten the
+    // bound the farther a tap sits from the main lobe, concentrating
+    // ringing closer to the centre followed by a quieter tail instead of
+    // a flat sidelobe plateau extending to the tap boundary - directly
+    // addressing the "ripples closer to the main lobe, then quiet"
+    // shape requested during development. Applies to whichever
+    // DesignMethod is in use (Minimax or ProlateBasis), since both share
+    // the same tryRho/solveForStopEdge machinery below - this field is
+    // an orthogonal modifier to the sidelobe constraint, not a separate
+    // design method itself.
+    //
+    // Measured directly (192 kHz/20 kHz/0.5 dB/98 dB, 19 taps) across
+    // the plugin's actual dense-verify-and-refine pipeline (which a
+    // quicker, refine-loop-free probe during development did NOT
+    // include, and which is essential - without it, aggressive decay
+    // ratios were found to let the LP satisfy only the sparse
+    // constraint grid while genuinely violating the passband/stopband
+    // spec between grid points, e.g. a 2.4% passband violation at
+    // decayRatio=0.001 - the dense-verify-and-refine loop in
+    // solveForStopEdge closes exactly that gap for any decayRatio, the
+    // same way it already does for the undecayed case):
+    //   1.0 (no decay): R_peak 0.6%,  T_0.1% 16 samples (unchanged baseline)
+    //   0.5:             R_peak 4.0%,  T_0.1% 14 samples
+    //   0.3:             R_peak 3.5%,  T_0.1% 10 samples (best measured trade-off)
+    //   0.15:            R_peak 4.6%,  T_0.1% 10 samples (plateaus, no further gain)
+    // Not monotonic and not a single "best" value for every spec/tap
+    // count, which is why this is a live control rather than a fixed
+    // constant - see PluginEditor.
+    double sidelobeDecayRatio = 1.0;
 };
 
 // The paper's own time-domain concentration metrics (Section 8.1),
@@ -987,16 +1022,22 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             indexToLinear (0, z0, c0);
             for (int i = mainLobeStart; i <= M; ++i)
             {
+                // Distance-dependent tightening (see FilterSpec::
+                // sidelobeDecayRatio) - a plain multiplier on the same
+                // bound used before, 1.0 when the feature is unused so
+                // this is an exact no-op by construction, not a special
+                // case.
+                const double w = std::pow (spec.sidelobeDecayRatio, static_cast<double> (i - mainLobeStart));
                 std::vector<double> zi; double ci;
                 indexToLinear (i, zi, ci);
                 std::vector<double> up (zi.size()), lo (zi.size());
                 for (std::size_t k = 0; k < zi.size(); ++k)
                 {
-                    up[k] = zi[k] - rho * z0[k];
-                    lo[k] = -zi[k] - rho * z0[k];
+                    up[k] = zi[k] - rho * w * z0[k];
+                    lo[k] = -zi[k] - rho * w * z0[k];
                 }
-                A.push_back (up); b.push_back (rho * c0 - ci);      // a[i] - rho*a[0] <= 0
-                A.push_back (lo); b.push_back (rho * c0 + ci);      // -a[i] - rho*a[0] <= 0
+                A.push_back (up); b.push_back (rho * w * c0 - ci);  // a[i] - rho*w*a[0] <= 0
+                A.push_back (lo); b.push_back (rho * w * c0 + ci);  // -a[i] - rho*w*a[0] <= 0
             }
 
             // Peak-dominance: a[0] must actually BE the peak, not just
