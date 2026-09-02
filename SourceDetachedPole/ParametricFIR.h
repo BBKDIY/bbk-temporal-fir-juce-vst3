@@ -749,7 +749,19 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
     if (spec.designMethod == DesignMethod::ProlateBasis)
     {
         const double bandwidthNormalized = fc / Fs;
-        auto dpssAll = computeEvenDpssHalfVectors (M, bandwidthNormalized, reducedVars);
+        // Request numVars (=M+1), not reducedVars (=M): numVars is the
+        // *true* total count of even half-coefficient directions (the
+        // even eigenvectors of the full N=2M+1 tridiagonal matrix split
+        // M+1 even / M odd, verified directly) - passing reducedVars
+        // here silently excluded the single least-concentrated even
+        // direction, capping ProlateBasis's own null-space dimension at
+        // reducedVars-1 (=M-1) even when K uses everything available,
+        // one short of Minimax's own reducedVars (=M). At the LP's
+        // actual optimum that missing direction can matter a great
+        // deal - measured directly: the gap this left behind was large
+        // enough to be visible on a hardware loopback measurement even
+        // after fixing the separate minimal-K issue above.
+        auto dpssAll = computeEvenDpssHalfVectors (M, bandwidthNormalized, numVars);
         const int maxAvailableK = static_cast<int> (dpssAll.size());
 
         // Build (a0, Z, reducedVars) from the first K DPSS directions;
