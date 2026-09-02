@@ -705,20 +705,47 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
     // with). Deriving DC=1 *within* the DPSS combination space instead
     // keeps each DPSS shape whole.
     //
-    // How many leading directions K to keep is not fixed in advance:
-    // start from a small K and grow it (one more DPSS direction at a
-    // time) until a quick passband+stopband feasibility probe (no
-    // sidelobe/ringing objective yet - just "does *any* point in this
-    // subspace meet the spectral spec at all") succeeds, at a
-    // representative stopband edge matching the guard-band rule
-    // FreeTransition mode actually uses further down. This keeps the
-    // basis as small (and therefore as inherently time-concentrated) as
-    // the spec allows, rather than guessing a fixed size that is either
-    // too restrictive (spuriously infeasible) or too generous (barely
-    // different from full Minimax). If even the largest available K
-    // still cannot meet the spec, the full null space is used instead
-    // for this M so the caller's usual infeasible-M handling (the outer
+    // How many leading directions K to keep: first find the *minimal*
+    // feasible K (grow K one DPSS direction at a time until a quick
+    // passband+stopband feasibility probe succeeds - no sidelobe/ringing
+    // objective yet, just "does any point in this subspace meet the
+    // spectral spec at all"), then deliberately grow past that minimum
+    // by a fixed multiplier before actually building the basis used for
+    // the real sidelobe-minimising solve below.
+    //
+    // This two-step shape (minimal-feasible, then multiply) is not a
+    // decoration - the minimal-feasible K on its own was measured
+    // directly to be a *bad* choice: at the plugin's own 192 kHz/20 kHz/
+    // 0.5 dB/98 dB default point (19 taps), minimal K leaves the LP so
+    // little room that its best achievable ringing is R_peak=18.2%
+    // (worse than a plain Kaiser window), while simply allowing more of
+    // the *already-computed, already-ranked* DPSS directions - K scaled
+    // up by kGrowthMultiplier at the same spec - lets the same
+    // bisection reach R_peak=6.3% at 1.6x and effectively matches
+    // Minimax by the time K approaches the full available set. Since
+    // feasibility is monotonic in K (each extra DPSS direction strictly
+    // extends, never shrinks, the achievable set - adding one more
+    // direction with coefficient 0 always recovers the previous
+    // solution exactly), any K at or above the minimal feasible one is
+    // guaranteed feasible too, so growing past it needs no further
+    // feasibility re-probing.
+    //
+    // kGrowthMultiplier is a plain heuristic, not derived from an
+    // optimality condition - it trades off "meaningfully restricted
+    // subspace" against "not crippling the achievable ringing", and at
+    // typical operating points pushes K close to (sometimes equal to)
+    // the full available set, at which point ProlateBasis's own
+    // sidelobe-minimising solve converges toward Minimax's. That is an
+    // accepted, known limitation of this basis-restriction approach as
+    // a whole, not something a better multiplier can fully avoid: the
+    // rigorous way to target genuine continuous-time concentration
+    // without this tension is the full QCQP/SOCP reformulation of the
+    // true energy objective, not a restricted linear basis at all - see
+    // the top-of-file discussion. If even the largest available K still
+    // cannot meet the spec, the full null space is used instead for
+    // this M so the caller's usual infeasible-M handling (the outer
     // M-search simply tries a larger M) still applies.
+    constexpr double kGrowthMultiplier = 2.5;
     if (spec.designMethod == DesignMethod::ProlateBasis)
     {
         const double bandwidthNormalized = fc / Fs;
@@ -838,25 +865,39 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             return solveLPFeasibility (A, b, redK).feasible;
         };
 
-        bool found = false;
+        int minimalFeasibleK = -1;
         for (int K = std::min (3, maxAvailableK); K <= maxAvailableK; ++K)
         {
             std::vector<double> a0K, ZK; int redK = 0;
             if (! buildBasisForK (K, a0K, ZK, redK)) continue;
-            if (probeFeasible (a0K, ZK, redK))
+            if (probeFeasible (a0K, ZK, redK)) { minimalFeasibleK = K; break; }
+        }
+
+        if (minimalFeasibleK > 0)
+        {
+            // Grow past the minimal feasible K (see the comment above) -
+            // feasibility is monotonic in K, so no re-probe is needed;
+            // if buildBasisForK happens to be degenerate exactly at the
+            // grown target (rare - only when its own Householder step
+            // is numerically ill-conditioned), fall back down toward the
+            // minimal feasible K rather than silently keeping the full
+            // null space, since minimalFeasibleK is already known-good.
+            int targetK = std::min (maxAvailableK, static_cast<int> (std::ceil (static_cast<double> (minimalFeasibleK) * kGrowthMultiplier)));
+            std::vector<double> a0K, ZK; int redK = 0;
+            bool built = false;
+            for (int K = targetK; K >= minimalFeasibleK && ! built; --K)
+                built = buildBasisForK (K, a0K, ZK, redK);
+            if (built)
             {
                 a0 = a0K;
                 Z = ZK;
                 reducedVars = redK;
-                found = true;
-                break;
             }
         }
-        // If no K worked, fall through and keep the full null space
-        // (already built above) for this M - the outer M-search treats
-        // it exactly like any other infeasible attempt and tries a
-        // larger M, where more DPSS directions become available.
-        (void) found;
+        // If no K worked at all, fall through and keep the full null
+        // space (already built above) for this M - the outer M-search
+        // treats it exactly like any other infeasible attempt and tries
+        // a larger M, where more DPSS directions become available.
     }
 
     // A "coefficient row": a[i] as a linear function of y (constant term
