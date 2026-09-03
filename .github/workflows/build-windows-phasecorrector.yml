@@ -1,0 +1,50 @@
+name: Build Windows VST3 - BBK Phase Corrector (JUCE, real MSVC)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'BBKPhaseCorrector/**'
+      - '.github/workflows/build-windows-phasecorrector.yml'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: BBKPhaseCorrector
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run phase-designer smoke test (framework-independent)
+        shell: pwsh
+        run: |
+          cmake -S . -B build-smoke -DBBKPC_BUILD_SMOKE_TEST_ONLY=ON
+          cmake --build build-smoke --config Release --target BBKPhaseCorrector_SmokeTest
+          $exe = Get-ChildItem -Path build-smoke -Recurse -Filter "BBKPhaseCorrector_SmokeTest.exe" | Select-Object -First 1
+          if (-not $exe) { throw "BBKPhaseCorrector_SmokeTest.exe not found - smoke test build failed." }
+          & $exe.FullName
+          if ($LASTEXITCODE -ne 0) { throw "BBKPhaseCorrector smoke test FAILED (exit code $LASTEXITCODE)." }
+
+      - name: Configure (CMake + Visual Studio 17 2022, x64)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release --target BBKPhaseCorrector_VST3
+
+      - name: Locate the built .vst3 bundle
+        shell: pwsh
+        run: |
+          $found = Get-ChildItem -Path build -Recurse -Filter "BBK Phase Corrector.vst3" | Select-Object -First 1
+          if (-not $found) { throw "BBK Phase Corrector.vst3 not found under build/ - build likely failed." }
+          Write-Host "Found: $($found.FullName)"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $found.FullName -Destination "dist/BBK Phase Corrector.vst3" -Recurse
+
+      - name: Upload BBK Phase Corrector artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: BBK-PhaseCorrector-Windows-VST3-JUCE-MSVC
+          path: BBKPhaseCorrector/dist/BBK Phase Corrector.vst3
