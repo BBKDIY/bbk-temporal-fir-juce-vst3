@@ -122,8 +122,8 @@ void BBKPhaseCorrectorAudioProcessor::initialiseDryDelay (int channels, int late
                          std::vector<float> (static_cast<std::size_t> (dryDelayLength), 0.0f));
 }
 
-void BBKPhaseCorrectorAudioProcessor::processDryDelay (const juce::AudioBlock<const float>& input,
-                                                        juce::AudioBlock<float>& output) noexcept
+void BBKPhaseCorrectorAudioProcessor::processDryDelay (const juce::dsp::AudioBlock<const float>& input,
+                                                        juce::dsp::AudioBlock<float>& output) noexcept
 {
     const auto channels = static_cast<int> (std::min (input.getNumChannels(), output.getNumChannels()));
     const auto samples = static_cast<int> (std::min (input.getNumSamples(), output.getNumSamples()));

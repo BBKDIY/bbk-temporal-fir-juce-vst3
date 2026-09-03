@@ -42,8 +42,8 @@ private:
     static juce::AudioBuffer<float> makeImpulseBuffer (const std::vector<float>& impulse);
 
     void initialiseDryDelay (int channels, int latencySamples);
-    void processDryDelay (const juce::AudioBlock<const float>& input,
-                          juce::AudioBlock<float>& output) noexcept;
+    void processDryDelay (const juce::dsp::AudioBlock<const float>& input,
+                          juce::dsp::AudioBlock<float>& output) noexcept;
     void updateModeTargets (int mode);
 
     juce::dsp::Convolution minimumConvolution;
