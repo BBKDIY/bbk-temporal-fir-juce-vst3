@@ -77,5 +77,17 @@ private:
     std::atomic<int> phaseLatencySamples { 0 };
     std::atomic<bool> sampleRateSupported { true };
 
+    // Auto-headroom calibration state - audio-thread only, no need for atomics.
+    // clipEnvelope is a leaky peak-hold of how far the corrected (MIN/LINEAR
+    // PHASE) signal has recently pushed past the soft-clip knee; when it
+    // stays above autoHeadroomTriggerLinear for a sustained period AND the
+    // cooldown has elapsed, the "headroom" parameter is ratcheted one step
+    // more negative via setValueNotifyingHost(). One-way only - it never
+    // loosens itself back up - see PluginProcessor.cpp for the full design
+    // rationale.
+    float clipEnvelope = 0.0f;
+    int samplesUntilNextAutoAdjust = 0;
+    int autoAdjustCooldownSamples = 0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKPhaseCorrectorAudioProcessor)
 };

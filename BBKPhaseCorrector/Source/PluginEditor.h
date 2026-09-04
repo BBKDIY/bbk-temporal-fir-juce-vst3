@@ -26,5 +26,12 @@ private:
     juce::TextButton minimumButton { "MIN PHASE" };
     juce::TextButton linearButton { "LINEAR PHASE" };
 
+    juce::Label headroomCaption;
+    juce::Slider headroomSlider;
+    juce::ToggleButton autoHeadroomButton { "Auto" };
+
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKPhaseCorrectorAudioProcessorEditor)
 };

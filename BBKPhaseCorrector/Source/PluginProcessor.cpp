@@ -5,6 +5,88 @@
 #include <cmath>
 #include <exception>
 
+namespace
+{
+    // Why there is both a pre-attenuation pad AND a soft-clip backstop
+    // below, rather than either alone:
+    //
+    // Even a pure phase-only, unit-magnitude all-pass filter does NOT
+    // preserve time-domain peak level, only energy (Parseval) - realigning
+    // phase across frequencies can make components that used to interfere
+    // destructively add constructively instead, producing a taller sample
+    // peak than the input ever had even though the magnitude response is
+    // flat. That is a genuine, physically-explained side effect of any
+    // phase correction, not a coding bug - and it is exactly the mechanism
+    // this plugin's own correction relies on to sharpen/concentrate the
+    // impulse response in the first place, so simply clamping every peak
+    // after the fact (an earlier version of this fix) blunts precisely the
+    // transient improvement the correction exists to deliver.
+    //
+    // Measured directly, by convolving the actual (unmodified) MIN PHASE/
+    // LINEAR PHASE impulse responses against several thousand full-scale
+    // (0 dBFS) synthetic test signals - multi-tone mixes, band-limited
+    // noise, chirps, and single tones, spanning 20 Hz-19 kHz:
+    //   - the median case already peaks a couple of hundredths of a dB
+    //     over 0 dBFS (i.e. a full-scale input very commonly ends up
+    //     slightly over, not just in rare pathological cases),
+    //   - the 99th percentile is roughly +2.5 dB over,
+    //   - the worst case found in this search was +4.0 dB over.
+    // (For reference, the mathematically exact worst case for ANY input,
+    // sum(|taps|), is far higher still, ~+20 dB - but that requires an
+    // input adversarially matched to the filter's own time-reversed
+    // shape, not realistic program material.)
+    //
+    // A LINEAR pre-attenuation pad applied before the correction
+    // (mathematically identical to applying it after, since convolution is
+    // linear - h*(k*x) == k*(h*x) - but placed before per the more
+    // intuitive "pad, then correct" framing) is chosen to comfortably cover
+    // the *typical* case: it changes absolute level only, and preserves the
+    // corrected waveform's shape exactly (including its sharper transient
+    // peak) since it's the same scale factor everywhere, at every
+    // frequency, not a nonlinearity. The soft-clip below is kept as a
+    // secondary backstop only, sized well above where the padded signal
+    // normally sits, so for ordinary program material it should now sit
+    // dormant almost all the time - it only exists to guarantee no actual
+    // digital-overs on the rarer, unusually peaky transient content that
+    // still exceeds the pad's margin, rather than being the primary
+    // mechanism shaping real peaks the way it was before.
+    //
+    // The pad amount is the "headroom" parameter (live-adjustable in the
+    // UI, default -4 dB, arrived at from real-world listening feedback) -
+    // no longer a fixed compile-time constant. "autoHeadroom" (default on)
+    // lets the processor ratchet it down itself if it detects the corrected
+    // signal sustainedly hitting the soft-clip backstop - see the
+    // auto-calibration constants below and processBlock().
+    //
+    // IMPORTANT: this pad, and the soft-clip below, both apply ONLY to the
+    // MIN PHASE/LINEAR PHASE paths. BYPASS must stay byte-for-byte
+    // untouched at any input level - see the bypass-path note in
+    // processBlock()'s mix loop.
+    constexpr float softClipKneeStart = 0.891f; // ~ -1 dBFS: identity below this
+    constexpr float softClipCeiling   = 0.999f; // ~ -0.01 dBFS: asymptote, never reached exactly
+
+    inline float applySafetySoftClip (float x) noexcept
+    {
+        const float ax = std::abs (x);
+        if (ax <= softClipKneeStart)
+            return x;
+
+        const float span = softClipCeiling - softClipKneeStart;
+        const float over = (ax - softClipKneeStart) / span;
+        const float shaped = softClipKneeStart + span * std::tanh (over);
+        return std::copysign (shaped, x);
+    }
+
+    // Auto-headroom calibration tuning (see clipEnvelope/
+    // samplesUntilNextAutoAdjust/autoAdjustCooldownSamples in
+    // PluginProcessor.h, and the ratchet logic at the end of processBlock()).
+    constexpr float autoHeadroomStepDb           = 0.5f;   // ratchet increment per adjustment
+    constexpr float autoHeadroomMinDb            = -18.0f; // matches the "headroom" parameter's range floor
+    constexpr float autoHeadroomTriggerLinear    = 0.02f;  // ~0.2 dB sustained excess over the knee before ratcheting
+    constexpr float autoHeadroomReleasePerSecond = 0.5f;   // clipEnvelope decay rate when not clipping
+    constexpr double autoHeadroomCooldownSeconds = 3.0;    // minimum time between successive ratchet steps
+}
+
 BBKPhaseCorrectorAudioProcessor::BBKPhaseCorrectorAudioProcessor()
     : AudioProcessor (BusesProperties()
                         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -22,6 +104,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKPhaseCorrectorAudioProces
         "Mode",
         juce::StringArray { "Bypass", "Minimum phase", "Linear phase" },
         0));
+
+    // Applied only to the MIN/LINEAR PHASE paths, never to BYPASS - see the
+    // pre-attenuation comment in processBlock() for why this exists at all.
+    // -4 dB is the value arrived at from real-world listening feedback
+    // before this became a live parameter; kept as the default here.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "headroom", 1 },
+        "Headroom",
+        juce::NormalisableRange<float> (-18.0f, 0.0f, 0.1f),
+        -4.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("dB")));
+
+    // When on (default), the processor self-adjusts "headroom" downward if
+    // it detects the correction sustainedly hitting the soft-clip backstop.
+    // One-way ratchet only. Turned off automatically the moment the user
+    // edits "headroom" directly in the UI - see PluginEditor.cpp.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "autoHeadroom", 1 },
+        "Auto Headroom",
+        true));
 
     return layout;
 }
@@ -121,6 +223,10 @@ void BBKPhaseCorrectorAudioProcessor::prepareToPlay (double sampleRate, int samp
     minimumMix.setCurrentAndTargetValue (mode == 1 ? 1.0f : 0.0f);
     linearMix.setCurrentAndTargetValue (mode == 2 ? 1.0f : 0.0f);
     lastMode = mode;
+
+    clipEnvelope = 0.0f;
+    samplesUntilNextAutoAdjust = 0;
+    autoAdjustCooldownSamples = static_cast<int> (sampleRate * autoHeadroomCooldownSeconds);
 }
 
 void BBKPhaseCorrectorAudioProcessor::releaseResources()
@@ -170,70 +276,6 @@ void BBKPhaseCorrectorAudioProcessor::processDryDelay (const juce::dsp::AudioBlo
 
         if (++dryDelayWritePosition >= dryDelayLength)
             dryDelayWritePosition = 0;
-    }
-}
-
-namespace
-{
-    // Why there is both a pre-attenuation pad AND a soft-clip backstop
-    // below, rather than either alone:
-    //
-    // Even a pure phase-only, unit-magnitude all-pass filter does NOT
-    // preserve time-domain peak level, only energy (Parseval) - realigning
-    // phase across frequencies can make components that used to interfere
-    // destructively add constructively instead, producing a taller sample
-    // peak than the input ever had even though the magnitude response is
-    // flat. That is a genuine, physically-explained side effect of any
-    // phase correction, not a coding bug - and it is exactly the mechanism
-    // this plugin's own correction relies on to sharpen/concentrate the
-    // impulse response in the first place, so simply clamping every peak
-    // after the fact (an earlier version of this fix) blunts precisely the
-    // transient improvement the correction exists to deliver.
-    //
-    // Measured directly, by convolving the actual (unmodified) MIN PHASE/
-    // LINEAR PHASE impulse responses against several thousand full-scale
-    // (0 dBFS) synthetic test signals - multi-tone mixes, band-limited
-    // noise, chirps, and single tones, spanning 20 Hz-19 kHz:
-    //   - the median case already peaks a couple of hundredths of a dB
-    //     over 0 dBFS (i.e. a full-scale input very commonly ends up
-    //     slightly over, not just in rare pathological cases),
-    //   - the 99th percentile is roughly +2.5 dB over,
-    //   - the worst case found in this search was +4.0 dB over.
-    // (For reference, the mathematically exact worst case for ANY input,
-    // sum(|taps|), is far higher still, ~+20 dB - but that requires an
-    // input adversarially matched to the filter's own time-reversed
-    // shape, not realistic program material.)
-    //
-    // A FIXED, LINEAR pre-attenuation pad applied before the correction
-    // (mathematically identical to applying it after, since convolution is
-    // linear - h*(k*x) == k*(h*x) - but placed before per the more
-    // intuitive "pad, then correct" framing) is chosen to comfortably cover
-    // the *typical* case: it changes absolute level only, and preserves the
-    // corrected waveform's shape exactly (including its sharper transient
-    // peak) since it's the same scale factor everywhere, at every
-    // frequency, not a nonlinearity. The soft-clip below is kept as a
-    // secondary backstop only, sized well above where the padded signal
-    // normally sits, so for ordinary program material it should now sit
-    // dormant almost all the time - it only exists to guarantee no actual
-    // digital-overs on the rarer, unusually peaky transient content that
-    // still exceeds the pad's margin, rather than being the primary
-    // mechanism shaping real peaks the way it was before.
-    constexpr float preAttenuationDb = -3.0f; // applied to MIN/LINEAR PHASE paths only, not BYPASS
-    const float preAttenuationGain = juce::Decibels::decibelsToGain (preAttenuationDb);
-
-    constexpr float softClipKneeStart = 0.891f; // ~ -1 dBFS: identity below this
-    constexpr float softClipCeiling   = 0.999f; // ~ -0.01 dBFS: asymptote, never reached exactly
-
-    inline float applySafetySoftClip (float x) noexcept
-    {
-        const float ax = std::abs (x);
-        if (ax <= softClipKneeStart)
-            return x;
-
-        const float span = softClipCeiling - softClipKneeStart;
-        const float over = (ax - softClipKneeStart) / span;
-        const float shaped = softClipKneeStart + span * std::tanh (over);
-        return std::copysign (shaped, x);
     }
 }
 
@@ -291,11 +333,13 @@ void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& bu
     processDryDelay (inputBlock, dryBlock);
 
     // Pad before correcting (see the comment above applySafetySoftClip):
-    // a fixed, linear, frequency-independent gain reduction so the
-    // phase-realigned peak headroom this correction naturally uses up
-    // doesn't have to come out of the correction's own peak shape via
-    // nonlinear limiting. Applied only to the two corrected paths -
-    // BYPASS is untouched, so it stays at full reference level.
+    // a linear, frequency-independent gain reduction so the phase-realigned
+    // peak headroom this correction naturally uses up doesn't have to come
+    // out of the correction's own peak shape via nonlinear limiting.
+    // Applied only to the two corrected paths - BYPASS is untouched, so it
+    // stays at full reference level regardless of this parameter.
+    const float headroomDb = parameters.getRawParameterValue ("headroom")->load();
+    const float preAttenuationGain = juce::Decibels::decibelsToGain (headroomDb);
     minimumBlock.multiplyBy (preAttenuationGain);
     linearBlock.multiplyBy (preAttenuationGain);
 
@@ -310,6 +354,13 @@ void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& bu
     if (mode != lastMode)
         updateModeTargets (mode);
 
+    // blockPeakOver tracks, across this whole block, how far the CORRECTED
+    // signal alone (before the dry/BYPASS contribution is added back) pushed
+    // past the soft-clip knee - this feeds the auto-headroom ratchet below,
+    // and deliberately excludes the dry path so a hot BYPASS-only signal
+    // can never trigger it.
+    float blockPeakOver = 0.0f;
+
     for (int sample = 0; sample < numSamples; ++sample)
     {
         const auto wb = bypassMix.getNextValue();
@@ -319,10 +370,51 @@ void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& bu
         for (int channel = 0; channel < numChannels; ++channel)
         {
             const auto c = static_cast<std::size_t> (channel);
-            const float mixed = wb * dryBlock.getChannelPointer (c)[sample]
-                              + wm * minimumBlock.getChannelPointer (c)[sample]
-                              + wl * linearBlock.getChannelPointer (c)[sample];
-            buffer.setSample (channel, sample, applySafetySoftClip (mixed));
+            const float dry = dryBlock.getChannelPointer (c)[sample];
+            const float corrected = wm * minimumBlock.getChannelPointer (c)[sample]
+                                   + wl * linearBlock.getChannelPointer (c)[sample];
+
+            const float absCorrected = std::abs (corrected);
+            if (absCorrected > softClipKneeStart)
+                blockPeakOver = std::max (blockPeakOver, absCorrected - softClipKneeStart);
+
+            // The soft-clip backstop applies ONLY to the corrected
+            // contribution; the dry/BYPASS contribution is added back
+            // afterwards, untouched. Previously the backstop was applied to
+            // the full wb*dry + wm*min + wl*linear sum, which meant a
+            // BYPASS signal anywhere near 0 dBFS - extremely common - was
+            // being audibly soft-clipped even though BYPASS is supposed to
+            // be a transparent pass-through. This was a genuine DSP bug,
+            // not a design tradeoff.
+            buffer.setSample (channel, sample, wb * dry + applySafetySoftClip (corrected));
+        }
+    }
+
+    // Auto-headroom: one-way ratchet only (see autoAdjustCooldownSamples/
+    // clipEnvelope in PluginProcessor.h for state, and the tuning constants
+    // above). Runs once per block, not per sample - this is a slow,
+    // "settle over several songs" adjustment, not a fast limiter.
+    const bool autoHeadroomEnabled = parameters.getRawParameterValue ("autoHeadroom")->load() > 0.5f;
+    if (autoHeadroomEnabled && currentSampleRate.load() > 0.0)
+    {
+        const float releaseThisBlock = autoHeadroomReleasePerSecond
+                                      * static_cast<float> (numSamples)
+                                      / static_cast<float> (currentSampleRate.load());
+        clipEnvelope = std::max (blockPeakOver, clipEnvelope - releaseThisBlock);
+
+        samplesUntilNextAutoAdjust -= numSamples;
+
+        if (clipEnvelope > autoHeadroomTriggerLinear && samplesUntilNextAutoAdjust <= 0)
+        {
+            if (auto* headroomParam = parameters.getParameter ("headroom"))
+            {
+                const float newDb = std::max (autoHeadroomMinDb, headroomDb - autoHeadroomStepDb);
+                if (newDb != headroomDb)
+                    headroomParam->setValueNotifyingHost (headroomParam->convertTo0to1 (newDb));
+            }
+
+            clipEnvelope = 0.0f;
+            samplesUntilNextAutoAdjust = autoAdjustCooldownSamples;
         }
     }
 }
