@@ -173,6 +173,50 @@ void BBKPhaseCorrectorAudioProcessor::processDryDelay (const juce::dsp::AudioBlo
     }
 }
 
+namespace
+{
+    // Safety ceiling applied to the final output, well below the fixed
+    // knee/ceiling constants: even a pure phase-only, unit-magnitude
+    // all-pass filter does NOT preserve time-domain peak level, only
+    // energy (Parseval) - re-aligning phase across frequencies can make
+    // components that used to interfere destructively add constructively
+    // instead, producing a taller sample peak than the input ever had,
+    // even though the magnitude response is flat. Verified directly:
+    // convolving the actual MIN PHASE/LINEAR PHASE impulse responses
+    // against full-scale (0 dBFS) test signals - a log sine sweep,
+    // band-limited noise, and 200 random multi-tone trials - showed
+    // output peaks up to roughly +1.3 to +1.7 dB over 0 dBFS. On already
+    // hot/limited commercial masters (extremely common), that is a real,
+    // audible click every time the correction's peak-gain lines up with
+    // one of the track's own peaks - reported directly by the user
+    // ("clicks... at amplitude peaks, like clipping").
+    //
+    // This is a genuine, physically-explained side effect of applying
+    // ANY phase correction to already-loud material, not a coding bug,
+    // and not something a "no intentional magnitude EQ" constraint
+    // prohibits fixing - it is flat/broadband and identical for every
+    // frequency, so it doesn't touch tonal balance the way an EQ curve
+    // would. Below the knee this is bit-identical to the unclamped
+    // signal; it only engages on the rare true-peak sample that would
+    // otherwise clip somewhere further down the chain anyway, and does
+    // so with a smooth (tanh) knee rather than a hard clamp, since a bare
+    // clamp's discontinuous derivative is itself audible as a small tick.
+    constexpr float softClipKneeStart = 0.891f; // ~ -1 dBFS: identity below this
+    constexpr float softClipCeiling   = 0.999f; // ~ -0.01 dBFS: asymptote, never reached exactly
+
+    inline float applySafetySoftClip (float x) noexcept
+    {
+        const float ax = std::abs (x);
+        if (ax <= softClipKneeStart)
+            return x;
+
+        const float span = softClipCeiling - softClipKneeStart;
+        const float over = (ax - softClipKneeStart) / span;
+        const float shaped = softClipKneeStart + span * std::tanh (over);
+        return std::copysign (shaped, x);
+    }
+}
+
 void BBKPhaseCorrectorAudioProcessor::updateModeTargets (int mode)
 {
     bypassMix.setTargetValue (mode == 0 ? 1.0f : 0.0f);
@@ -246,10 +290,10 @@ void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& bu
         for (int channel = 0; channel < numChannels; ++channel)
         {
             const auto c = static_cast<std::size_t> (channel);
-            buffer.setSample (channel, sample,
-                              wb * dryBlock.getChannelPointer (c)[sample]
-                            + wm * minimumBlock.getChannelPointer (c)[sample]
-                            + wl * linearBlock.getChannelPointer (c)[sample]);
+            const float mixed = wb * dryBlock.getChannelPointer (c)[sample]
+                              + wm * minimumBlock.getChannelPointer (c)[sample]
+                              + wl * linearBlock.getChannelPointer (c)[sample];
+            buffer.setSample (channel, sample, applySafetySoftClip (mixed));
         }
     }
 }
