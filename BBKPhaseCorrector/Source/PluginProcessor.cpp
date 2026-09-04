@@ -93,6 +93,10 @@ BBKPhaseCorrectorAudioProcessor::BBKPhaseCorrectorAudioProcessor()
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       parameters (*this, nullptr, "STATE", createParameterLayout())
 {
+    // See timerCallback(): polls "correctionDepth" on the message thread so
+    // moving that slider can hot-swap a redesigned impulse response without
+    // ever touching the audio thread.
+    startTimerHz (10);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout BBKPhaseCorrectorAudioProcessor::createParameterLayout()
@@ -125,6 +129,29 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKPhaseCorrectorAudioProces
         "Auto Headroom",
         true));
 
+    // How much of the measured phase correction to actually apply, as a
+    // percentage of the full amount (100% = the full measured correction,
+    // 0% = none - a pure delay, same effect as BYPASS). This is a genuine
+    // reduction in how aggressively phase is corrected, not a level trick -
+    // it directly reduces the constructive-interference peak growth that
+    // "headroom" and the soft-clip backstop otherwise have to absorb, at
+    // the cost of leaving more of the measured phase error uncorrected.
+    // Manual only, by design - like Acourate's own correction-strength
+    // control, this is a judgment call about how much correction is worth
+    // its side effects for a given room/system/programme material, made by
+    // ear, not something to auto-tune. Default 50% is a deliberately
+    // conservative starting point: measured full-strength (100%) correction
+    // can still produce audible peak growth even with -18 dB of headroom
+    // pad on real programme material, so shipping 100% as the out-of-the-
+    // box default would put most users straight into the soft-clip
+    // backstop. See PhaseFilterDesigner::design() for how this is applied.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "correctionDepth", 1 },
+        "Correction Depth",
+        juce::NormalisableRange<float> (0.0f, 100.0f, 1.0f),
+        50.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("%")));
+
     return layout;
 }
 
@@ -139,14 +166,17 @@ void BBKPhaseCorrectorAudioProcessor::prepareToPlay (double sampleRate, int samp
 {
     currentSampleRate.store (sampleRate);
 
+    const float correctionDepth = juce::jlimit (0.0f, 100.0f,
+        parameters.getRawParameterValue ("correctionDepth")->load()) / 100.0f;
+
     bbk::PhaseFilterDesigner::DesignResult minimumDesign, linearDesign;
 
     try
     {
         minimumDesign = bbk::PhaseFilterDesigner::design (
-            sampleRate, bbk::PhaseFilterDesigner::Target::minimumPhase);
+            sampleRate, bbk::PhaseFilterDesigner::Target::minimumPhase, correctionDepth);
         linearDesign = bbk::PhaseFilterDesigner::design (
-            sampleRate, bbk::PhaseFilterDesigner::Target::linearPhase);
+            sampleRate, bbk::PhaseFilterDesigner::Target::linearPhase, correctionDepth);
         sampleRateSupported.store (true);
     }
     catch (const std::exception&)
@@ -227,6 +257,8 @@ void BBKPhaseCorrectorAudioProcessor::prepareToPlay (double sampleRate, int samp
     clipEnvelope = 0.0f;
     samplesUntilNextAutoAdjust = 0;
     autoAdjustCooldownSamples = static_cast<int> (sampleRate * autoHeadroomCooldownSeconds);
+
+    lastAppliedCorrectionDepth = correctionDepth;
 }
 
 void BBKPhaseCorrectorAudioProcessor::releaseResources()
@@ -285,6 +317,54 @@ void BBKPhaseCorrectorAudioProcessor::updateModeTargets (int mode)
     minimumMix.setTargetValue (mode == 1 ? 1.0f : 0.0f);
     linearMix.setTargetValue (mode == 2 ? 1.0f : 0.0f);
     lastMode = mode;
+}
+
+void BBKPhaseCorrectorAudioProcessor::timerCallback()
+{
+    // prepareToPlay() hasn't run yet (e.g. plugin just instantiated, host
+    // hasn't started the audio graph) - nothing to redesign against.
+    const auto sampleRate = currentSampleRate.load();
+    if (sampleRate <= 0.0)
+        return;
+
+    const float correctionDepth = juce::jlimit (0.0f, 100.0f,
+        parameters.getRawParameterValue ("correctionDepth")->load()) / 100.0f;
+
+    if (std::abs (correctionDepth - lastAppliedCorrectionDepth) < 0.001f)
+        return;
+
+    try
+    {
+        const auto minimumDesign = bbk::PhaseFilterDesigner::design (
+            sampleRate, bbk::PhaseFilterDesigner::Target::minimumPhase, correctionDepth);
+        const auto linearDesign = bbk::PhaseFilterDesigner::design (
+            sampleRate, bbk::PhaseFilterDesigner::Target::linearPhase, correctionDepth);
+
+        // Same calls as prepareToPlay(), minus prepare() - the engines are
+        // already prepared, and fftSize/latency are unaffected by depth
+        // (only sampleRate changes those), so the dry-delay length and
+        // setLatencySamples() value from prepareToPlay() are still correct.
+        minimumConvolution.loadImpulseResponse (makeImpulseBuffer (minimumDesign.impulse),
+                                                 sampleRate,
+                                                 juce::dsp::Convolution::Stereo::no,
+                                                 juce::dsp::Convolution::Trim::no,
+                                                 juce::dsp::Convolution::Normalise::no);
+
+        linearConvolution.loadImpulseResponse (makeImpulseBuffer (linearDesign.impulse),
+                                                sampleRate,
+                                                juce::dsp::Convolution::Stereo::no,
+                                                juce::dsp::Convolution::Trim::no,
+                                                juce::dsp::Convolution::Normalise::no);
+
+        lastAppliedCorrectionDepth = correctionDepth;
+    }
+    catch (const std::exception&)
+    {
+        // design() only throws for sampleRate < 40 kHz, which
+        // prepareToPlay() already validated before we got here - stay
+        // defensive anyway rather than let an exception escape a Timer
+        // callback into the host/message loop.
+    }
 }
 
 void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,

@@ -30,8 +30,12 @@ private:
     juce::Slider headroomSlider;
     juce::ToggleButton autoHeadroomButton { "Auto" };
 
+    juce::Label depthCaption;
+    juce::Slider depthSlider;
+
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> depthAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKPhaseCorrectorAudioProcessorEditor)
 };

@@ -192,7 +192,7 @@ namespace bbk
         return result;
     }
 
-    PhaseFilterDesigner::DesignResult PhaseFilterDesigner::design (double sampleRate, Target target)
+    PhaseFilterDesigner::DesignResult PhaseFilterDesigner::design (double sampleRate, Target target, float correctionDepth)
     {
         if (sampleRate < 40000.0)
             throw std::runtime_error ("BBK Phase Corrector requires a sample rate of at least 40 kHz");
@@ -227,6 +227,22 @@ namespace bbk
 
         std::vector<double> correction;
         applyBandEdgeTapers (frequency, rawCorrection, correction);
+
+        // Uniformly scale the finished (tapered) correction curve toward
+        // zero. This is a genuine reduction in how much phase shift is
+        // introduced, not a headroom/gain trick - it directly reduces the
+        // constructive-interference peak growth this whole plugin is
+        // otherwise vulnerable to, at the cost of leaving more of the
+        // measured phase error uncorrected. Every bin's zero-crossing stays
+        // exactly where it was; only the excursion around it shrinks, which
+        // is what was asked for ("small rotation around this zero point").
+        // depth=0 collapses every bin to the pure delayPhase term added
+        // below, i.e. an exact identity allpass (matching BYPASS's matched
+        // delay) with no correction at all.
+        const auto depth = static_cast<double> (std::clamp (correctionDepth, 0.0f, 1.0f));
+        if (depth != 1.0)
+            for (auto& c : correction)
+                c *= depth;
 
         std::vector<std::complex<double>> spectrum (static_cast<std::size_t> (fftSize), { 0.0, 0.0 });
 

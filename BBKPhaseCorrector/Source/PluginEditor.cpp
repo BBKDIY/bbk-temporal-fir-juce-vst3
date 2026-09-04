@@ -5,7 +5,7 @@
 BBKPhaseCorrectorAudioProcessorEditor::BBKPhaseCorrectorAudioProcessorEditor (BBKPhaseCorrectorAudioProcessor& p)
     : AudioProcessorEditor (&p), processor (p)
 {
-    setSize (560, 280);
+    setSize (560, 320);
 
     titleLabel.setText ("BBK PHASE CORRECTOR", juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centred);
@@ -42,13 +42,20 @@ BBKPhaseCorrectorAudioProcessorEditor::BBKPhaseCorrectorAudioProcessorEditor (BB
     headroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.parameters, "headroom", headroomSlider);
 
-    // SliderAttachment syncs parameter -> UI with dontSendNotification, so
-    // onValueChange only fires for genuine user interaction (typing,
-    // clicking the arrows), never for a value pushed in from outside (host
-    // automation or the processor's own auto-headroom ratchet). That makes
-    // this the right hook for "typing overrides Auto": any real user edit
-    // turns Auto off so the typed value sticks.
-    headroomSlider.onValueChange = [this]
+    // IMPORTANT: this is onDragStart, not onValueChange. Checked against the
+    // actual JUCE source: SliderParameterAttachment pushes parameter->UI
+    // updates via slider.setValue(v, sendNotificationSync), which DOES fire
+    // onValueChange - so onValueChange fires for every change regardless of
+    // origin, including the processor's own auto-headroom ratchet, which
+    // would immediately (and wrongly) look like a user edit and turn Auto
+    // back off after its very first adjustment. onDragStart is different:
+    // JUCE wraps every genuine user gesture - mouse drag, IncDecButtons
+    // clicks, and committing typed text - in a ScopedDragNotification that
+    // fires onDragStart/onDragEnd, but SliderParameterAttachment's
+    // programmatic pushes do not go through that path at all. So
+    // onDragStart is the correct signal for "the user just started
+    // editing this control themselves."
+    headroomSlider.onDragStart = [this]
     {
         if (auto* autoParam = processor.parameters.getParameter ("autoHeadroom"))
         {
@@ -65,6 +72,23 @@ BBKPhaseCorrectorAudioProcessorEditor::BBKPhaseCorrectorAudioProcessorEditor (BB
     addAndMakeVisible (autoHeadroomButton);
     autoHeadroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.parameters, "autoHeadroom", autoHeadroomButton);
+
+    depthCaption.setText ("Correction Depth (%)", juce::dontSendNotification);
+    depthCaption.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (depthCaption);
+
+    // How much of the measured phase correction to actually apply - manual
+    // only (no auto-calibration for this one, unlike headroom): how much
+    // correction is worth its side effects is a judgment call to make by
+    // ear for your own room/system/material, the same way Acourate's own
+    // correction-strength control works. Lower this if MIN/LINEAR PHASE
+    // still hits the soft-clip backstop even with a lot of Headroom pad.
+    depthSlider.setSliderStyle (juce::Slider::IncDecButtons);
+    depthSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 64, 24);
+    depthSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
+    addAndMakeVisible (depthSlider);
+    depthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.parameters, "correctionDepth", depthSlider);
 
     latencyLabel.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (latencyLabel);
@@ -105,6 +129,13 @@ void BBKPhaseCorrectorAudioProcessorEditor::resized()
     headroomSlider.setBounds (headroomRow.removeFromLeft (130));
     headroomRow.removeFromLeft (16);
     autoHeadroomButton.setBounds (headroomRow.removeFromLeft (70));
+
+    area.removeFromTop (12);
+
+    auto depthRow = area.removeFromTop (28);
+    depthCaption.setBounds (depthRow.removeFromLeft (120));
+    depthRow.removeFromLeft (10);
+    depthSlider.setBounds (depthRow.removeFromLeft (130));
 
     area.removeFromTop (14);
     latencyLabel.setBounds (area.removeFromTop (28));

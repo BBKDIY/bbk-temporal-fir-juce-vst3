@@ -3,7 +3,8 @@
 #include <JuceHeader.h>
 #include "PhaseFilterDesigner.h"
 
-class BBKPhaseCorrectorAudioProcessor final : public juce::AudioProcessor
+class BBKPhaseCorrectorAudioProcessor final : public juce::AudioProcessor,
+                                               private juce::Timer
 {
 public:
     BBKPhaseCorrectorAudioProcessor();
@@ -57,6 +58,20 @@ private:
                           juce::dsp::AudioBlock<float>& output) noexcept;
     void updateModeTargets (int mode);
 
+    // Polls "correctionDepth" on the message thread (NOT the audio thread)
+    // and, if it changed since the last time we applied it, redesigns both
+    // impulse responses at the new depth and hot-swaps them in via
+    // loadImpulseResponse(). That call is safe to make anytime after
+    // prepare() - JUCE defers the actual FFT-based engine build to
+    // Convolution's own background thread and crossfades to it over ~50ms,
+    // so this never blocks or glitches processBlock() even though a
+    // recompute of a 0.68s impulse response is too heavy to do inline on
+    // the audio thread. fftSize/latency never change with depth (only
+    // sampleRate affects those), so the dry-delay length and reported
+    // plugin latency stay valid across a depth change with no other
+    // bookkeeping needed.
+    void timerCallback() override;
+
     juce::dsp::Convolution minimumConvolution;
     juce::dsp::Convolution linearConvolution;
 
@@ -88,6 +103,14 @@ private:
     float clipEnvelope = 0.0f;
     int samplesUntilNextAutoAdjust = 0;
     int autoAdjustCooldownSamples = 0;
+
+    // Message-thread only: last correction depth (0..1) actually baked into
+    // the currently-loaded impulse responses, so timerCallback() only
+    // triggers a redesign when the "correctionDepth" parameter has actually
+    // moved. -1 sentinel forces the first check (right after prepareToPlay)
+    // to be a no-op, since prepareToPlay() already designs at the current
+    // depth itself.
+    float lastAppliedCorrectionDepth = -1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKPhaseCorrectorAudioProcessor)
 };
