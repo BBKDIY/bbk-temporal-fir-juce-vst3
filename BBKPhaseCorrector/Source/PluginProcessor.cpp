@@ -164,6 +164,25 @@ void BBKPhaseCorrectorAudioProcessor::processBlock (juce::AudioBuffer<float>& bu
     for (auto channel = getTotalNumInputChannels(); channel < getTotalNumOutputChannels(); ++channel)
         buffer.clear (channel, 0, numSamples);
 
+    // Defensive: minimumBuffer/linearBuffer/delayedDryBuffer are normally
+    // sized once in prepareToPlay() for the samplesPerBlock the host
+    // declares there, for efficiency. Some hosts do not honour that as a
+    // hard upper bound (an occasional larger "catch-up" block, adaptive
+    // buffering, etc.), and jassert() below compiles out entirely in the
+    // Release configuration this plugin ships as - so without this check,
+    // a single oversized block would silently read/write past the end of
+    // a fixed-size buffer via getSubBlock() (real, silent heap corruption,
+    // not merely a debug-only assertion). Grow them here on the rare
+    // occasion it's needed, the same defensive-resize pattern already
+    // used for channel count elsewhere in this codebase (see Black-19's
+    // PluginProcessor::process()).
+    if (numSamples > minimumBuffer.getNumSamples())
+    {
+        minimumBuffer.setSize (getTotalNumOutputChannels(), numSamples, false, false, true);
+        linearBuffer.setSize (getTotalNumOutputChannels(), numSamples, false, false, true);
+        delayedDryBuffer.setSize (getTotalNumOutputChannels(), numSamples, false, false, true);
+    }
+
     jassert (numSamples <= minimumBuffer.getNumSamples());
     jassert (numSamples <= linearBuffer.getNumSamples());
     jassert (numSamples <= delayedDryBuffer.getNumSamples());
