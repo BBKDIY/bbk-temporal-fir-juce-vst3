@@ -77,6 +77,18 @@ public:
     // for, not necessarily the host's rate right now).
     double getCurrentSampleRateForUI() const noexcept { return currentSampleRate.load(); }
 
+    // Millisecond timestamp (juce::Time::getMillisecondCounter() scale) of
+    // the last audio block in which the WET signal actually exceeded the
+    // soft-clip knee - i.e. the backstop actually engaged, regardless of
+    // whether Auto Headroom is on. The editor compares this against "now"
+    // to light a clip indicator for a short hold time. This exists because
+    // the backstop is deliberately inaudible/gentle when it engages
+    // rarely, which is the point for playback - but that same gentleness
+    // means it can hide from the ear exactly when you're trying to tune
+    // Headroom down manually by listening for clipping. The indicator
+    // gives an objective signal instead of relying on hearing it.
+    juce::uint32 getLastClipTimeMsForUI() const noexcept { return lastClipTimeMs.load(); }
+
     // A snapshot of the most recently completed design, safe to read from
     // the message thread at any time (used by the editor's metrics
     // readout and the "show coefficients" popup).
@@ -177,6 +189,24 @@ private:
     std::atomic<double> currentSampleRate { 0.0 };
     double lastPreparedSampleRate = 0.0;
     std::atomic<bool> hasPrepared { false };
+
+    // Auto-headroom calibration state - audio-thread only. Same design as
+    // BBK Phase Corrector's and BBK Temporal FIR's Auto Headroom: a leaky
+    // peak-hold of how far the WET (filtered) signal alone has recently
+    // pushed past the soft-clip knee; when it stays above the trigger for
+    // a sustained period AND the cooldown has elapsed, "headroom" is
+    // ratcheted one step more negative via setValueNotifyingHost().
+    // One-way only - see PluginProcessor.cpp.
+    float clipEnvelope = 0.0f;
+    int samplesUntilNextAutoAdjust = 0;
+    int autoAdjustCooldownSamples = 0;
+
+    // Written from the audio thread, read from the message thread for the
+    // UI's clip indicator - see getLastClipTimeMsForUI() above. Driven by
+    // the exact same per-block "did the wet signal exceed the knee"
+    // detection that feeds the Auto Headroom ratchet, so the light and
+    // Auto react to the same events, not two independent measurements.
+    std::atomic<juce::uint32> lastClipTimeMs { 0 };
 
     // Message-thread-only snapshot of the latest completed design, kept
     // separately from the audio-thread hand-off above so the UI never has

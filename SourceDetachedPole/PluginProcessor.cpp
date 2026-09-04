@@ -1,6 +1,62 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <cmath>
+
+namespace
+{
+    // This plugin's minimax-designed lowpass has unity DC gain (checked
+    // directly: designParametricFIR() always returns taps summing to
+    // 1.0), but that does NOT mean unity PEAK gain - the design allows
+    // sidelobe ripple (that's the whole point of "Sidelobe Decay"/R_peak),
+    // and for any filter with negative taps, sum(|taps|) is strictly
+    // greater than sum(taps) = 1. That gap is the exact worst-case peak
+    // gain the filter can apply to any bounded input, and it is highly
+    // sample-rate/cutoff dependent here: measured directly against the
+    // actual designParametricFIR() output for the plugin's own default
+    // spec (20 kHz cutoff, 0.5 dB attenuation, 98 dB stopband), it's only
+    // about +0.6 dB at 192 kHz (19 taps) but grows to +5.7 dB at 48 kHz
+    // and +6.4 dB at 44.1 kHz - because pushing the same 20 kHz cutoff
+    // much closer to a lower Nyquist forces a far longer, sharper filter
+    // (up to 65 taps) with correspondingly more sidelobe energy. Real
+    // program material lands far below that ceiling in practice
+    // (empirically ~+0.1 to +0.5 dB over, measured the same way as BBK
+    // Phase Corrector/BBK Temporal FIR via Monte Carlo convolution against
+    // the actual generated taps) - but since the worst case swings so
+    // much with the host's sample rate and the user's own cutoff choice,
+    // "headroom" defaults conservatively and Auto is relied on to find
+    // the right level for whatever combination is actually in use.
+    //
+    // Applied only to the WET (filtered) signal, before it's mixed with
+    // dry - BYPASS stays byte-for-byte untouched regardless of this
+    // setting, same transparency principle as the other two BBK plugins.
+    constexpr float softClipKneeStart = 0.891f; // ~ -1 dBFS: identity below this
+    constexpr float softClipCeiling   = 0.999f; // ~ -0.01 dBFS: asymptote, never reached exactly
+
+    inline double applySafetySoftClip (double x) noexcept
+    {
+        const double ax = std::abs (x);
+        if (ax <= softClipKneeStart)
+            return x;
+
+        const double span = static_cast<double> (softClipCeiling) - softClipKneeStart;
+        const double over = (ax - softClipKneeStart) / span;
+        const double shaped = softClipKneeStart + span * std::tanh (over);
+        return std::copysign (shaped, x);
+    }
+
+    // Auto-headroom calibration tuning - one-way ratchet only, same design
+    // as the other two BBK plugins. Wider range than BBK Temporal FIR
+    // since the measured worst case here goes up to +6.4 dB rather than
+    // +4.24 dB, and could plausibly be worse still for a cutoff pushed
+    // even closer to Nyquist than what was measured.
+    constexpr float autoHeadroomStepDb           = 0.25f;
+    constexpr float autoHeadroomMinDb            = -12.0f; // matches the "headroom" parameter's range floor
+    constexpr float autoHeadroomTriggerLinear    = 0.01f;  // ~0.1 dB sustained excess over the knee before ratcheting
+    constexpr float autoHeadroomReleasePerSecond = 0.5f;
+    constexpr double autoHeadroomCooldownSeconds = 3.0;
+}
+
 BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
 : AudioProcessor (BusesProperties()
     .withInput ("Input", juce::AudioChannelSet::stereo(), true)
@@ -106,6 +162,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::ParameterID { "sidelobeDecay", 1 }, "Sidelobe Decay",
         juce::NormalisableRange<float> (0.02f, 1.0f, 0.001f, 0.5f),
         1.0f));
+
+    // See the anonymous namespace above process() for the full rationale:
+    // the measured worst-case peak gain here ranges from about +0.6 dB
+    // (192 kHz) to +6.4 dB (44.1 kHz, cutoff near Nyquist) depending on
+    // sample rate and cutoff. -1.5 dB comfortably covers the empirically-
+    // measured realistic worst case (~+0.5 dB) at any rate; Auto Headroom
+    // (below) handles the rarer cases that need more than that, since a
+    // single fixed default can't cover every sample-rate/cutoff
+    // combination equally well.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "headroom", 1 },
+        "Headroom",
+        juce::NormalisableRange<float> (-12.0f, 0.0f, 0.1f),
+        -1.5f,
+        juce::AudioParameterFloatAttributes().withLabel ("dB")));
+
+    // One-way ratchet, default on - see the auto-headroom constants above
+    // process() and PluginEditor.cpp for how manual edits turn this off.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "autoHeadroom", 1 },
+        "Auto Headroom",
+        true));
 
     return layout;
 }
@@ -295,6 +373,10 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
 
     lastPreparedSampleRate = sampleRate;
 
+    clipEnvelope = 0.0f;
+    samplesUntilNextAutoAdjust = 0;
+    autoAdjustCooldownSamples = static_cast<int> (sampleRate * autoHeadroomCooldownSeconds);
+
     // maxHalfLength samples, always - see DetachedPoleFilter.h. Every
     // design is zero-padded to this same fixed length, so the
     // host-reported latency never changes at runtime regardless of slider
@@ -370,6 +452,13 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
         bypassCrossfade.setTargetValue (bypassNow ? 1.0 : 0.0);
     }
 
+    // See the anonymous namespace above for the full rationale. Read once
+    // per block, not per sample.
+    const float headroomDb = parameters.getRawParameterValue ("headroom")->load();
+    const double preAttenuationGain = juce::Decibels::decibelsToGain (headroomDb);
+    const bool autoHeadroomEnabled = parameters.getRawParameterValue ("autoHeadroom")->load() > 0.5f;
+    double blockPeakOver = 0.0;
+
     for (int sample = 0; sample < numSamples; ++sample)
     {
         const double crossfadeAmount = crossfading ? designCrossfade.getNextValue() : 1.0;
@@ -404,6 +493,19 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                 wet = wOld + crossfadeAmount * (wNew - wOld);
             }
 
+            // Pad + soft-clip backstop applied to the WET signal only -
+            // BYPASS (bypassAmount == 1, so out == dry exactly) is
+            // completely untouched by either, same transparency principle
+            // as BBK Phase Corrector and BBK Temporal FIR. See the
+            // anonymous namespace above for why this is needed at all.
+            wet *= preAttenuationGain;
+
+            const double absWet = std::abs (wet);
+            if (absWet > softClipKneeStart)
+                blockPeakOver = std::max (blockPeakOver, absWet - static_cast<double> (softClipKneeStart));
+
+            wet = applySafetySoftClip (wet);
+
             // Dry path delayed by exactly latencySamples - the same fixed
             // group delay every design has by construction (centre tap
             // always at maxHalfLength), so bypassing lines up
@@ -425,6 +527,45 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
     {
         activeTaps = incomingTaps;
         crossfading = false;
+    }
+
+    // Clip indicator: stamped independently of Auto Headroom being on -
+    // this reflects "the backstop actually engaged this block", the exact
+    // same detection that feeds the Auto ratchet below, so the light and
+    // Auto never disagree about what counts as a clip.
+    if (blockPeakOver > 0.0 && ! bypassNow)
+        lastClipTimeMs.store (juce::Time::getMillisecondCounter());
+
+    // Auto-headroom: one-way ratchet only, same design as the other two
+    // BBK plugins' Auto Headroom - see the tuning constants above and the
+    // member comments in PluginProcessor.h. Only runs while not bypassed;
+    // "bypassNow" (not bypassAmount, which is still ramping mid-crossfade)
+    // is the right gate here since it reflects the actual target state.
+    if (autoHeadroomEnabled && ! bypassNow)
+    {
+        const auto sampleRate = currentSampleRate.load();
+        if (sampleRate > 0.0)
+        {
+            const float releaseThisBlock = autoHeadroomReleasePerSecond
+                                          * static_cast<float> (numSamples)
+                                          / static_cast<float> (sampleRate);
+            clipEnvelope = std::max (static_cast<float> (blockPeakOver), clipEnvelope - releaseThisBlock);
+
+            samplesUntilNextAutoAdjust -= numSamples;
+
+            if (clipEnvelope > autoHeadroomTriggerLinear && samplesUntilNextAutoAdjust <= 0)
+            {
+                if (auto* headroomParam = parameters.getParameter ("headroom"))
+                {
+                    const float newDb = std::max (autoHeadroomMinDb, headroomDb - autoHeadroomStepDb);
+                    if (newDb != headroomDb)
+                        headroomParam->setValueNotifyingHost (headroomParam->convertTo0to1 (newDb));
+                }
+
+                clipEnvelope = 0.0f;
+                samplesUntilNextAutoAdjust = autoAdjustCooldownSamples;
+            }
+        }
     }
 }
 

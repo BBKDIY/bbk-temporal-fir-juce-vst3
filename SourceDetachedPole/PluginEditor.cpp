@@ -103,6 +103,59 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     prolateBasisAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "prolateBasis", prolateBasisButton);
 
+    prepareLabel (headroomCaption, 13.0f, false, juce::Justification::centredLeft);
+    headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
+    addAndMakeVisible (headroomCaption);
+
+    // IncDecButtons: a typeable numeric box (click the number to edit
+    // directly, or use the +/- arrows), not a drag knob.
+    headroomSlider.setSliderStyle (juce::Slider::IncDecButtons);
+    headroomSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
+    headroomSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
+    addAndMakeVisible (headroomSlider);
+    headroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "headroom", headroomSlider);
+
+    // onDragStart, NOT onValueChange: SliderParameterAttachment pushes
+    // parameter->UI updates via slider.setValue(v, sendNotificationSync),
+    // so onValueChange fires for every change regardless of origin,
+    // including the processor's own auto-headroom ratchet - which would
+    // make Auto look like it's doing nothing (it ratchets once, that looks
+    // like a user edit, Auto turns itself back off). onDragStart only
+    // fires for genuine user gestures - mouse drag, IncDecButtons clicks,
+    // and committing typed text all wrap in a ScopedDragNotification that
+    // fires it; the attachment's programmatic pushes do not go through
+    // that path at all.
+    headroomSlider.onDragStart = [this]
+    {
+        if (auto* autoParam = processor.getAPVTS().getParameter ("autoHeadroom"))
+        {
+            if (autoParam->getValue() > 0.5f)
+            {
+                autoParam->beginChangeGesture();
+                autoParam->setValueNotifyingHost (0.0f);
+                autoParam->endChangeGesture();
+            }
+        }
+    };
+
+    autoHeadroomButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (autoHeadroomButton);
+    autoHeadroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "autoHeadroom", autoHeadroomButton);
+
+    // Lit red for a short hold after the soft-clip backstop actually
+    // engages (see timerCallback()) - a deliberately gentle backstop can
+    // be hard to hear when it fires, which is exactly when you're trying
+    // to tune Headroom down by ear. This gives an objective signal
+    // instead, driven by the same detection that feeds Auto Headroom.
+    clipIndicator.setText ("CLIP", juce::dontSendNotification);
+    clipIndicator.setJustificationType (juce::Justification::centred);
+    clipIndicator.setColour (juce::Label::textColourId, juce::Colours::white);
+    clipIndicator.setColour (juce::Label::backgroundColourId, juce::Colour (0xff3a3a3a));
+    clipIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
+    addAndMakeVisible (clipIndicator);
+
     prepareLabel (metricsReadout, 13.0f, false, juce::Justification::centredLeft);
     addAndMakeVisible (metricsReadout);
 
@@ -119,7 +172,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 660);
+    setSize (680, 692);
     startTimerHz (4);
     timerCallback();
 }
@@ -166,6 +219,17 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     prolateBasisButton.setBounds (area.removeFromTop (24));
     area.removeFromTop (6);
 
+    {
+        auto row = area.removeFromTop (26);
+        headroomCaption.setBounds (row.removeFromLeft (170));
+        headroomSlider.setBounds (row.removeFromLeft (120));
+        row.removeFromLeft (16);
+        autoHeadroomButton.setBounds (row.removeFromLeft (70));
+        row.removeFromLeft (16);
+        clipIndicator.setBounds (row.removeFromLeft (56));
+    }
+    area.removeFromTop (6);
+
     area.removeFromTop (10);
     metricsReadout.setBounds (area.removeFromTop (195));
 
@@ -205,6 +269,16 @@ void BBKDetachedPoleAudioProcessorEditor::refreshCoefficientsText (const BBKDeta
 void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 {
     const auto snap = processor.getDesignSnapshotForUI();
+
+    // Clip indicator: held lit for a short time (600 ms) after the last
+    // detected engagement so a single brief event is actually visible at
+    // this timer's 4 Hz poll rate, not just flickering for one frame.
+    constexpr juce::uint32 clipHoldMs = 600;
+    const auto now = juce::Time::getMillisecondCounter();
+    const auto sinceLastClip = now - processor.getLastClipTimeMsForUI();
+    const bool clipping = sinceLastClip < clipHoldMs;
+    clipIndicator.setColour (juce::Label::backgroundColourId,
+                              clipping ? juce::Colours::red : juce::Colour (0xff3a3a3a));
 
     // Read directly from the host, not from the design snapshot - the
     // snapshot only updates when a redesign finishes, which lagged behind

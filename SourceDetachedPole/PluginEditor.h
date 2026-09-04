@@ -36,6 +36,11 @@ private:
     juce::Label sidelobeDecayLabel;
     juce::Slider sidelobeDecaySlider;
 
+    juce::Label headroomCaption;
+    juce::Slider headroomSlider;
+    juce::ToggleButton autoHeadroomButton { "Auto" };
+    juce::Label clipIndicator; // lit red for a short hold time after the soft-clip backstop engages
+
     juce::Label metricsReadout;
     juce::TextButton coefficientsButton { "Show Coefficients" };
     juce::TextEditor coefficientsBox;
@@ -48,6 +53,8 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> prolateBasisAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKDetachedPoleAudioProcessorEditor)
 };
