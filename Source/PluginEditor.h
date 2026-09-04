@@ -30,8 +30,14 @@ private:
 
     juce::Label metricsReadout;
 
+    juce::Label headroomCaption;
+    juce::Slider headroomSlider;
+    juce::ToggleButton autoHeadroomButton { "Auto" };
+
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enableAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sliderAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKTemporalFIRAudioProcessorEditor)
 };

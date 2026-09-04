@@ -102,5 +102,15 @@ private:
     double lastPreparedSampleRate = 0.0;
     bool hasPrepared = false;
 
+    // Auto-headroom calibration state - audio-thread only. Same design as
+    // BBK Phase Corrector's Auto Headroom: a leaky peak-hold of how far the
+    // WET (filtered) signal alone has recently pushed past the soft-clip
+    // knee; when it stays above the trigger for a sustained period AND the
+    // cooldown has elapsed, "headroom" is ratcheted one step more negative
+    // via setValueNotifyingHost(). One-way only - see PluginProcessor.cpp.
+    float clipEnvelope = 0.0f;
+    int samplesUntilNextAutoAdjust = 0;
+    int autoAdjustCooldownSamples = 0;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKTemporalFIRAudioProcessor)
 };

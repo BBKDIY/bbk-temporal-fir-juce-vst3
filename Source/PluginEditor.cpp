@@ -55,7 +55,49 @@ BBKTemporalFIRAudioProcessorEditor::BBKTemporalFIRAudioProcessorEditor (BBKTempo
     metricsReadout.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (metricsReadout);
 
-    setSize (620, 340);
+    prepareLabel (headroomCaption, 12.0f);
+    headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
+    headroomCaption.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (headroomCaption);
+
+    // IncDecButtons: a typeable numeric box (click the number to edit
+    // directly, or use the +/- arrows), not a drag knob.
+    headroomSlider.setSliderStyle (juce::Slider::IncDecButtons);
+    headroomSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
+    headroomSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
+    addAndMakeVisible (headroomSlider);
+    headroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "headroom", headroomSlider);
+
+    // onDragStart, NOT onValueChange: SliderParameterAttachment pushes
+    // parameter->UI updates via slider.setValue(v, sendNotificationSync),
+    // so onValueChange fires for every change regardless of origin,
+    // including the processor's own auto-headroom ratchet - which would
+    // make Auto look like it's doing nothing (it ratchets once, that looks
+    // like a user edit, Auto turns itself back off). onDragStart only
+    // fires for genuine user gestures - mouse drag, IncDecButtons clicks,
+    // and committing typed text all wrap in a ScopedDragNotification that
+    // fires it; the attachment's programmatic pushes do not go through
+    // that path at all.
+    headroomSlider.onDragStart = [this]
+    {
+        if (auto* autoParam = processor.getAPVTS().getParameter ("autoHeadroom"))
+        {
+            if (autoParam->getValue() > 0.5f)
+            {
+                autoParam->beginChangeGesture();
+                autoParam->setValueNotifyingHost (0.0f);
+                autoParam->endChangeGesture();
+            }
+        }
+    };
+
+    autoHeadroomButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (autoHeadroomButton);
+    autoHeadroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "autoHeadroom", autoHeadroomButton);
+
+    setSize (620, 420);
     startTimerHz (4);
     timerCallback();
 }
@@ -85,7 +127,15 @@ void BBKTemporalFIRAudioProcessorEditor::resized()
     rightEndLabel.setBounds (labelRow);
 
     area.removeFromTop (18);
-    metricsReadout.setBounds (area);
+    metricsReadout.setBounds (area.removeFromTop (110));
+
+    area.removeFromTop (12);
+    auto headroomRow = area.removeFromTop (26);
+    headroomCaption.setBounds (headroomRow.removeFromLeft (120));
+    headroomRow.removeFromLeft (10);
+    headroomSlider.setBounds (headroomRow.removeFromLeft (120));
+    headroomRow.removeFromLeft (16);
+    autoHeadroomButton.setBounds (headroomRow.removeFromLeft (70));
 }
 
 void BBKTemporalFIRAudioProcessorEditor::timerCallback()
