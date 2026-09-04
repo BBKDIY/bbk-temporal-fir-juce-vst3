@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 
 BBKPhaseCorrectorAudioProcessor::BBKPhaseCorrectorAudioProcessor()
     : AudioProcessor (BusesProperties()
@@ -36,10 +37,37 @@ void BBKPhaseCorrectorAudioProcessor::prepareToPlay (double sampleRate, int samp
 {
     currentSampleRate.store (sampleRate);
 
-    const auto minimumDesign = bbk::PhaseFilterDesigner::design (
-        sampleRate, bbk::PhaseFilterDesigner::Target::minimumPhase);
-    const auto linearDesign = bbk::PhaseFilterDesigner::design (
-        sampleRate, bbk::PhaseFilterDesigner::Target::linearPhase);
+    bbk::PhaseFilterDesigner::DesignResult minimumDesign, linearDesign;
+
+    try
+    {
+        minimumDesign = bbk::PhaseFilterDesigner::design (
+            sampleRate, bbk::PhaseFilterDesigner::Target::minimumPhase);
+        linearDesign = bbk::PhaseFilterDesigner::design (
+            sampleRate, bbk::PhaseFilterDesigner::Target::linearPhase);
+        sampleRateSupported.store (true);
+    }
+    catch (const std::exception&)
+    {
+        // design() only throws for sampleRate < 40 kHz. Letting that
+        // exception escape prepareToPlay() would cross the host boundary
+        // uncaught - undefined behaviour, almost certainly a crash or a
+        // hung/unstable host, for what should just be "this rate isn't
+        // supported". Fall back to a trivial identity (single unit
+        // sample, zero added latency) impulse for both convolutions
+        // instead, so MIN PHASE/LINEAR PHASE degrade to an audible no-op
+        // identical to BYPASS rather than taking the host down.
+        // isSampleRateSupportedForUI() lets the editor warn about this
+        // rather than silently showing the modes as if they were doing
+        // real correction.
+        minimumDesign = {};
+        linearDesign = {};
+        minimumDesign.impulse = { 1.0f };
+        linearDesign.impulse = { 1.0f };
+        minimumDesign.fftSize = 1;
+        linearDesign.fftSize = 1;
+        sampleRateSupported.store (false);
+    }
 
     jassert (minimumDesign.latencySamples == linearDesign.latencySamples);
     jassert (minimumDesign.fftSize == linearDesign.fftSize);

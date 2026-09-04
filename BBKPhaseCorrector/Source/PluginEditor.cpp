@@ -84,7 +84,13 @@ void BBKPhaseCorrectorAudioProcessorEditor::timerCallback()
     const auto sr = processor.getCurrentSampleRateForUI();
     const auto latency = processor.getPhaseLatencySamplesForUI();
 
-    if (sr > 0.0 && latency > 0)
+    if (! processor.isSampleRateSupportedForUI())
+    {
+        latencyLabel.setText ("Sample rate not supported (needs >= 40 kHz) - "
+                              "MIN/LINEAR PHASE are passing through unmodified",
+                              juce::dontSendNotification);
+    }
+    else if (sr > 0.0 && latency > 0)
     {
         latencyLabel.setText ("Matched A/B latency: "
                               + juce::String (1000.0 * static_cast<double> (latency) / sr, 1)

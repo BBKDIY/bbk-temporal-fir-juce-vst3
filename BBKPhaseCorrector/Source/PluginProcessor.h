@@ -37,6 +37,17 @@ public:
     double getCurrentSampleRateForUI() const noexcept { return currentSampleRate.load(); }
     int getPhaseLatencySamplesForUI() const noexcept { return phaseLatencySamples.load(); }
 
+    // PhaseFilterDesigner::design() throws for sample rates below 40 kHz
+    // (the measured phase/magnitude model was captured for a 20 Hz-19 kHz
+    // passband, which leaves no sensible transition band above 19 kHz at
+    // lower rates). prepareToPlay() catches that and falls back to an
+    // identity pass-through rather than letting the exception escape
+    // across the host boundary - see prepareToPlay() for details. This
+    // reports that fallback state so the editor can warn the user rather
+    // than silently showing MIN PHASE/LINEAR PHASE as if they were doing
+    // real correction.
+    bool isSampleRateSupportedForUI() const noexcept { return sampleRateSupported.load(); }
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     static juce::AudioBuffer<float> makeImpulseBuffer (const std::vector<float>& impulse);
@@ -64,6 +75,7 @@ private:
 
     std::atomic<double> currentSampleRate { 0.0 };
     std::atomic<int> phaseLatencySamples { 0 };
+    std::atomic<bool> sampleRateSupported { true };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BBKPhaseCorrectorAudioProcessor)
 };
