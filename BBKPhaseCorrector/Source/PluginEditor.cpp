@@ -12,7 +12,8 @@ BBKPhaseCorrectorAudioProcessorEditor::BBKPhaseCorrectorAudioProcessorEditor (BB
     titleLabel.setFont (juce::FontOptions (24.0f, juce::Font::bold));
     addAndMakeVisible (titleLabel);
 
-    infoLabel.setText ("Phase-only correction  |  magnitude EQ: none", juce::dontSendNotification);
+    infoLabel.setText ("Phase-only correction  |  magnitude EQ: none  |  MIN/LINEAR PHASE padded -3 dB for peak headroom",
+                       juce::dontSendNotification);
     infoLabel.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (infoLabel);
 
