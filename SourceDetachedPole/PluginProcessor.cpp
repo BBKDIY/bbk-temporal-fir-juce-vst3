@@ -246,61 +246,229 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     return spec;
 }
 
-void BBKDetachedPoleAudioProcessor::requestBackgroundRedesign()
+BBKDetachedPoleAudioProcessor::DesignMode BBKDetachedPoleAudioProcessor::selectedModeFromParameters() const
+{
+    // Priority order matches specFromParameters()/the editor's greying-out
+    // logic exactly: Peak-Energy Optimized, when on, overrides Prolate/DPSS
+    // Basis entirely (that toggle becomes a no-op, not a stacked modifier).
+    if (parameters.getRawParameterValue ("peakEnergyOptimized")->load() > 0.5f)
+        return DesignMode::PeakEnergy;
+    if (parameters.getRawParameterValue ("prolateBasis")->load() > 0.5f)
+        return DesignMode::ProlateBasis;
+    return DesignMode::Minimax;
+}
+
+void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 {
     // May be called from the message thread (typical - a slider moved) or
     // from the audio thread (a host delivered automation for one of these
     // parameters mid-block) - either way this only ever copies a small
-    // FilterSpec under a SpinLock and signals the worker thread; the
-    // actual (slow) design work never runs here.
+    // FilterSpec/queues three lightweight DesignTasks under a SpinLock and
+    // signals the worker thread; the actual (slow) design work never runs
+    // here. See the class-level comment in PluginProcessor.h for the full
+    // rationale behind bumping boundaryEpoch and invalidating all three
+    // per-mode caches rather than just re-running the currently selected
+    // one.
     if (! hasPrepared.load() || currentSampleRate.load() <= 0.0)
         return;
 
     const auto spec = specFromParameters();
-    const bool peakEnergyOn = parameters.getRawParameterValue ("peakEnergyOptimized")->load() > 0.5f;
+    const auto selectedMode = selectedModeFromParameters();
+
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
-        requestedSpec = spec;
-        requestedPeakEnergyOn = peakEnergyOn;
-        requestedVersion = ++versionCounter;
+        currentBoundarySpec = spec;
+        ++boundaryEpoch;
+        taskQueue.clear();
+
+        auto pushTask = [&] (DesignMode mode)
+        {
+            DesignTask task;
+            task.spec = spec;
+            // Only Minimax/ProlateBasis tasks actually consult
+            // spec.designMethod (designPeakEnergyFIR() ignores it - see
+            // PeakEnergyFIR.h) but setting it consistently per task keeps
+            // the queued spec self-describing.
+            task.spec.designMethod = (mode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
+                                                                          : bbk::parametric::DesignMethod::Minimax;
+            task.mode = mode;
+            task.epoch = boundaryEpoch;
+            taskQueue.push_back (task);
+        };
+
+        // Selected mode first, so the still-audible/about-to-be-audible
+        // result arrives as soon as possible; the other two fill the cache
+        // in behind it, invisibly to playback, ready for an instant
+        // switch later.
+        pushTask (selectedMode);
+        for (auto mode : { DesignMode::Minimax, DesignMode::ProlateBasis, DesignMode::PeakEnergy })
+            if (mode != selectedMode)
+                pushTask (mode);
     }
+
+    {
+        const juce::SpinLock::ScopedLockType sl (resultLock);
+        cacheMinimax.valid = false;
+        cacheProlateBasis.valid = false;
+        cachePeakEnergy.valid = false;
+    }
+
     notify();
+}
+
+void BBKDetachedPoleAudioProcessor::requestModeSwitch()
+{
+    // Deliberately does NOT touch currentBoundarySpec/boundaryEpoch/the
+    // caches for the other two modes - a mode toggle is a pure "look at
+    // what's already known" operation, never a reason to redesign
+    // anything. See the class-level comment in PluginProcessor.h.
+    if (! hasPrepared.load() || currentSampleRate.load() <= 0.0)
+        return;
+
+    const auto selectedMode = selectedModeFromParameters();
+
+    int epoch;
+    bbk::parametric::FilterSpec spec;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        epoch = boundaryEpoch;
+        spec = currentBoundarySpec;
+        spec.designMethod = (selectedMode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
+                                                                         : bbk::parametric::DesignMethod::Minimax;
+
+        // If the newly selected mode's task is still queued behind
+        // others, bump it to the front - the user is waiting on it now,
+        // whatever else was mid-fill can wait its turn.
+        for (auto it = taskQueue.begin(); it != taskQueue.end(); ++it)
+        {
+            if (it->mode == selectedMode && it->epoch == epoch)
+            {
+                auto task = *it;
+                taskQueue.erase (it);
+                taskQueue.push_front (task);
+                break;
+            }
+        }
+    }
+
+    CachedDesign cached;
+    bool haveCached = false;
+    {
+        const juce::SpinLock::ScopedLockType sl (resultLock);
+        const CachedDesign& slot = (selectedMode == DesignMode::PeakEnergy) ? cachePeakEnergy
+                                  : (selectedMode == DesignMode::ProlateBasis) ? cacheProlateBasis
+                                                                                : cacheMinimax;
+        if (slot.valid && slot.epoch == epoch)
+        {
+            cached = slot;
+            haveCached = true;
+        }
+    }
+
+    if (haveCached)
+    {
+        // Instant path: already known for the current boundary - install
+        // and crossfade straight away, no wait, no worker thread
+        // involvement at all.
+        publishResult (spec, selectedMode, cached.result, cached.etaAchieved, cached.concentrationDb);
+        return;
+    }
+
+    notify(); // wake the worker so it picks up the just-reprioritised task promptly
+}
+
+void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec, DesignMode mode,
+                                                     const bbk::parametric::DesignResult& result,
+                                                     double etaAchieved, double concentrationDb)
+{
+    int version;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        version = ++versionCounter;
+    }
+
+    {
+        const juce::SpinLock::ScopedLockType sl (resultLock);
+        latestResult = result;
+        latestSpec = spec;
+        latestPeakEnergyOn = (mode == DesignMode::PeakEnergy);
+        latestEtaAchieved = etaAchieved;
+        latestConcentrationDb = concentrationDb;
+        latestVersion = version;
+    }
+
+    {
+        const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
+        uiSnapshot.sampleRateHz = spec.sampleRateHz;
+        uiSnapshot.cutoffHz = spec.cutoffHz;
+        uiSnapshot.attenuationAtCutoffDb = spec.attenuationAtCutoffDb;
+        uiSnapshot.stopbandRejectionDb = spec.stopbandRejectionDb;
+        uiSnapshot.stopbandMode = spec.stopbandMode;
+        uiSnapshot.designMethod = (mode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
+                                                                       : bbk::parametric::DesignMethod::Minimax;
+        uiSnapshot.sidelobeDecayRatio = spec.sidelobeDecayRatio;
+        uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
+        uiSnapshot.tapCount = result.tapCount;
+        uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
+        uiSnapshot.constraintsMet = result.constraintsMet;
+        uiSnapshot.designAttempts = result.designAttempts;
+        uiSnapshot.taps = result.taps;
+        uiSnapshot.temporal = result.temporal;
+        uiSnapshot.peakEnergyOptimizedOn = (mode == DesignMode::PeakEnergy);
+        uiSnapshot.etaAchieved = etaAchieved;
+        uiSnapshot.concentrationDb = concentrationDb;
+    }
 }
 
 void BBKDetachedPoleAudioProcessor::run()
 {
     while (! threadShouldExit())
     {
-        wait (-1);
+        DesignTask task;
+        bool haveTask = false;
+        {
+            const juce::SpinLock::ScopedLockType sl (specLock);
+            if (! taskQueue.empty())
+            {
+                task = taskQueue.front();
+                taskQueue.pop_front();
+                haveTask = true;
+            }
+        }
+
+        if (! haveTask)
+        {
+            wait (-1);
+            continue;
+        }
+
         if (threadShouldExit())
             break;
 
-        bbk::parametric::FilterSpec specToRun;
-        bool peakEnergyOnToRun;
-        int versionToRun;
+        // Drop it if a newer boundary change has already superseded it -
+        // no point spending time (possibly several seconds, for
+        // Peak-Energy Optimized) designing a spec nobody wants any more.
         {
             const juce::SpinLock::ScopedLockType sl (specLock);
-            specToRun = requestedSpec;
-            peakEnergyOnToRun = requestedPeakEnergyOn;
-            versionToRun = requestedVersion;
+            if (task.epoch != boundaryEpoch)
+                continue;
         }
 
-        // OFF = designParametricFIR() exactly as before this mode existed -
-        // the only path that ever ran here previously, still completely
-        // unchanged. ON = the new, isolated bbk::peakenergy::
-        // designPeakEnergyFIR() engine instead (see PeakEnergyFIR.h);
-        // its result is copied into the same bbk::parametric::DesignResult
-        // shape (both structs share these field names/meanings by design)
-        // so everything downstream - the crossfade hand-off, the UI
-        // snapshot's core fields - works identically either way. Only the
-        // two peak-energy-specific fields (eta/concentration) are carried
-        // separately, since ordinary DesignResult has no room for them.
+        // Peak-Energy Optimized is a completely separate, isolated engine
+        // (PeakEnergyFIR.h) - its result is copied into the same
+        // bbk::parametric::DesignResult shape (both structs share these
+        // field names/meanings by design) so everything downstream - the
+        // cache slots, the crossfade hand-off, the UI snapshot's core
+        // fields - works identically regardless of which mode ran. Only
+        // the two peak-energy-specific fields (eta/concentration) are
+        // carried separately, since ordinary DesignResult has no room for
+        // them.
         bbk::parametric::DesignResult result;
         double etaAchieved = 0.0;
         double concentrationDb = 0.0;
-        if (peakEnergyOnToRun)
+        if (task.mode == DesignMode::PeakEnergy)
         {
-            const auto peResult = bbk::peakenergy::designPeakEnergyFIR (specToRun, bbk::detachedpole::maxTapCount);
+            const auto peResult = bbk::peakenergy::designPeakEnergyFIR (task.spec, bbk::detachedpole::maxTapCount);
             result.taps = peResult.taps;
             result.tapCount = peResult.tapCount;
             result.constraintsMet = peResult.constraintsMet;
@@ -312,54 +480,42 @@ void BBKDetachedPoleAudioProcessor::run()
         }
         else
         {
-            result = bbk::parametric::designParametricFIR (specToRun, bbk::detachedpole::maxTapCount);
+            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount);
         }
 
-        // Only publish if this is still the newest request - a stale
-        // in-flight design finishing after a newer one was already
-        // requested (e.g. two sample-rate changes in quick succession -
-        // see prepareToPlay()) must never overwrite a newer result. Since
-        // this worker only ever runs one design at a time and always
-        // re-reads the latest request before starting the next one, the
-        // only way to see a stale version here is that race - and even
-        // then, processBlock() separately guards against crossfading in a
-        // design published for a sample rate that is no longer current.
-        bool isNewest = false;
+        // Re-check staleness after the (possibly slow) computation - a
+        // newer boundary change may have arrived while this task was
+        // running. If so, the work is simply discarded: not cached (it
+        // would be wrong for the new boundary) and not published.
+        bool stillCurrent;
+        {
+            const juce::SpinLock::ScopedLockType sl (specLock);
+            stillCurrent = (task.epoch == boundaryEpoch);
+        }
+        if (! stillCurrent)
+            continue;
+
         {
             const juce::SpinLock::ScopedLockType sl (resultLock);
-            if (versionToRun > latestVersion)
-            {
-                latestResult = result;
-                latestSpec = specToRun;
-                latestPeakEnergyOn = peakEnergyOnToRun;
-                latestEtaAchieved = etaAchieved;
-                latestConcentrationDb = concentrationDb;
-                latestVersion = versionToRun;
-                isNewest = true;
-            }
+            CachedDesign& slot = (task.mode == DesignMode::PeakEnergy) ? cachePeakEnergy
+                                : (task.mode == DesignMode::ProlateBasis) ? cacheProlateBasis
+                                                                           : cacheMinimax;
+            slot.valid = true;
+            slot.epoch = task.epoch;
+            slot.result = result;
+            slot.etaAchieved = etaAchieved;
+            slot.concentrationDb = concentrationDb;
         }
 
-        if (isNewest)
-        {
-            const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
-            uiSnapshot.sampleRateHz = specToRun.sampleRateHz;
-            uiSnapshot.cutoffHz = specToRun.cutoffHz;
-            uiSnapshot.attenuationAtCutoffDb = specToRun.attenuationAtCutoffDb;
-            uiSnapshot.stopbandRejectionDb = specToRun.stopbandRejectionDb;
-            uiSnapshot.stopbandMode = specToRun.stopbandMode;
-            uiSnapshot.designMethod = specToRun.designMethod;
-            uiSnapshot.sidelobeDecayRatio = specToRun.sidelobeDecayRatio;
-            uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
-            uiSnapshot.tapCount = result.tapCount;
-            uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
-            uiSnapshot.constraintsMet = result.constraintsMet;
-            uiSnapshot.designAttempts = result.designAttempts;
-            uiSnapshot.taps = result.taps;
-            uiSnapshot.temporal = result.temporal;
-            uiSnapshot.peakEnergyOptimizedOn = peakEnergyOnToRun;
-            uiSnapshot.etaAchieved = etaAchieved;
-            uiSnapshot.concentrationDb = concentrationDb;
-        }
+        // Only crossfade this into playback if it's both still the
+        // current boundary AND the mode the user currently has selected -
+        // a cache-fill for a mode nobody's listening to right now just
+        // sits in the cache quietly, ready for an instant switch later.
+        // (selectedModeFromParameters() is re-read fresh here rather than
+        // captured with the task, since the user may have toggled modes
+        // again while this design was running.)
+        if (task.mode == selectedModeFromParameters())
+            publishResult (task.spec, task.mode, result, etaAchieved, concentrationDb);
     }
 }
 
@@ -381,7 +537,7 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
                              || std::abs (sampleRate - lastPreparedSampleRate) > 0.5
                              || static_cast<int> (channels.size()) < channelsToAllocate;
 
-    // Set before requestBackgroundRedesign() below, which gates on it -
+    // Set before requestBoundaryRedesign() below, which gates on it -
     // this call is always itself the moment "prepared" becomes true, so
     // there is no reason to make that method wait for a later statement.
     hasPrepared.store (true);
@@ -425,7 +581,7 @@ void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)
             uiSnapshot.tapCount = 0;
         }
 
-        requestBackgroundRedesign();
+        requestBoundaryRedesign();
     }
 
     lastPreparedSampleRate = sampleRate;
