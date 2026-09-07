@@ -949,6 +949,7 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
 
     int M = std::min (maxM, 9);
     detail::AttemptResult best;
+    int bestM = M;
     bool foundFeasible = false;
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (60);
@@ -957,19 +958,46 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
     {
         auto attempt = detail::attemptPeakEnergyDesign (spec, M);
         ++result.designAttempts;
-        best = attempt;
-        if (attempt.feasible) { foundFeasible = true; break; }
+        if (attempt.feasible)
+        {
+            best = attempt;
+            bestM = M;
+            foundFeasible = true;
+            break;
+        }
+
+        // Keep the best (highest-eta) candidate seen across the WHOLE
+        // search, not just whichever M was tried last. attemptPeakEnergyDesign
+        // returns an explicit all-zero, eta=0 AttemptResult when its gamma
+        // search finds no feasible point at all for that M (see its own
+        // "if (bestEta <= 0.0) return {...0.0...}" fallbacks) - and that
+        // can happen at a LARGER M than one that already produced a
+        // genuine (if non-compliant) design, since the gamma-bracket
+        // search's own LP feasibility check is documented above to
+        // occasionally report a false negative at a specific gamma/M
+        // purely from simplex iteration limits, not real infeasibility.
+        // Unconditionally overwriting on every iteration let exactly that
+        // kind of later, spurious all-zero failure stomp an earlier
+        // perfectly good candidate - which is what surfaced as "changing
+        // one boundary parameter, e.g. attenuation, shows zero
+        // coefficients" even though an earlier M had already converged.
+        if (best.a.empty() || attempt.eta > best.eta)
+        {
+            best = attempt;
+            bestM = M;
+        }
+
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 
-    int N = 2 * M + 1;
+    int N = 2 * bestM + 1;
     std::vector<double> taps (static_cast<std::size_t> (N));
-    for (int m = 0; m <= M; ++m)
+    for (int m = 0; m <= bestM; ++m)
     {
-        taps[static_cast<std::size_t> (M - m)] = best.a[static_cast<std::size_t> (m)];
-        taps[static_cast<std::size_t> (M + m)] = best.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (bestM - m)] = best.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (bestM + m)] = best.a[static_cast<std::size_t> (m)];
     }
     result.taps = taps;
     result.tapCount = N;
