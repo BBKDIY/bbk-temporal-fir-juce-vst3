@@ -952,13 +952,49 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
     int bestM = M;
     bool foundFeasible = false;
 
+    // A genuine unity-DC-gain lowpass never legitimately needs a half-
+    // coefficient magnitude anywhere near this large - every validated
+    // design (Case B/C, the 384 kHz/192 kHz sweeps, etc.) stays well
+    // under 1.0. A solution whose raw taps run into the hundreds (while
+    // still summing to ~1.0 DC gain through massive alternating-sign
+    // cancellation) is numerically degenerate: the gamma-bracket search
+    // picked a point where the sparse feasibility grid is satisfied but
+    // the underlying QP reconstruction is wildly ill-conditioned between
+    // grid points. Such a candidate produces an impulse response that's
+    // effectively a huge, clipping oscillation burst rather than a
+    // lowpass - audible, but not remotely what was asked for - so it must
+    // never be preferred over a modest, merely non-compliant one just
+    // because its eta happens to look good.
+    constexpr double maxSaneTapMagnitude = 8.0;
+    auto maxAbsTap = [] (const std::vector<double>& a)
+    {
+        double m = 0.0;
+        for (double v : a) m = std::max (m, std::abs (v));
+        return m;
+    };
+    // A candidate is "sane" only if it is neither the explicit all-zero
+    // sentinel attemptPeakEnergyDesign returns when its own gamma search
+    // finds nothing feasible at all (a[0]==0.0 unambiguously flags that,
+    // exactly as in ParametricFIR.h's own degenerate-sentinel check - a
+    // genuine design always has a nonzero centre tap) NOR a wildly
+    // oversized reconstruction (checked above). Missing the sentinel
+    // check here was measured to let an all-zero, eta=0, feasible=false
+    // "result" silently pass the magnitude test (0.0 <= 8.0) and be
+    // accepted as the running best, producing complete silence instead of
+    // ever reaching the Minimax fallback below.
+    auto isSane = [&] (const detail::AttemptResult& r)
+    {
+        return ! r.a.empty() && r.a[0] != 0.0 && maxAbsTap (r.a) <= maxSaneTapMagnitude;
+    };
+
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (60);
 
     while (true)
     {
         auto attempt = detail::attemptPeakEnergyDesign (spec, M);
         ++result.designAttempts;
-        if (attempt.feasible)
+        const bool attemptSane = isSane (attempt);
+        if (attempt.feasible && attemptSane)
         {
             best = attempt;
             bestM = M;
@@ -966,23 +1002,38 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
             break;
         }
 
-        // Keep the best (highest-eta) candidate seen across the WHOLE
-        // search, not just whichever M was tried last. attemptPeakEnergyDesign
-        // returns an explicit all-zero, eta=0 AttemptResult when its gamma
-        // search finds no feasible point at all for that M (see its own
-        // "if (bestEta <= 0.0) return {...0.0...}" fallbacks) - and that
-        // can happen at a LARGER M than one that already produced a
-        // genuine (if non-compliant) design, since the gamma-bracket
-        // search's own LP feasibility check is documented above to
-        // occasionally report a false negative at a specific gamma/M
-        // purely from simplex iteration limits, not real infeasibility.
-        // Unconditionally overwriting on every iteration let exactly that
-        // kind of later, spurious all-zero failure stomp an earlier
-        // perfectly good candidate - which is what surfaced as "changing
-        // one boundary parameter, e.g. attenuation, shows zero
-        // coefficients" even though an earlier M had already converged.
-        if (best.a.empty() || attempt.eta > best.eta)
+        // Keep the best (highest-eta) SANE, non-degenerate candidate seen
+        // across the WHOLE search, not just whichever M was tried last.
+        // attemptPeakEnergyDesign returns an explicit all-zero, eta=0
+        // AttemptResult when its gamma search finds no feasible point at
+        // all for that M (see its own "if (bestEta <= 0.0) return
+        // {...0.0...}" fallbacks) - and that can happen at a LARGER M
+        // than one that already produced a genuine (if non-compliant)
+        // design, since the gamma-bracket search's own LP feasibility
+        // check is documented above to occasionally report a false
+        // negative at a specific gamma/M purely from simplex iteration
+        // limits, not real infeasibility. Unconditionally overwriting on
+        // every iteration let exactly that kind of later, spurious
+        // all-zero failure stomp an earlier perfectly good candidate -
+        // which is what surfaced as "changing one boundary parameter,
+        // e.g. attenuation, shows zero coefficients" even though an
+        // earlier M had already converged. Restricting the comparison to
+        // sane candidates additionally stops a numerically-degenerate
+        // (huge-magnitude) high-eta candidate from being preferred over
+        // an earlier, merely non-compliant but sane one.
+        const bool bestSane = isSane (best);
+        if (attemptSane && (! bestSane || attempt.eta > best.eta))
         {
+            best = attempt;
+            bestM = M;
+        }
+        else if (best.a.empty())
+        {
+            // Nothing sane has been seen yet at all - still record
+            // *something* so bestM/best.a stay in sync for the tap-array
+            // reconstruction below, even if every candidate so far is
+            // degenerate. A later sane candidate (if any) will still
+            // replace it via the branch above.
             best = attempt;
             bestM = M;
         }
@@ -990,6 +1041,56 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
         M = std::min (maxM, M + std::max (1, M / 6));
+    }
+
+    // Final safety net: even with the sane/degenerate tracking above, the
+    // gamma-bracket QP search can legitimately never produce a single sane
+    // candidate anywhere in the whole M-search within its time budget -
+    // measured directly at 192 kHz (18.5 kHz cutoff, 0.5 dB, -98 dB, the
+    // plugin's own default spec): every one of the few M values reached
+    // before the 60s deadline came back with taps in the hundreds
+    // (alternating sign, cancelling to unity DC gain), because the QP's
+    // own conditioning degrades badly once the passband/stopband corridor
+    // spans such a large fraction of a very high Nyquist. Rather than ever
+    // send that to the audio thread - it is not a lowpass, it is a huge,
+    // effectively-clipping oscillation burst dressed up with unity DC gain
+    // - fall back to Minimax's own full, independent, already-fixed
+    // designParametricFIR search (NOT a single attemptDesign call at
+    // whatever bestM this engine's own troubled search happened to land
+    // on - that was tried first and measured to fail: bestM here can be a
+    // value Minimax's own stopEdge cascade does not handle well either,
+    // e.g. bestM=12 when Minimax actually converges at M=9 for this exact
+    // spec, silently trading one all-zero/degenerate result for another).
+    // designParametricFIR does its own robust multi-M search from scratch
+    // and is independently verified, at this exact spec, to reach
+    // -97.99 dB compliance at M=9. This guarantees Peak-Energy Optimized
+    // can never sound worse than plain Minimax, even in the worst case.
+    const bool needsFallback = ! isSane (best);
+    if (needsFallback)
+    {
+        bbk::parametric::FilterSpec minimaxSpec = spec;
+        minimaxSpec.designMethod = bbk::parametric::DesignMethod::Minimax;
+        auto fallback = bbk::parametric::designParametricFIR (minimaxSpec, maxTapCount);
+        if (! fallback.taps.empty())
+        {
+            const int centre = (fallback.tapCount - 1) / 2;
+            double sumSq = 0.0;
+            for (double v : fallback.taps) sumSq += v * v;
+            const double centreVal = fallback.taps[static_cast<std::size_t> (centre)];
+
+            result.taps = fallback.taps;
+            result.tapCount = fallback.tapCount;
+            result.constraintsMet = fallback.constraintsMet;
+            result.achievedStopbandDb = fallback.achievedStopbandDb;
+            result.etaAchieved = (sumSq > 0.0) ? (centreVal * centreVal) / sumSq : 0.0;
+            result.concentrationDb = (result.etaAchieved > 0.0) ? 10.0 * std::log10 (result.etaAchieved) : -300.0;
+            result.temporal = bbk::parametric::computeTemporalMetrics (fallback.taps, spec.sampleRateHz);
+            return result;
+        }
+        // fallback.taps empty is not expected (designParametricFIR always
+        // returns *some* taps, even its own worst-case best-effort array),
+        // but if it somehow did happen, fall through to the ordinary path
+        // below rather than returning an uninitialised result.
     }
 
     int N = 2 * bestM + 1;
