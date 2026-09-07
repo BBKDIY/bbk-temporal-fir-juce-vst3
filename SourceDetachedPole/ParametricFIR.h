@@ -1296,6 +1296,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
     int M = std::min (maxM, 9);
     detail::AttemptResult best;
+    int bestM = M;
     bool foundFeasible = false;
 
     // Overall wall-clock budget across the *whole* M-search: each
@@ -1314,23 +1315,50 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     {
         auto attempt = detail::attemptDesign (spec, M);
         ++result.designAttempts;
-        best = attempt;
         if (attempt.feasible)
         {
+            best = attempt;
+            bestM = M;
             foundFeasible = true;
             break;
         }
+
+        // Keep the best (least-far-from-compliant) NON-degenerate attempt
+        // seen across the WHOLE search, not just whichever M was tried
+        // last. attemptDesign() has its own explicit all-zero-taps
+        // fallback for "no candidate survived the grid-refinement loop at
+        // all" at this M (see its own "return
+        // { std::vector<double>(numVars,0.0), false, 0.0 }" points) - a
+        // real design always has a nonzero centre/DC coefficient, so
+        // a[0]==0.0 unambiguously flags that sentinel, not a genuine
+        // (if non-compliant) result. Unconditionally overwriting on every
+        // iteration let a LARGER M's spurious all-zero failure silently
+        // stomp an earlier M's perfectly good design - this is what
+        // surfaced as Minimax/Prolate going completely silent once a
+        // background redesign completes, seen both at 44.1 kHz and at
+        // 192 kHz (where the cutoff-to-Nyquist free-transition zone is
+        // far wider and evidently harder for some M values to satisfy).
+        const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
+        const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
+        if (best.a.empty()
+            || (bestDegenerate && ! attemptDegenerate)
+            || (! attemptDegenerate && ! bestDegenerate && attempt.worstStopbandDb < best.worstStopbandDb))
+        {
+            best = attempt;
+            bestM = M;
+        }
+
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 
-    int N = 2 * M + 1;
+    int N = 2 * bestM + 1;
     std::vector<double> taps (static_cast<std::size_t> (N));
-    for (int m = 0; m <= M; ++m)
+    for (int m = 0; m <= bestM; ++m)
     {
-        taps[static_cast<std::size_t> (M - m)] = best.a[static_cast<std::size_t> (m)];
-        taps[static_cast<std::size_t> (M + m)] = best.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (bestM - m)] = best.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (bestM + m)] = best.a[static_cast<std::size_t> (m)];
     }
     result.taps = taps;
     result.tapCount = N;
