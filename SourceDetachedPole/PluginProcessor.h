@@ -199,19 +199,37 @@ private:
                          const bbk::parametric::DesignResult& result,
                          double etaAchieved, double concentrationDb);
 
+    // "Prolate/DPSS Basis" and "Peak-Energy Optimized" are two independent
+    // AudioParameterBools with nothing else in JUCE keeping them exclusive -
+    // without this, both can end up checked at once, in which case
+    // selectedModeFromParameters()'s fixed priority (Peak-Energy wins) would
+    // silently keep the OTHER checkbox's click from ever taking audible
+    // effect. Called before requestModeSwitch() so that by the time it reads
+    // selectedModeFromParameters(), the just-unchecked mode's parameter has
+    // already been turned off. enforcingExclusivity guards against
+    // setValueNotifyingHost() re-entering this same listener while it is
+    // still turning the other one off (that re-entrant call always sees
+    // newValue == 0, so it would no-op anyway, but the flag makes the
+    // non-recursion explicit rather than relying on it).
+    void enforceModeExclusivity (const juce::String& changedParamID, float newValue);
+    bool enforcingExclusivity = false;
+
     juce::AudioProcessorValueTreeState parameters;
 
     struct ParamListener final : juce::AudioProcessorValueTreeState::Listener
     {
         BBKDetachedPoleAudioProcessor& owner;
         explicit ParamListener (BBKDetachedPoleAudioProcessor& o) : owner (o) {}
-        void parameterChanged (const juce::String& paramID, float) override
+        void parameterChanged (const juce::String& paramID, float newValue) override
         {
             // Mode toggles are handled entirely separately from boundary
             // parameters - see requestModeSwitch()/requestBoundaryRedesign()
             // and the class-level comment above.
             if (paramID == "prolateBasis" || paramID == "peakEnergyOptimized")
+            {
+                owner.enforceModeExclusivity (paramID, newValue);
                 owner.requestModeSwitch();
+            }
             else
                 owner.requestBoundaryRedesign();
         }

@@ -343,9 +343,7 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         text << "Peak-Energy Optimized - maximises the normalised peak-to-total-impulse-energy "
                 "concentration (eta = centre-tap^2 / sum(taps^2)) directly, rather than minimax's "
                 "minimum-largest-sidelobe objective, under the same spectral boundaries. "
-                "Prolate/DPSS Basis and Sidelobe Decay are not applicable in this mode.\n"
-             << "Achieved concentration: eta = " << juce::String (snap.etaAchieved, 6)
-             << "  (CE = " << juce::String (snap.concentrationDb, 3) << " dB)\n";
+                "Prolate/DPSS Basis and Sidelobe Decay are not applicable in this mode.\n";
     }
     else
     {
@@ -378,6 +376,10 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
          << "Achieved worst-case level in the enforced region: " << juce::String (snap.achievedStopbandDb, 2)
          << " dB (Nyquist = " << juce::String (nyquist, 0) << " Hz)\n"
          << "Design attempts (tap-count search): " << snap.designAttempts << "\n"
+         << "Peak-energy concentration: eta = " << juce::String (snap.etaAchieved, 6)
+         << "  (CE = " << juce::String (snap.concentrationDb, 3)
+         << " dB) - measured the same way for every design method, so all three are directly "
+            "comparable on this number\n"
          << "Temporal concentration (from the article's own metrics):\n"
          << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "
          << juce::String (snap.temporal.eZcPercent, 3) << "%  |  T_0.1% "

@@ -55,6 +55,32 @@ namespace
     constexpr float autoHeadroomTriggerLinear    = 0.01f;  // ~0.1 dB sustained excess over the knee before ratcheting
     constexpr float autoHeadroomReleasePerSecond = 0.5f;
     constexpr double autoHeadroomCooldownSeconds = 3.0;
+
+    // Same normalised peak-to-total-impulse-energy concentration Peak-
+    // Energy Optimized reports for itself (see PeakEnergyFIR.h: "eta =
+    // a[0]^2 / sum(h^2)") - but that's a property of any symmetric FIR's
+    // taps, not something specific to how they were designed, so it can be
+    // measured identically for Minimax and Prolate/DPSS Basis results too,
+    // letting all three modes be compared on the same number.
+    struct EtaMetrics { double eta = 0.0; double concentrationDb = -300.0; };
+
+    inline EtaMetrics computeEtaMetrics (const std::vector<double>& taps)
+    {
+        if (taps.empty())
+            return {};
+
+        double sumSquares = 0.0;
+        for (double t : taps)
+            sumSquares += t * t;
+
+        const auto centreIndex = static_cast<std::size_t> ((taps.size() - 1) / 2);
+        const double centreTap = taps[centreIndex];
+
+        EtaMetrics m;
+        m.eta = (sumSquares > 0.0) ? (centreTap * centreTap) / sumSquares : 0.0;
+        m.concentrationDb = (m.eta > 0.0) ? 10.0 * std::log10 (m.eta) : -300.0;
+        return m;
+    }
 }
 
 BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
@@ -316,6 +342,25 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     notify();
 }
 
+void BBKDetachedPoleAudioProcessor::enforceModeExclusivity (const juce::String& changedParamID, float newValue)
+{
+    // Only turning a mode ON is ever a reason to turn the other OFF -
+    // unchecking one should never reach back and touch the other.
+    if (newValue <= 0.5f || enforcingExclusivity)
+        return;
+
+    const char* otherID = (changedParamID == "prolateBasis") ? "peakEnergyOptimized" : "prolateBasis";
+    if (auto* other = parameters.getParameter (juce::String (otherID)))
+    {
+        if (other->getValue() > 0.5f)
+        {
+            enforcingExclusivity = true;
+            other->setValueNotifyingHost (0.0f);
+            enforcingExclusivity = false;
+        }
+    }
+}
+
 void BBKDetachedPoleAudioProcessor::requestModeSwitch()
 {
     // Deliberately does NOT touch currentBoundarySpec/boundaryEpoch/the
@@ -387,15 +432,23 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         version = ++versionCounter;
     }
 
+    bool isNewest = false;
     {
         const juce::SpinLock::ScopedLockType sl (resultLock);
-        latestResult = result;
-        latestSpec = spec;
-        latestPeakEnergyOn = (mode == DesignMode::PeakEnergy);
-        latestEtaAchieved = etaAchieved;
-        latestConcentrationDb = concentrationDb;
-        latestVersion = version;
+        if (version > latestVersion)
+        {
+            latestResult = result;
+            latestSpec = spec;
+            latestPeakEnergyOn = (mode == DesignMode::PeakEnergy);
+            latestEtaAchieved = etaAchieved;
+            latestConcentrationDb = concentrationDb;
+            latestVersion = version;
+            isNewest = true;
+        }
     }
+
+    if (! isNewest)
+        return;
 
     {
         const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
@@ -481,6 +534,15 @@ void BBKDetachedPoleAudioProcessor::run()
         else
         {
             result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount);
+
+            // Minimax/Prolate don't optimise for this the way Peak-Energy
+            // does, but the same eta/concentration numbers can still be
+            // measured after the fact from their taps, so all three modes
+            // report a directly comparable figure (see computeEtaMetrics
+            // above).
+            const auto etaMetrics = computeEtaMetrics (result.taps);
+            etaAchieved = etaMetrics.eta;
+            concentrationDb = etaMetrics.concentrationDb;
         }
 
         // Re-check staleness after the (possibly slow) computation - a
@@ -706,11 +768,11 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                 wet = wOld + crossfadeAmount * (wNew - wOld);
             }
 
-            // Pad + soft-clip backstop applied to the WET signal only -
-            // BYPASS (bypassAmount == 1, so out == dry exactly) is
-            // completely untouched by either, same transparency principle
-            // as BBK Phase Corrector and BBK Temporal FIR. See the
-            // anonymous namespace above for why this is needed at all.
+            // Pad + soft-clip backstop applied to the WET signal only - the
+            // headroom gain and clip backstop are both design-side
+            // corrections for the filter's own overshoot, so neither
+            // belongs on the dry path itself. See the anonymous namespace
+            // above for why the backstop is needed at all.
             wet *= preAttenuationGain;
 
             const double absWet = std::abs (wet);
@@ -723,10 +785,15 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
             // group delay every design has by construction (centre tap
             // always at maxHalfLength), so bypassing lines up
             // sample-for-sample with the filtered signal it is fading
-            // against.
+            // against. Also scaled by the same headroom gain as the wet
+            // path (rather than left at unity) so toggling Bypass is a
+            // pure A/B of the filter's tonal effect at matched loudness,
+            // not a loudness jump - the headroom pad exists purely to
+            // avoid clipping the wet signal's overshoot and has nothing to
+            // do with the dry signal's own level.
             int dryIndex = state.writeIndex - bbk::detachedpole::latencySamples;
             if (dryIndex < 0) dryIndex += historyLength;
-            const double dry = state.history[static_cast<std::size_t> (dryIndex)];
+            const double dry = state.history[static_cast<std::size_t> (dryIndex)] * preAttenuationGain;
 
             const double out = wet + bypassAmount * (dry - wet);
             data[sample] = static_cast<SampleType> (out);
