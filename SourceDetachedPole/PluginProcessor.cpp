@@ -70,6 +70,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("prolateBasis", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
+    parameters.addParameterListener ("peakEnergyOptimized", &paramListener);
 
     startThread();
 }
@@ -87,6 +88,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("prolateBasis", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
+    parameters.removeParameterListener ("peakEnergyOptimized", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -144,6 +146,23 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     // against real music rather than compared only by numbers.
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "prolateBasis", 1 }, "Prolate/DPSS Basis", false));
+
+    // OFF (default): use the existing Black/minimum-sidelobe filter exactly
+    // as the plugin has always designed it (Minimax or Prolate/DPSS Basis
+    // above, unchanged - ParametricFIR.h itself is untouched by this mode).
+    // ON: ignore both of those and design instead via
+    // bbk::peakenergy::designPeakEnergyFIR() (see PeakEnergyFIR.h) - a
+    // completely separate, isolated code path targeting direct maximum
+    // peak-to-total-impulse-energy concentration (eta = centreTap^2 /
+    // sum(taps^2)) rather than minimax's minimum-largest-sidelobe
+    // objective, under the exact same passband/stopband spectral
+    // boundaries and unity-DC normalisation as the mode it replaces - nothing
+    // is relaxed to make the new objective look better. Takes priority over
+    // Prolate/DPSS Basis and Sidelobe Decay when on (both become no-ops;
+    // see specFromParameters()/run() and the editor's greying-out of those
+    // controls).
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "peakEnergyOptimized", 1 }, "Peak-Energy Optimized", false));
 
     // 1.0 (default, top of the range): the flat sidelobe bound used
     // above - an exact no-op (see ParametricFIR.h::FilterSpec::
@@ -238,9 +257,11 @@ void BBKDetachedPoleAudioProcessor::requestBackgroundRedesign()
         return;
 
     const auto spec = specFromParameters();
+    const bool peakEnergyOn = parameters.getRawParameterValue ("peakEnergyOptimized")->load() > 0.5f;
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
         requestedSpec = spec;
+        requestedPeakEnergyOn = peakEnergyOn;
         requestedVersion = ++versionCounter;
     }
     notify();
@@ -255,14 +276,44 @@ void BBKDetachedPoleAudioProcessor::run()
             break;
 
         bbk::parametric::FilterSpec specToRun;
+        bool peakEnergyOnToRun;
         int versionToRun;
         {
             const juce::SpinLock::ScopedLockType sl (specLock);
             specToRun = requestedSpec;
+            peakEnergyOnToRun = requestedPeakEnergyOn;
             versionToRun = requestedVersion;
         }
 
-        auto result = bbk::parametric::designParametricFIR (specToRun, bbk::detachedpole::maxTapCount);
+        // OFF = designParametricFIR() exactly as before this mode existed -
+        // the only path that ever ran here previously, still completely
+        // unchanged. ON = the new, isolated bbk::peakenergy::
+        // designPeakEnergyFIR() engine instead (see PeakEnergyFIR.h);
+        // its result is copied into the same bbk::parametric::DesignResult
+        // shape (both structs share these field names/meanings by design)
+        // so everything downstream - the crossfade hand-off, the UI
+        // snapshot's core fields - works identically either way. Only the
+        // two peak-energy-specific fields (eta/concentration) are carried
+        // separately, since ordinary DesignResult has no room for them.
+        bbk::parametric::DesignResult result;
+        double etaAchieved = 0.0;
+        double concentrationDb = 0.0;
+        if (peakEnergyOnToRun)
+        {
+            const auto peResult = bbk::peakenergy::designPeakEnergyFIR (specToRun, bbk::detachedpole::maxTapCount);
+            result.taps = peResult.taps;
+            result.tapCount = peResult.tapCount;
+            result.constraintsMet = peResult.constraintsMet;
+            result.achievedStopbandDb = peResult.achievedStopbandDb;
+            result.designAttempts = peResult.designAttempts;
+            result.temporal = peResult.temporal;
+            etaAchieved = peResult.etaAchieved;
+            concentrationDb = peResult.concentrationDb;
+        }
+        else
+        {
+            result = bbk::parametric::designParametricFIR (specToRun, bbk::detachedpole::maxTapCount);
+        }
 
         // Only publish if this is still the newest request - a stale
         // in-flight design finishing after a newer one was already
@@ -280,6 +331,9 @@ void BBKDetachedPoleAudioProcessor::run()
             {
                 latestResult = result;
                 latestSpec = specToRun;
+                latestPeakEnergyOn = peakEnergyOnToRun;
+                latestEtaAchieved = etaAchieved;
+                latestConcentrationDb = concentrationDb;
                 latestVersion = versionToRun;
                 isNewest = true;
             }
@@ -302,6 +356,9 @@ void BBKDetachedPoleAudioProcessor::run()
             uiSnapshot.designAttempts = result.designAttempts;
             uiSnapshot.taps = result.taps;
             uiSnapshot.temporal = result.temporal;
+            uiSnapshot.peakEnergyOptimizedOn = peakEnergyOnToRun;
+            uiSnapshot.etaAchieved = etaAchieved;
+            uiSnapshot.concentrationDb = concentrationDb;
         }
     }
 }

@@ -26,6 +26,7 @@ private:
     juce::ToggleButton bypassButton { "Bypass" };
     juce::ToggleButton amplitudeRelaxationButton { "Amplitude Relaxation" };
     juce::ToggleButton prolateBasisButton { "Prolate/DPSS Basis (experimental - A/B against Minimax by ear)" };
+    juce::ToggleButton peakEnergyButton { "Peak-Energy Optimized" };
 
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
@@ -53,6 +54,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> prolateBasisAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> peakEnergyAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
 

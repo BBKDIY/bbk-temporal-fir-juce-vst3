@@ -6,6 +6,7 @@
 #include <vector>
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
+#include "PeakEnergyFIR.h"
 
 // BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
@@ -114,6 +115,22 @@ public:
         // bbk::parametric::computeTemporalMetrics() - see ParametricFIR.h
         // for exact definitions and the Case C reference validation.
         bbk::parametric::TemporalMetrics temporal;
+
+        // Peak-Energy Optimized mode (see PeakEnergyFIR.h). OFF (default):
+        // the fields above describe an ordinary bbk::parametric::
+        // designParametricFIR() result exactly as always - designMethod/
+        // sidelobeDecayRatio are meaningful and this struct is completely
+        // unchanged from before this mode existed. ON: taps/tapCount/
+        // constraintsMet/achievedStopbandDb/designAttempts/temporal above
+        // instead describe a bbk::peakenergy::designPeakEnergyFIR() result
+        // (designMethod/sidelobeDecayRatio are then not applicable - that
+        // engine ignores both), and etaAchieved/concentrationDb below are
+        // populated with its normalised peak-to-total-energy concentration
+        // achieved (eta = centreTap^2 / sum(taps^2); concentrationDb =
+        // 10*log10(eta)).
+        bool peakEnergyOptimizedOn = false;
+        double etaAchieved = 0.0;
+        double concentrationDb = 0.0;
     };
     DesignSnapshot getDesignSnapshotForUI() const;
 
@@ -176,11 +193,21 @@ private:
     // best-effort tryEnter() from the audio thread is safe in practice.
     juce::SpinLock specLock;
     bbk::parametric::FilterSpec requestedSpec;
+    // Captured at request time alongside requestedSpec, same reasoning as
+    // every other parameter read here: the audio/worker threads must never
+    // call getRawParameterValue() themselves mid-design, so this toggle's
+    // state is snapshotted once, together with the spec it applies to, at
+    // the moment a redesign is requested. See PeakEnergyFIR.h and
+    // requestBackgroundRedesign()/run() below.
+    bool requestedPeakEnergyOn = false;
     int requestedVersion = 0;
 
     juce::SpinLock resultLock;
     bbk::parametric::DesignResult latestResult;
     bbk::parametric::FilterSpec latestSpec;
+    bool latestPeakEnergyOn = false;
+    double latestEtaAchieved = 0.0;
+    double latestConcentrationDb = 0.0;
     int latestVersion = 0;
     int consumedVersion = 0; // audio-thread-only: last version picked up
 
