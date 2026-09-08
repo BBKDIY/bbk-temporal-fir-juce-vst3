@@ -26,12 +26,10 @@
 #include "../SourceDetachedPole/DetachedPoleFilter.h"
 #include "../SourceDetachedPole/ParametricFIR.h"
 
-#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
 #include <numeric>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -619,34 +617,6 @@ int main()
             "[stopband monotonicity] relaxing 95dB to 80dB does not make the chosen design's R_peak worse");
         std::printf ("  [stopband monotonicity] 95dB: taps=%d R_peak=%.3f%%  |  80dB: taps=%d R_peak=%.3f%%\n",
             tightResult.tapCount, tightResult.temporal.rPeakPercent, looseResult.tapCount, looseResult.temporal.rPeakPercent);
-
-        // TEMPORARY DIAGNOSTIC (not a real check - always passes): the
-        // check above is currently failing only on the CI runner's own
-        // Windows/MSVC build, not locally, and the failure mode changed
-        // between two different attempted fixes without ever showing an
-        // intermediate M's own numbers - this dumps attemptDesign()'s
-        // per-M result directly (feasible/worstStopbandDb/R_peak/settling)
-        // for the loose (80dB) spec across the same M values the real
-        // search would try, specifically to see, on the machine that
-        // actually reproduces the bug, whether a smaller M than the
-        // search's final answer is spuriously reporting infeasible (the
-        // suspected cause) versus genuinely infeasible. Remove once the
-        // real root cause is found and fixed.
-        {
-            int dM = 9;
-            for (int i = 0; i < 10 && dM <= 40; ++i)
-            {
-                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (10);
-                auto r = detail::attemptDesign (loose, dM, deadline);
-                bool degenerate = r.a.empty() || r.a[0] == 0.0;
-                std::printf ("  [diag M-sweep 80dB] M=%d taps=%d feasible=%d degenerate=%d worstSB=%.3fdB Rpeak=%s settle=%s\n",
-                    dM, 2 * dM + 1, r.feasible ? 1 : 0, degenerate ? 1 : 0, r.worstStopbandDb,
-                    degenerate ? "n/a" : (std::to_string (r.rPeakPercent)).c_str(),
-                    degenerate ? "n/a" : (std::to_string (r.settlingSampleSpan)).c_str());
-                dM = std::min (40, dM + std::max (1, dM / 6));
-            }
-        }
-        check (true, "[diag] M-sweep dump completed (not a real assertion)");
     }
 
     // --- 384 kHz operating point (upstream upsampling scenario) -----------

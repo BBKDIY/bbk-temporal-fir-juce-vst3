@@ -811,7 +811,19 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // candidate run longer.
         const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now() + std::chrono::seconds (6));
 
-        const int maxGridRounds = 4;
+        // Raised from 4: a diagnostic dump on the exact spec behind the
+        // stopband-monotonicity bug (see designParametricFIR's own
+        // comment) showed a specific M landing at -79.69dB after 4 rounds
+        // when the target was -80.0dB - a genuine near-miss (0.31dB), not
+        // a hard infeasibility, that a real design at that M could clear
+        // with more grid-refinement rounds to keep chasing the last few
+        // violating points. This is bounded by the same 6-second (or
+        // remaining overallDeadline, if tighter) deadline above either
+        // way via the loop's own "if (now() > deadline) break" - raising
+        // the round count only lets a candidate that's already converging
+        // well use more of that same time budget on more rounds, instead
+        // of giving up on rounds before it runs out of actual time.
+        const int maxGridRounds = 10;
         int gridRound = 0;
         for (; gridRound < maxGridRounds; ++gridRound)
         {
