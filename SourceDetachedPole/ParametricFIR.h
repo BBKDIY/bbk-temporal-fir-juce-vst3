@@ -134,6 +134,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <utility>
@@ -490,12 +491,28 @@ struct AttemptResult
     std::vector<double> a;
     bool feasible = false;
     double worstStopbandDb = 0.0;
-    // Temporal-concentration quality score for this candidate (see
-    // computeTemporalMetrics::rPeakPercent below) - only meaningful when
-    // feasible is true; used to pick the best among several compliant
-    // stopEdge/M candidates instead of just the first one found (see
-    // attemptDesign's candidate sweep and designParametricFIR's M-search).
+    // Temporal-concentration quality scores for this candidate (see
+    // computeTemporalMetrics below) - only meaningful when feasible is
+    // true; used to pick the best among several compliant stopEdge/M
+    // candidates instead of just the first one found (see attemptDesign's
+    // candidate sweep and designParametricFIR's M-search).
+    //
+    // settlingSampleSpan (T_0.1%, in samples) - not rPeakPercent - is what
+    // designParametricFIR's M-search actually compares candidate M's on:
+    // a lower R_peak does not always mean faster settling. Measured
+    // directly at the Case B operating point: the 25-tap candidate has a
+    // BETTER R_peak than the paper's own 19-tap design (1.758% vs 3.33%)
+    // but a WORSE (longer) settling time (0.125ms vs 0.094ms) - more taps
+    // bought a smaller relative sidelobe ratio while still adding enough
+    // extra above-threshold samples at the tail to lengthen the actual
+    // settling window. Settling time is the metric this plugin exists to
+    // minimize (see the top-of-file article reference), so the search
+    // should optimize for it directly rather than for a proxy that can
+    // move the wrong way. rPeakPercent is kept alongside it for display/
+    // diagnostics (see PluginEditor.cpp) but no longer drives the
+    // cross-M comparison itself.
     double rPeakPercent = 1.0e300;
+    int settlingSampleSpan = INT_MAX;
 };
 
 // attemptDesign now sweeps several stopband-edge candidates per M (see
@@ -760,7 +777,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
             {
                 auto noSidelobe = tryRho (curPb, curSb, mainLobeStart, 0.0, false);
                 if (! noSidelobe.feasible)
-                    return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0, 1.0e300 };
+                    return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0, 1.0e300, INT_MAX };
                 everFeasible = true;
                 if (bestY.empty()) { bestY = noSidelobe.y; bestRho = 1.0e300; } // safe fallback, overwritten below if bisection succeeds
 
@@ -843,19 +860,20 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         }
 
         // Full symmetric tap array, purely to score this candidate's
-        // actual temporal concentration (R_peak) - meeting the spectral
-        // spec is necessary but not sufficient for good ringing
-        // behaviour (see top-of-file comment), and different stopEdge
-        // choices meet the same spec with genuinely different ringing.
+        // actual temporal concentration (R_peak, settling span) - meeting
+        // the spectral spec is necessary but not sufficient for good
+        // ringing behaviour (see top-of-file comment), and different
+        // stopEdge choices meet the same spec with genuinely different
+        // ringing/settling.
         std::vector<double> fullTaps (static_cast<std::size_t> (2 * M + 1));
         for (int m = 0; m <= M; ++m)
         {
             fullTaps[static_cast<std::size_t> (M - m)] = a[static_cast<std::size_t> (m)];
             fullTaps[static_cast<std::size_t> (M + m)] = a[static_cast<std::size_t> (m)];
         }
-        const double rPeak = computeTemporalMetrics (fullTaps, Fs).rPeakPercent;
+        const auto fullMetrics = computeTemporalMetrics (fullTaps, Fs);
 
-        return { a, sbCompliant && pbCompliant, worstStopbandDb, rPeak };
+        return { a, sbCompliant && pbCompliant, worstStopbandDb, fullMetrics.rPeakPercent, fullMetrics.settlingSampleSpan };
     };
 
     double totalAvailable = nyquist - fc;
@@ -981,13 +999,13 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     // BETWEEN simplex solves, not inside one, so a single solve at a
     // large M can still run for a long time uninterrupted - a cost worth
     // paying once to find the first compliant design, but not worth
-    // risking repeatedly just to see whether a much larger M rings even
-    // less. A relative (not fixed-count) cap means an easy spec whose
+    // risking repeatedly just to see whether a much larger M settles even
+    // faster. A relative (not fixed-count) cap means an easy spec whose
     // first feasible M is already small (e.g. the calibrated Case B
     // operating point, M=9) gets several more small/cheap tap counts to
-    // try - which is where the measured real win is, R_peak improving
-    // from 3.33% to well under 2% by M=12, see Tests/
-    // DSPTestDetachedPole.cpp - while a demanding spec whose first
+    // try - which is where the measured real win is (see Tests/
+    // DSPTestDetachedPole.cpp for the exact before/after numbers) - while
+    // a demanding spec whose first
     // feasible M is already large (e.g. M=37) is only allowed a couple of
     // proportionally-sized steps further, never the far, much slower tail
     // toward maxM.
@@ -1028,13 +1046,18 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
             // Once at least one M has produced a spec-compliant design,
             // keep searching larger M values (rather than stopping here,
             // the previous behaviour) and only replace the running best
-            // with a candidate that actually rings LESS (lower R_peak) -
-            // more taps can, but does not always, buy better temporal
-            // concentration at the same spec, so this is a genuine
-            // quality comparison, not just "first success wins".
+            // with a candidate that actually SETTLES FASTER (shorter
+            // T_0.1% sample span) - more taps can, but does not always,
+            // buy a shorter settling time at the same spec, so this is a
+            // genuine quality comparison, not just "first success wins".
+            // Compared on settlingSampleSpan, not rPeakPercent (see
+            // AttemptResult's own comment): the two do not always move
+            // together, and settling time is the metric this plugin
+            // exists to minimize, so it is what should drive this choice
+            // directly.
             if (! foundFeasible)
                 maxMAfterFeasible = std::min (maxM, static_cast<int> (std::ceil (static_cast<double> (M) * extraSearchMultiplier)));
-            if (! foundFeasible || attempt.rPeakPercent < best.rPeakPercent)
+            if (! foundFeasible || attempt.settlingSampleSpan < best.settlingSampleSpan)
             {
                 best = attempt;
                 bestM = M;
@@ -1067,15 +1090,15 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // still bounds how much further this can go.
 
         // FlatMask-only safety valve: the "keep searching past the first
-        // feasible M, prefer whichever has the lowest R_peak" logic above
+        // feasible M, prefer whichever settles fastest" logic above
         // is only sound when every M's own "feasible" flag means compliance
         // over the SAME enforced-stopband width - true for FreeTransition
         // (a single fixed guard-band rule, unchanged by M - see attemptDesign's
         // own comment), but NOT true for FlatMask: attemptDesign's per-M
         // candidate sweep (mirror -> Kaiser -> narrow, see above) can fall
         // through to a much NARROWER candidate at one M than at another, and
-        // a narrower enforced region is both easier to satisfy and rings
-        // less (lower R_peak) almost by construction - not because it is a
+        // a narrower enforced region is both easier to satisfy and rings/
+        // settles less almost by construction - not because it is a
         // genuinely better full-width design. Comparing R_peak *across*
         // FlatMask M's can therefore let a narrow-candidate M with a
         // technically-true but much weaker "feasible" flag win purely on

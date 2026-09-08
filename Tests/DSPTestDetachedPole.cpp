@@ -544,7 +544,7 @@ int main()
         auto caseB = designParametricFIR (caseBSpec, maxTapCount, kTestDeadlineSeconds);
 
         check (caseB.constraintsMet, "[Case B calibrated] design reports its own targets as met");
-        check (caseB.tapCount >= 19, "[Case B calibrated] tap count is at least the article's own 19 (the search may now use more for better ringing)");
+        check (caseB.tapCount >= 19, "[Case B calibrated] tap count is at least the article's own 19");
 
         const auto guard = freeTransitionGuardBand (caseBSpec);
         checkNear (guard.first, 94000.0, 1.0, "[Case B calibrated] guard band starts at 94 kHz, matching the article's stopband edge");
@@ -552,6 +552,16 @@ int main()
         const double worst = denseWorstDbInBand (caseB.taps, caseBSpec.sampleRateHz, guard.first, guard.second);
         check (worst <= -97.5, "[Case B calibrated] worst-case stopband over 94-96 kHz meets the article's -97.98 dB");
 
+        // The M-search now compares candidate tap counts on settling time
+        // (T_0.1%), not R_peak (see ParametricFIR.h's own comment on why:
+        // a lower R_peak does not always mean faster settling, measured
+        // directly at this exact operating point). With that change this
+        // search correctly recognizes that the article's own 19 taps
+        // already settles as fast as any larger M does here, so it no
+        // longer trades away settling time for a marginally better R_peak
+        // - check settling directly, at least as tight a bound as R_peak/
+        // E_ZC get, rather than leaving it unchecked.
+        check (caseB.temporal.settlingSampleSpan <= 18, "[Case B calibrated] settling span is at least as good as the article's published 18-sample T_0.1%");
         check (caseB.temporal.rPeakPercent <= 3.33 + 0.5, "[Case B calibrated] R_peak is at least as good as the article's published 3.33%");
         check (caseB.temporal.eZcPercent <= 0.61 + 0.15, "[Case B calibrated] E_ZC is at least as good as the article's published 0.61%");
 
