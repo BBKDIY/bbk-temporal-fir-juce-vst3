@@ -774,6 +774,26 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         double bestRho = 1.0;
         bool everFeasible = false;
 
+        // Whether the sidelobe-CONSTRAINED bisection below ever actually
+        // confirmed a feasible rho, as opposed to falling back to the
+        // no-sidelobe safety net (see bestY's own "safe fallback,
+        // overwritten below if bisection succeeds" comment). That fallback
+        // exists so a spectrally-compliant design is still returned when
+        // time runs out mid-bisection, but it places NO bound at all on
+        // relative sidelobe height - measured directly as the cause of a
+        // real bug: under time pressure at a demanding M, the doubling
+        // search for a feasible hi can itself eat the whole per-candidate
+        // deadline before ever confirming one, leaving the raw
+        // unconstrained solution as the final answer - which can have
+        // near-100% R_peak, yet was still reported as a genuine "feasible"
+        // (compliant) design once the cross-M search started comparing
+        // candidates on R_peak directly. Gating the returned feasible flag
+        // on this (see below) makes the M-search correctly treat "gave up
+        // mid-shaping" the same as "not feasible here", so it keeps
+        // looking for a properly-shaped design at another tap count
+        // instead of silently accepting whatever the fallback produced.
+        bool sidelobeBisectionSucceeded = false;
+
         // Per-candidate deadline: kept at the original, proven 6 seconds
         // (NOT raised, and NOT tied to the shared overallDeadline) -
         // measured directly that raising this cap, or letting it float up
@@ -818,7 +838,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
                     if (std::chrono::steady_clock::now() > deadline) break;
                 }
                 auto final = tryRho (curPb, curSb, mainLobeStart, hi, true);
-                if (final.feasible) { bestY = final.y; bestRho = hi; }
+                if (final.feasible) { bestY = final.y; bestRho = hi; sidelobeBisectionSucceeded = true; }
 
                 auto a = reconstruct (bestY);
                 int newStart = 1;
@@ -935,7 +955,19 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         }
         const auto fullMetrics = computeTemporalMetrics (fullTaps, Fs);
 
-        return { a, sbCompliant && pbCompliant, worstStopbandDb, fullMetrics.rPeakPercent, fullMetrics.settlingSampleSpan };
+        // sidelobeBisectionSucceeded is required alongside spectral
+        // compliance (see its own comment above): without it, "feasible"
+        // would include the raw no-sidelobe fallback, which is spectrally
+        // fine but can have almost no ringing suppression (R_peak close to
+        // 100%) - a real bug this fixes, not a hypothetical one (measured
+        // directly on a demanding real-world spec where the fallback won
+        // the cross-M R_peak comparison outright once nothing better was
+        // ever tried). Rejecting it here as infeasible lets the M-search
+        // correctly move on and look for a tap count where the shaping
+        // actually completed, rather than accepting whatever shape the
+        // fallback happened to produce.
+        const bool feasible = sidelobeBisectionSucceeded && sbCompliant && pbCompliant;
+        return { a, feasible, worstStopbandDb, fullMetrics.rPeakPercent, fullMetrics.settlingSampleSpan };
     };
 
     double totalAvailable = nyquist - fc;
