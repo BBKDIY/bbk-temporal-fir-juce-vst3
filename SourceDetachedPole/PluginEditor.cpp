@@ -90,32 +90,6 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     sidelobeDecayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "sidelobeDecay", sidelobeDecaySlider);
 
-    // Off (default): the article's own minimax design (unchanged). On:
-    // the same LP restricted to a DPSS/prolate-spheroidal basis instead
-    // of the full tap space - see PluginProcessor.cpp::createParameterLayout()
-    // and ParametricFIR.h for the full rationale. Meant to be flipped
-    // live while listening to real music, not judged from the metrics
-    // readout alone (R_peak/E_ZC are discrete-tap metrics; this mode
-    // targets continuous-time concentration instead, which they don't
-    // fully capture).
-    prolateBasisButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (prolateBasisButton);
-    prolateBasisAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-        processor.getAPVTS(), "prolateBasis", prolateBasisButton);
-
-    // OFF (default): the two rows above (Minimax/Prolate-DPSS) behave
-    // exactly as always. ON: takes priority over both - the engine
-    // switches entirely to bbk::peakenergy::designPeakEnergyFIR() (see
-    // PeakEnergyFIR.h), which targets direct peak-to-total-impulse-energy
-    // concentration instead of minimax's minimum-largest-sidelobe
-    // objective, under the same spectral boundaries. Prolate/DPSS Basis
-    // and Sidelobe Decay are then both no-ops (greyed out below - see
-    // timerCallback()), since that engine doesn't consult either.
-    peakEnergyButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (peakEnergyButton);
-    peakEnergyAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-        processor.getAPVTS(), "peakEnergyOptimized", peakEnergyButton);
-
     prepareLabel (headroomCaption, 13.0f, false, juce::Justification::centredLeft);
     headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
     addAndMakeVisible (headroomCaption);
@@ -229,12 +203,6 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     sliderRow (stopbandLabel, stopbandSlider);
     sliderRow (sidelobeDecayLabel, sidelobeDecaySlider);
 
-    prolateBasisButton.setBounds (area.removeFromTop (24));
-    area.removeFromTop (6);
-
-    peakEnergyButton.setBounds (area.removeFromTop (24));
-    area.removeFromTop (6);
-
     {
         auto row = area.removeFromTop (26);
         headroomCaption.setBounds (row.removeFromLeft (170));
@@ -322,27 +290,6 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // live and misleading.
     attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
 
-    // Sidelobe Decay is a no-op once Peak-Energy Optimized is on -
-    // designPeakEnergyFIR() doesn't consult it (see PeakEnergyFIR.h) - so
-    // grey it out rather than leave it looking live, same principle as the
-    // attenuation slider above.
-    //
-    // Prolate/DPSS Basis is a no-op in the same sense, but its own
-    // checkbox is deliberately NEVER disabled (unlike the slider above):
-    // it is the other half of a mutually-exclusive pair with Peak-Energy
-    // Optimized (see enforceModeExclusivity() in PluginProcessor.cpp,
-    // which already turns either one off the instant the other is turned
-    // on). Disabling it here used to make that exclusivity asymmetric in
-    // the worst way - clicking Peak-Energy while Prolate was on correctly
-    // switched straight over, but going the other way (Prolate while
-    // Peak-Energy was on) silently did nothing, because a disabled JUCE
-    // button simply swallows the click. The user then had to uncheck
-    // Peak-Energy first, purely to re-enable the Prolate checkbox, before
-    // they could check it - two clicks and a re-render for what should be
-    // one. Leaving it always enabled makes both directions a single click,
-    // exactly like the Peak-Energy button's own always-enabled state.
-    sidelobeDecaySlider.setEnabled (! snap.peakEnergyOptimizedOn);
-
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
         if (bypassParam->load() > 0.5f)
@@ -350,30 +297,15 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
-         << "Design method: ";
-
-    if (snap.peakEnergyOptimizedOn)
-    {
-        text << "Peak-Energy Optimized - maximises the normalised peak-to-total-impulse-energy "
-                "concentration (eta = centre-tap^2 / sum(taps^2)) directly, rather than minimax's "
-                "minimum-largest-sidelobe objective, under the same spectral boundaries. "
-                "Prolate/DPSS Basis and Sidelobe Decay are not applicable in this mode.\n";
-    }
-    else
-    {
-        text << (snap.designMethod == bbk::parametric::DesignMethod::ProlateBasis
-              ? "Prolate/DPSS basis (experimental) - taps restricted to a span of leading even "
-                "discrete prolate spheroidal directions, biased toward continuous-time energy "
-                "concentration rather than only discrete-sample sidelobe suppression"
-              : "Minimax (default) - the article's own minimum-peak-sidelobe method")
-         << "\n"
+         << "Design method: Minimax - the article's own minimum-peak-sidelobe method, searched "
+            "thoroughly across tap counts and stopband-edge candidates for the best (lowest "
+            "ringing) compliant result (see the design-attempts count below)\n"
          << "Sidelobe decay: " << juce::String (snap.sidelobeDecayRatio, 3)
          << (snap.sidelobeDecayRatio >= 0.999
               ? " (flat, no decay - unchanged behaviour)"
               : " - taps farther from the main lobe are bounded more tightly, concentrating "
                 "ringing near the centre with a shorter, quieter tail")
          << "\n";
-    }
 
     text
          << "Amplitude relaxation: " << (snap.amplitudeRelaxationOn
@@ -389,11 +321,7 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             "nothing downstream can fold that energy back into the audible band.\n"
          << "Achieved worst-case level in the enforced region: " << juce::String (snap.achievedStopbandDb, 2)
          << " dB (Nyquist = " << juce::String (nyquist, 0) << " Hz)\n"
-         << "Design attempts (tap-count search): " << snap.designAttempts << "\n"
-         << "Peak-energy concentration: eta = " << juce::String (snap.etaAchieved, 6)
-         << "  (CE = " << juce::String (snap.concentrationDb, 3)
-         << " dB) - measured the same way for every design method, so all three are directly "
-            "comparable on this number\n"
+         << "Design attempts (tap-count/stopband-edge candidates tried): " << snap.designAttempts << "\n"
          << "Temporal concentration (from the article's own metrics):\n"
          << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "
          << juce::String (snap.temporal.eZcPercent, 3) << "%  |  T_0.1% "

@@ -7,17 +7,29 @@
 #include <vector>
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
-#include "PeakEnergyFIR.h"
 
 // BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
-// controls - cutoff, attenuation at cutoff, and minimum stopband
-// rejection - are handed straight to bbk::parametric::designParametricFIR(),
-// along with a toggle (Prolate/DPSS Basis) selecting which of the two
-// design methods ParametricFIR.h implements, and a Sidelobe Decay slider
-// (FilterSpec::sidelobeDecayRatio) that applies orthogonally to either
-// method. The plugin auto-detects the host sample rate (44.1/48/96/192 kHz
-// and anything else the host reports) rather than hard-locking to 192 kHz.
+// controls - cutoff, attenuation at cutoff, and minimum stopband rejection -
+// are handed straight to bbk::parametric::designParametricFIR(), along with
+// a Sidelobe Decay slider (FilterSpec::sidelobeDecayRatio). The plugin
+// auto-detects the host sample rate (44.1/48/96/192 kHz and anything else
+// the host reports) rather than hard-locking to 192 kHz.
+//
+// This plugin previously offered two extra design engines - a Prolate/DPSS
+// basis-restricted variant of this same minimax LP, and a completely
+// separate Peak-Energy Optimized engine (PeakEnergyFIR.h) - selectable live
+// alongside this one, with a 3-way per-mode cache/queue so switching between
+// them never re-paid a slow design. Direct A/B listening at 44.1 kHz found
+// the plain minimax design here sounded best of the three, so both
+// alternatives were removed entirely rather than continuing to carry their
+// own bugs (a QP convergence failure in Peak-Energy at 192 kHz, and a
+// background-thread contention bug the Peak-Energy time-budget increase
+// introduced) - see ParametricFIR.h's own comment for where that effort was
+// redirected instead: designParametricFIR() itself now searches far more
+// thoroughly (more tap counts, more stopband-edge candidates per tap count,
+// a much larger time budget) for the single best result, since this design
+// now runs alone with nothing else competing for the background thread.
 //
 // A redesign never runs on the audio thread, and never blocks the host
 // either - not even on a sample-rate change or the very first
@@ -25,36 +37,14 @@
 // dedicated background juce::Thread; prepareToPlay() installs a safe
 // identity pass-through (pure delay, no filtering - see
 // DetachedPoleFilter.h::identityTaps()) immediately and returns, and the
-// audio thread crossfades smoothly from whatever was previously active
-// into the newly completed design once the background thread finishes
-// (same 15 ms linear crossfade mechanism this plugin has always used for
-// its mode switches, now generalised to two arbitrary tap sets instead of
-// four fixed ones) so a redesign never clicks - and, just as importantly,
-// prepareToPlay() itself always returns in milliseconds regardless of how
-// long the actual design takes (some cutoff/sample-rate combinations
-// pushed close to Nyquist can legitimately take several seconds - see
-// ParametricFIR.h - which is far too long for a host to wait on).
-//
-// A/B'ing the three design MODES (Minimax, Prolate/DPSS Basis, and
-// Peak-Energy Optimized - see PeakEnergyFIR.h) live is a distinct case from
-// tuning the shared BOUNDARY parameters (cutoff, attenuation, amplitude
-// relaxation, min. stopband, sidelobe decay, sample rate): flipping a mode
-// toggle should never re-pay a slow design if the answer is already known.
-// So instead of tracking one "requested design", the processor tracks a
-// boundary spec plus a monotonically increasing boundaryEpoch: whenever a
-// boundary parameter changes, the epoch bumps, all three per-mode caches
-// (cacheMinimax/cacheProlateBasis/cachePeakEnergy) are invalidated, and all
-// three designs are queued on the background thread - the currently
-// selected mode first (so playback still starts as soon as possible),
-// then the other two filled in behind it silently. Flipping a mode toggle
-// never touches the boundary spec or the epoch: it just checks whether
-// that mode's cache slot is already valid for the current epoch - if so,
-// the cached taps are crossfaded in immediately (no wait at all); if the
-// background fill hasn't reached that mode yet, its queued task is bumped
-// to the front so it's computed next. A stale task (queued or mid-flight
-// for an epoch that a newer boundary change has since superseded) is
-// discarded rather than cached or played, the same "only the newest result
-// wins" principle this plugin already used for its single-design queue.
+// audio thread crossfades smoothly from whatever was previously active into
+// the newly completed design once the background thread finishes (same
+// 15 ms linear crossfade mechanism this plugin has always used) so a
+// redesign never clicks - and, just as importantly, prepareToPlay() itself
+// always returns in milliseconds regardless of how long the actual design
+// takes (a demanding spec can legitimately take minutes now that the search
+// is deliberately much more thorough - see ParametricFIR.h - which is far
+// too long for a host to wait on).
 class BBKDetachedPoleAudioProcessor final : public juce::AudioProcessor,
                                              private juce::Thread
 {
@@ -122,7 +112,6 @@ public:
         double attenuationAtCutoffDb = 0.0;
         double stopbandRejectionDb = 0.0;
         bbk::parametric::StopbandMode stopbandMode = bbk::parametric::StopbandMode::FlatMask;
-        bbk::parametric::DesignMethod designMethod = bbk::parametric::DesignMethod::Minimax;
         double sidelobeDecayRatio = 1.0;
         bool amplitudeRelaxationOn = true;
         int tapCount = 0;
@@ -137,22 +126,6 @@ public:
         // bbk::parametric::computeTemporalMetrics() - see ParametricFIR.h
         // for exact definitions and the Case C reference validation.
         bbk::parametric::TemporalMetrics temporal;
-
-        // Peak-Energy Optimized mode (see PeakEnergyFIR.h). OFF (default):
-        // the fields above describe an ordinary bbk::parametric::
-        // designParametricFIR() result exactly as always - designMethod/
-        // sidelobeDecayRatio are meaningful and this struct is completely
-        // unchanged from before this mode existed. ON: taps/tapCount/
-        // constraintsMet/achievedStopbandDb/designAttempts/temporal above
-        // instead describe a bbk::peakenergy::designPeakEnergyFIR() result
-        // (designMethod/sidelobeDecayRatio are then not applicable - that
-        // engine ignores both), and etaAchieved/concentrationDb below are
-        // populated with its normalised peak-to-total-energy concentration
-        // achieved (eta = centreTap^2 / sum(taps^2); concentrationDb =
-        // 10*log10(eta)).
-        bool peakEnergyOptimizedOn = false;
-        double etaAchieved = 0.0;
-        double concentrationDb = 0.0;
     };
     DesignSnapshot getDesignSnapshotForUI() const;
 
@@ -166,53 +139,20 @@ private:
 
     bbk::parametric::FilterSpec specFromParameters() const;
 
-    // The three design modes this plugin can produce a filter with - see
-    // the class-level comment above for how caching/queueing works across
-    // them. Deliberately a closed 3-way enum (not just the two
-    // bbk::parametric::DesignMethod values) since Peak-Energy Optimized is
-    // a different engine entirely (PeakEnergyFIR.h), not a third
-    // DesignMethod.
-    enum class DesignMode { Minimax, ProlateBasis, PeakEnergy };
-    DesignMode selectedModeFromParameters() const;
-
     // Boundary parameter changed (cutoff/attenuation/amplitude relaxation/
     // stopband/sidelobe decay, or a sample-rate change via prepareToPlay):
-    // bumps boundaryEpoch, invalidates all three per-mode caches, and
-    // queues fresh designs for all three modes (selected mode first).
+    // bumps boundaryEpoch, queues a fresh design on the background thread,
+    // and discards any design already queued or mid-flight for an older
+    // epoch (the same "only the newest request wins" principle this plugin
+    // has always used).
     void requestBoundaryRedesign();
 
-    // Mode toggle changed (Prolate/DPSS Basis or Peak-Energy Optimized):
-    // the boundary spec and epoch are untouched. Installs the newly
-    // selected mode's cached result immediately if it's already valid for
-    // the current epoch; otherwise bumps that mode's queued task to the
-    // front so the background thread computes it next.
-    void requestModeSwitch();
-
-    // Shared by both the background worker (after computing a task) and
-    // requestModeSwitch()'s cache-hit path (which never touches the
-    // worker thread at all): bumps versionCounter and writes
-    // latestResult/latestSpec/latestVersion/uiSnapshot exactly once, so
-    // the audio thread's existing version-based crossfade pickup in
-    // process() works identically regardless of which path produced the
-    // result.
-    void publishResult (const bbk::parametric::FilterSpec& spec, DesignMode mode,
-                         const bbk::parametric::DesignResult& result,
-                         double etaAchieved, double concentrationDb);
-
-    // "Prolate/DPSS Basis" and "Peak-Energy Optimized" are two independent
-    // AudioParameterBools with nothing else in JUCE keeping them exclusive -
-    // without this, both can end up checked at once, in which case
-    // selectedModeFromParameters()'s fixed priority (Peak-Energy wins) would
-    // silently keep the OTHER checkbox's click from ever taking audible
-    // effect. Called before requestModeSwitch() so that by the time it reads
-    // selectedModeFromParameters(), the just-unchecked mode's parameter has
-    // already been turned off. enforcingExclusivity guards against
-    // setValueNotifyingHost() re-entering this same listener while it is
-    // still turning the other one off (that re-entrant call always sees
-    // newValue == 0, so it would no-op anyway, but the flag makes the
-    // non-recursion explicit rather than relying on it).
-    void enforceModeExclusivity (const juce::String& changedParamID, float newValue);
-    bool enforcingExclusivity = false;
+    // Bumps versionCounter and writes latestResult/latestSpec/
+    // latestVersion/uiSnapshot exactly once, so the audio thread's existing
+    // version-based crossfade pickup in process() always sees the newest
+    // published design.
+    void publishResult (const bbk::parametric::FilterSpec& spec,
+                         const bbk::parametric::DesignResult& result);
 
     juce::AudioProcessorValueTreeState parameters;
 
@@ -220,18 +160,9 @@ private:
     {
         BBKDetachedPoleAudioProcessor& owner;
         explicit ParamListener (BBKDetachedPoleAudioProcessor& o) : owner (o) {}
-        void parameterChanged (const juce::String& paramID, float newValue) override
+        void parameterChanged (const juce::String&, float) override
         {
-            // Mode toggles are handled entirely separately from boundary
-            // parameters - see requestModeSwitch()/requestBoundaryRedesign()
-            // and the class-level comment above.
-            if (paramID == "prolateBasis" || paramID == "peakEnergyOptimized")
-            {
-                owner.enforceModeExclusivity (paramID, newValue);
-                owner.requestModeSwitch();
-            }
-            else
-                owner.requestBoundaryRedesign();
+            owner.requestBoundaryRedesign();
         }
     } paramListener { *this };
 
@@ -267,52 +198,30 @@ private:
     bool lastBypassParam = false;
 
     // Background design thread hand-off. The audio thread never runs
-    // designParametricFIR()/designPeakEnergyFIR() itself - Minimax/
-    // ProlateBasis can take tens to low hundreds of milliseconds for
-    // demanding specs and Peak-Energy Optimized can take several seconds
-    // (see PeakEnergyFIR.h), fine off the audio thread, fatal on it. Every
-    // lock below is only ever held for a very short copy (a FilterSpec/
+    // designParametricFIR() itself - a demanding spec can legitimately take
+    // minutes now that the search is deliberately thorough (see
+    // ParametricFIR.h), fine off the audio thread, fatal on it. Every lock
+    // below is only ever held for a very short copy (a FilterSpec/
     // DesignResult/DesignTask, at most maxTapCount doubles), so a
     // best-effort tryEnter() from the audio thread is safe in practice.
     juce::SpinLock specLock;
 
-    // One background-design task: the boundary spec it applies to (with
-    // designMethod already set for whichever of Minimax/ProlateBasis this
-    // task is - irrelevant/ignored for PeakEnergy tasks, which call
-    // designPeakEnergyFIR() directly), which of the three modes to run,
-    // and the boundaryEpoch it was queued for (checked again before, and
-    // after, the actual design runs - see run() - so a task superseded by
-    // a newer boundary change mid-flight is discarded rather than cached
-    // or played).
+    // One background-design task: the boundary spec it applies to, and the
+    // boundaryEpoch it was queued for (checked again before, and after,
+    // the actual design runs - see run() - so a task superseded by a newer
+    // boundary change mid-flight is discarded rather than published).
     struct DesignTask
     {
         bbk::parametric::FilterSpec spec;
-        DesignMode mode = DesignMode::Minimax;
         int epoch = 0;
     };
     std::deque<DesignTask> taskQueue;          // guarded by specLock
     int boundaryEpoch = 0;                     // guarded by specLock
     bbk::parametric::FilterSpec currentBoundarySpec; // guarded by specLock
 
-    // One cached design per mode - the whole point of this scheme:
-    // switching modes only needs to read one of these, never re-run a
-    // design, as long as epoch matches the current boundaryEpoch.
-    struct CachedDesign
-    {
-        bool valid = false;
-        int epoch = -1;
-        bbk::parametric::DesignResult result;
-        double etaAchieved = 0.0;     // meaningful for PeakEnergy only
-        double concentrationDb = 0.0; // meaningful for PeakEnergy only
-    };
-    CachedDesign cacheMinimax, cacheProlateBasis, cachePeakEnergy; // guarded by resultLock
-
     juce::SpinLock resultLock;
     bbk::parametric::DesignResult latestResult;
     bbk::parametric::FilterSpec latestSpec;
-    bool latestPeakEnergyOn = false;
-    double latestEtaAchieved = 0.0;
-    double latestConcentrationDb = 0.0;
     int latestVersion = 0;
     int consumedVersion = 0; // audio-thread-only: last version picked up
 

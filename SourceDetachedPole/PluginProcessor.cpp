@@ -56,31 +56,6 @@ namespace
     constexpr float autoHeadroomReleasePerSecond = 0.5f;
     constexpr double autoHeadroomCooldownSeconds = 3.0;
 
-    // Same normalised peak-to-total-impulse-energy concentration Peak-
-    // Energy Optimized reports for itself (see PeakEnergyFIR.h: "eta =
-    // a[0]^2 / sum(h^2)") - but that's a property of any symmetric FIR's
-    // taps, not something specific to how they were designed, so it can be
-    // measured identically for Minimax and Prolate/DPSS Basis results too,
-    // letting all three modes be compared on the same number.
-    struct EtaMetrics { double eta = 0.0; double concentrationDb = -300.0; };
-
-    inline EtaMetrics computeEtaMetrics (const std::vector<double>& taps)
-    {
-        if (taps.empty())
-            return {};
-
-        double sumSquares = 0.0;
-        for (double t : taps)
-            sumSquares += t * t;
-
-        const auto centreIndex = static_cast<std::size_t> ((taps.size() - 1) / 2);
-        const double centreTap = taps[centreIndex];
-
-        EtaMetrics m;
-        m.eta = (sumSquares > 0.0) ? (centreTap * centreTap) / sumSquares : 0.0;
-        m.concentrationDb = (m.eta > 0.0) ? 10.0 * std::log10 (m.eta) : -300.0;
-        return m;
-    }
 }
 
 BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
@@ -94,9 +69,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("attenuation", &paramListener);
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
-    parameters.addParameterListener ("prolateBasis", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
-    parameters.addParameterListener ("peakEnergyOptimized", &paramListener);
 
     startThread();
 }
@@ -112,9 +85,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("attenuation", &paramListener);
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
-    parameters.removeParameterListener ("prolateBasis", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
-    parameters.removeParameterListener ("peakEnergyOptimized", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -160,35 +131,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     // matters at this scale).
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "amplitudeRelaxation", 1 }, "Amplitude Relaxation", true));
-
-    // Off (default): the article's own minimax method (see
-    // ParametricFIR.h). On: the same minimax LP, but restricted to a
-    // small span of leading even discrete prolate spheroidal (Slepian)
-    // directions instead of the full space of free taps - trading some
-    // classical R_peak/E_ZC sidelobe suppression for a continuous-time
-    // (sinc-reconstructed) impulse response that is inherently energy-
-    // concentrated near t=0 by construction, rather than only bounding
-    // discrete-sample sidelobes. Exists so the two can be A/B'd live
-    // against real music rather than compared only by numbers.
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "prolateBasis", 1 }, "Prolate/DPSS Basis", false));
-
-    // OFF (default): use the existing Black/minimum-sidelobe filter exactly
-    // as the plugin has always designed it (Minimax or Prolate/DPSS Basis
-    // above, unchanged - ParametricFIR.h itself is untouched by this mode).
-    // ON: ignore both of those and design instead via
-    // bbk::peakenergy::designPeakEnergyFIR() (see PeakEnergyFIR.h) - a
-    // completely separate, isolated code path targeting direct maximum
-    // peak-to-total-impulse-energy concentration (eta = centreTap^2 /
-    // sum(taps^2)) rather than minimax's minimum-largest-sidelobe
-    // objective, under the exact same passband/stopband spectral
-    // boundaries and unity-DC normalisation as the mode it replaces - nothing
-    // is relaxed to make the new objective look better. Takes priority over
-    // Prolate/DPSS Basis and Sidelobe Decay when on (both become no-ops;
-    // see specFromParameters()/run() and the editor's greying-out of those
-    // controls).
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "peakEnergyOptimized", 1 }, "Peak-Energy Optimized", false));
 
     // 1.0 (default, top of the range): the flat sidelobe bound used
     // above - an exact no-op (see ParametricFIR.h::FilterSpec::
@@ -264,24 +206,8 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     // is no longer reachable from the plugin itself.
     spec.stopbandMode = bbk::parametric::StopbandMode::FreeTransition;
 
-    const bool prolateBasisOn = parameters.getRawParameterValue ("prolateBasis")->load() > 0.5f;
-    spec.designMethod = prolateBasisOn ? bbk::parametric::DesignMethod::ProlateBasis
-                                        : bbk::parametric::DesignMethod::Minimax;
-
     spec.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
     return spec;
-}
-
-BBKDetachedPoleAudioProcessor::DesignMode BBKDetachedPoleAudioProcessor::selectedModeFromParameters() const
-{
-    // Priority order matches specFromParameters()/the editor's greying-out
-    // logic exactly: Peak-Energy Optimized, when on, overrides Prolate/DPSS
-    // Basis entirely (that toggle becomes a no-op, not a stacked modifier).
-    if (parameters.getRawParameterValue ("peakEnergyOptimized")->load() > 0.5f)
-        return DesignMode::PeakEnergy;
-    if (parameters.getRawParameterValue ("prolateBasis")->load() > 0.5f)
-        return DesignMode::ProlateBasis;
-    return DesignMode::Minimax;
 }
 
 void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
@@ -289,17 +215,16 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     // May be called from the message thread (typical - a slider moved) or
     // from the audio thread (a host delivered automation for one of these
     // parameters mid-block) - either way this only ever copies a small
-    // FilterSpec/queues three lightweight DesignTasks under a SpinLock and
+    // FilterSpec, queues one lightweight DesignTask under a SpinLock, and
     // signals the worker thread; the actual (slow) design work never runs
-    // here. See the class-level comment in PluginProcessor.h for the full
-    // rationale behind bumping boundaryEpoch and invalidating all three
-    // per-mode caches rather than just re-running the currently selected
-    // one.
+    // here. Bumping boundaryEpoch and clearing taskQueue means any design
+    // already queued or mid-flight for an older boundary is discarded
+    // rather than published once it finishes - only the newest request
+    // ever wins.
     if (! hasPrepared.load() || currentSampleRate.load() <= 0.0)
         return;
 
     const auto spec = specFromParameters();
-    const auto selectedMode = selectedModeFromParameters();
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -307,124 +232,17 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         ++boundaryEpoch;
         taskQueue.clear();
 
-        auto pushTask = [&] (DesignMode mode)
-        {
-            DesignTask task;
-            task.spec = spec;
-            // Only Minimax/ProlateBasis tasks actually consult
-            // spec.designMethod (designPeakEnergyFIR() ignores it - see
-            // PeakEnergyFIR.h) but setting it consistently per task keeps
-            // the queued spec self-describing.
-            task.spec.designMethod = (mode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
-                                                                          : bbk::parametric::DesignMethod::Minimax;
-            task.mode = mode;
-            task.epoch = boundaryEpoch;
-            taskQueue.push_back (task);
-        };
-
-        // Selected mode first, so the still-audible/about-to-be-audible
-        // result arrives as soon as possible; the other two fill the cache
-        // in behind it, invisibly to playback, ready for an instant
-        // switch later.
-        pushTask (selectedMode);
-        for (auto mode : { DesignMode::Minimax, DesignMode::ProlateBasis, DesignMode::PeakEnergy })
-            if (mode != selectedMode)
-                pushTask (mode);
-    }
-
-    {
-        const juce::SpinLock::ScopedLockType sl (resultLock);
-        cacheMinimax.valid = false;
-        cacheProlateBasis.valid = false;
-        cachePeakEnergy.valid = false;
+        DesignTask task;
+        task.spec = spec;
+        task.epoch = boundaryEpoch;
+        taskQueue.push_back (task);
     }
 
     notify();
 }
 
-void BBKDetachedPoleAudioProcessor::enforceModeExclusivity (const juce::String& changedParamID, float newValue)
-{
-    // Only turning a mode ON is ever a reason to turn the other OFF -
-    // unchecking one should never reach back and touch the other.
-    if (newValue <= 0.5f || enforcingExclusivity)
-        return;
-
-    const char* otherID = (changedParamID == "prolateBasis") ? "peakEnergyOptimized" : "prolateBasis";
-    if (auto* other = parameters.getParameter (juce::String (otherID)))
-    {
-        if (other->getValue() > 0.5f)
-        {
-            enforcingExclusivity = true;
-            other->setValueNotifyingHost (0.0f);
-            enforcingExclusivity = false;
-        }
-    }
-}
-
-void BBKDetachedPoleAudioProcessor::requestModeSwitch()
-{
-    // Deliberately does NOT touch currentBoundarySpec/boundaryEpoch/the
-    // caches for the other two modes - a mode toggle is a pure "look at
-    // what's already known" operation, never a reason to redesign
-    // anything. See the class-level comment in PluginProcessor.h.
-    if (! hasPrepared.load() || currentSampleRate.load() <= 0.0)
-        return;
-
-    const auto selectedMode = selectedModeFromParameters();
-
-    int epoch;
-    bbk::parametric::FilterSpec spec;
-    {
-        const juce::SpinLock::ScopedLockType sl (specLock);
-        epoch = boundaryEpoch;
-        spec = currentBoundarySpec;
-        spec.designMethod = (selectedMode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
-                                                                         : bbk::parametric::DesignMethod::Minimax;
-
-        // If the newly selected mode's task is still queued behind
-        // others, bump it to the front - the user is waiting on it now,
-        // whatever else was mid-fill can wait its turn.
-        for (auto it = taskQueue.begin(); it != taskQueue.end(); ++it)
-        {
-            if (it->mode == selectedMode && it->epoch == epoch)
-            {
-                auto task = *it;
-                taskQueue.erase (it);
-                taskQueue.push_front (task);
-                break;
-            }
-        }
-    }
-
-    CachedDesign cached;
-    bool haveCached = false;
-    {
-        const juce::SpinLock::ScopedLockType sl (resultLock);
-        const CachedDesign& slot = (selectedMode == DesignMode::PeakEnergy) ? cachePeakEnergy
-                                  : (selectedMode == DesignMode::ProlateBasis) ? cacheProlateBasis
-                                                                                : cacheMinimax;
-        if (slot.valid && slot.epoch == epoch)
-        {
-            cached = slot;
-            haveCached = true;
-        }
-    }
-
-    if (haveCached)
-    {
-        // Instant path: already known for the current boundary - install
-        // and crossfade straight away, no wait, no worker thread
-        // involvement at all.
-        publishResult (spec, selectedMode, cached.result, cached.etaAchieved, cached.concentrationDb);
-        return;
-    }
-
-    notify(); // wake the worker so it picks up the just-reprioritised task promptly
-}
-
-void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec, DesignMode mode,
-                                                     const bbk::parametric::DesignResult& result,
-                                                     double etaAchieved, double concentrationDb)
+void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec,
+                                                     const bbk::parametric::DesignResult& result)
 {
     int version;
     {
@@ -439,9 +257,6 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         {
             latestResult = result;
             latestSpec = spec;
-            latestPeakEnergyOn = (mode == DesignMode::PeakEnergy);
-            latestEtaAchieved = etaAchieved;
-            latestConcentrationDb = concentrationDb;
             latestVersion = version;
             isNewest = true;
         }
@@ -457,8 +272,6 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.attenuationAtCutoffDb = spec.attenuationAtCutoffDb;
         uiSnapshot.stopbandRejectionDb = spec.stopbandRejectionDb;
         uiSnapshot.stopbandMode = spec.stopbandMode;
-        uiSnapshot.designMethod = (mode == DesignMode::ProlateBasis) ? bbk::parametric::DesignMethod::ProlateBasis
-                                                                       : bbk::parametric::DesignMethod::Minimax;
         uiSnapshot.sidelobeDecayRatio = spec.sidelobeDecayRatio;
         uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
         uiSnapshot.tapCount = result.tapCount;
@@ -467,9 +280,6 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.designAttempts = result.designAttempts;
         uiSnapshot.taps = result.taps;
         uiSnapshot.temporal = result.temporal;
-        uiSnapshot.peakEnergyOptimizedOn = (mode == DesignMode::PeakEnergy);
-        uiSnapshot.etaAchieved = etaAchieved;
-        uiSnapshot.concentrationDb = concentrationDb;
     }
 }
 
@@ -499,56 +309,20 @@ void BBKDetachedPoleAudioProcessor::run()
             break;
 
         // Drop it if a newer boundary change has already superseded it -
-        // no point spending time (possibly several seconds, for
-        // Peak-Energy Optimized) designing a spec nobody wants any more.
+        // no point spending time designing a spec nobody wants any more.
         {
             const juce::SpinLock::ScopedLockType sl (specLock);
             if (task.epoch != boundaryEpoch)
                 continue;
         }
 
-        // Peak-Energy Optimized is a completely separate, isolated engine
-        // (PeakEnergyFIR.h) - its result is copied into the same
-        // bbk::parametric::DesignResult shape (both structs share these
-        // field names/meanings by design) so everything downstream - the
-        // cache slots, the crossfade hand-off, the UI snapshot's core
-        // fields - works identically regardless of which mode ran. Only
-        // the two peak-energy-specific fields (eta/concentration) are
-        // carried separately, since ordinary DesignResult has no room for
-        // them.
-        bbk::parametric::DesignResult result;
-        double etaAchieved = 0.0;
-        double concentrationDb = 0.0;
-        if (task.mode == DesignMode::PeakEnergy)
-        {
-            const auto peResult = bbk::peakenergy::designPeakEnergyFIR (task.spec, bbk::detachedpole::maxTapCount);
-            result.taps = peResult.taps;
-            result.tapCount = peResult.tapCount;
-            result.constraintsMet = peResult.constraintsMet;
-            result.achievedStopbandDb = peResult.achievedStopbandDb;
-            result.designAttempts = peResult.designAttempts;
-            result.temporal = peResult.temporal;
-            etaAchieved = peResult.etaAchieved;
-            concentrationDb = peResult.concentrationDb;
-        }
-        else
-        {
-            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount);
+        auto result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount);
 
-            // Minimax/Prolate don't optimise for this the way Peak-Energy
-            // does, but the same eta/concentration numbers can still be
-            // measured after the fact from their taps, so all three modes
-            // report a directly comparable figure (see computeEtaMetrics
-            // above).
-            const auto etaMetrics = computeEtaMetrics (result.taps);
-            etaAchieved = etaMetrics.eta;
-            concentrationDb = etaMetrics.concentrationDb;
-        }
-
-        // Re-check staleness after the (possibly slow) computation - a
-        // newer boundary change may have arrived while this task was
-        // running. If so, the work is simply discarded: not cached (it
-        // would be wrong for the new boundary) and not published.
+        // Re-check staleness after the (possibly slow - see
+        // ParametricFIR.h for how thorough this search now is)
+        // computation - a newer boundary change may have arrived while
+        // this task was running. If so, the work is simply discarded, not
+        // published.
         bool stillCurrent;
         {
             const juce::SpinLock::ScopedLockType sl (specLock);
@@ -557,27 +331,7 @@ void BBKDetachedPoleAudioProcessor::run()
         if (! stillCurrent)
             continue;
 
-        {
-            const juce::SpinLock::ScopedLockType sl (resultLock);
-            CachedDesign& slot = (task.mode == DesignMode::PeakEnergy) ? cachePeakEnergy
-                                : (task.mode == DesignMode::ProlateBasis) ? cacheProlateBasis
-                                                                           : cacheMinimax;
-            slot.valid = true;
-            slot.epoch = task.epoch;
-            slot.result = result;
-            slot.etaAchieved = etaAchieved;
-            slot.concentrationDb = concentrationDb;
-        }
-
-        // Only crossfade this into playback if it's both still the
-        // current boundary AND the mode the user currently has selected -
-        // a cache-fill for a mode nobody's listening to right now just
-        // sits in the cache quietly, ready for an instant switch later.
-        // (selectedModeFromParameters() is re-read fresh here rather than
-        // captured with the task, since the user may have toggled modes
-        // again while this design was running.)
-        if (task.mode == selectedModeFromParameters())
-            publishResult (task.spec, task.mode, result, etaAchieved, concentrationDb);
+        publishResult (task.spec, result);
     }
 }
 

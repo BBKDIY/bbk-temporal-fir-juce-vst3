@@ -144,20 +144,6 @@ enum class StopbandMode
     FreeTransition  // opt-in: [cutoff, Nyquist] is one free transition zone, -stopbandRejectionDb only enforced in a narrow guard band right at Nyquist
 };
 
-// See detail::computeEvenDpssHalfVectors further down for the full
-// rationale. Minimax (default) is the article's own method, unchanged.
-// ProlateBasis restricts the *same* minimax LP to a small span of
-// leading even discrete prolate spheroidal (Slepian) directions instead
-// of the full null-space of free taps - trading some passband/stopband
-// flexibility for taps whose continuous-time (sinc-reconstructed)
-// energy is inherently concentrated near t=0 by construction, rather
-// than only bounding discrete-sample sidelobes as minimax does.
-enum class DesignMethod
-{
-    Minimax,
-    ProlateBasis
-};
-
 struct FilterSpec
 {
     double sampleRateHz = 192000.0;
@@ -165,7 +151,6 @@ struct FilterSpec
     double attenuationAtCutoffDb = 0.5;
     double stopbandRejectionDb = 98.0;
     StopbandMode stopbandMode = StopbandMode::FlatMask;
-    DesignMethod designMethod = DesignMethod::Minimax;
 
     // Distance-dependent penalty on the sidelobe/rho bound: outer tap i
     // (i steps from the main lobe boundary) is bounded by
@@ -177,11 +162,9 @@ struct FilterSpec
     // ringing closer to the centre followed by a quieter tail instead of
     // a flat sidelobe plateau extending to the tap boundary - directly
     // addressing the "ripples closer to the main lobe, then quiet"
-    // shape requested during development. Applies to whichever
-    // DesignMethod is in use (Minimax or ProlateBasis), since both share
-    // the same tryRho/solveForStopEdge machinery below - this field is
-    // an orthogonal modifier to the sidelobe constraint, not a separate
-    // design method itself.
+    // shape requested during development. An orthogonal modifier to the
+    // sidelobe constraint shared by the tryRho/solveForStopEdge
+    // machinery below, not a separate design method itself.
     //
     // Measured directly (192 kHz/20 kHz/0.5 dB/98 dB, 19 taps) across
     // the plugin's actual dense-verify-and-refine pipeline (which a
@@ -475,187 +458,26 @@ inline double amplitudeResponse (const std::vector<double>& a, double freqHz, do
     return sum;
 }
 
-// --- DPSS / prolate-spheroidal basis restriction (opt-in via
-// FilterSpec::designMethod == DesignMethod::ProlateBasis - see the
-// enum's own doc comment above) ---
-//
-// Dense Jacobi eigenvalue solver for a real symmetric matrix (classic
-// cyclic-sweep rotation method - simple and easy to verify
-// independently against known matrices). Returns eigenvalues sorted
-// descending and the matching eigenvectors as columns of eigvecs
-// (eigvecs[row][col]). Matrix sizes here are at most maxTapCount (161),
-// run once per M and only when ProlateBasis mode is selected, so the
-// O(n^3)-per-sweep cost is not a concern in practice.
-inline void jacobiEigenSymmetric (std::vector<std::vector<double>> A,
-                                   std::vector<double>& eigvals,
-                                   std::vector<std::vector<double>>& eigvecs)
-{
-    const int n = static_cast<int> (A.size());
-    std::vector<std::vector<double>> V (static_cast<std::size_t> (n), std::vector<double> (static_cast<std::size_t> (n), 0.0));
-    for (int i = 0; i < n; ++i) V[static_cast<std::size_t> (i)][static_cast<std::size_t> (i)] = 1.0;
-
-    const int maxSweeps = 80;
-    for (int sweep = 0; sweep < maxSweeps; ++sweep)
-    {
-        double off = 0.0;
-        for (int p = 0; p < n; ++p)
-            for (int q = p + 1; q < n; ++q)
-                off += A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)] * A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)];
-        if (off < 1.0e-24) break;
-
-        for (int p = 0; p < n; ++p)
-        {
-            for (int q = p + 1; q < n; ++q)
-            {
-                double apq = A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)];
-                if (std::fabs (apq) < 1.0e-300) continue;
-                double app = A[static_cast<std::size_t> (p)][static_cast<std::size_t> (p)];
-                double aqq = A[static_cast<std::size_t> (q)][static_cast<std::size_t> (q)];
-                double theta = (aqq - app) / (2.0 * apq);
-                double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::fabs (theta) + std::sqrt (theta * theta + 1.0));
-                double c = 1.0 / std::sqrt (t * t + 1.0);
-                double s = t * c;
-
-                A[static_cast<std::size_t> (p)][static_cast<std::size_t> (p)] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-                A[static_cast<std::size_t> (q)][static_cast<std::size_t> (q)] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-                A[static_cast<std::size_t> (p)][static_cast<std::size_t> (q)] = 0.0;
-                A[static_cast<std::size_t> (q)][static_cast<std::size_t> (p)] = 0.0;
-
-                for (int i = 0; i < n; ++i)
-                {
-                    if (i == p || i == q) continue;
-                    double aip = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
-                    double aiq = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
-                    A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)] = c * aip - s * aiq;
-                    A[static_cast<std::size_t> (p)][static_cast<std::size_t> (i)] = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
-                    A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)] = s * aip + c * aiq;
-                    A[static_cast<std::size_t> (q)][static_cast<std::size_t> (i)] = A[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
-                }
-                for (int i = 0; i < n; ++i)
-                {
-                    double vip = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)];
-                    double viq = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)];
-                    V[static_cast<std::size_t> (i)][static_cast<std::size_t> (p)] = c * vip - s * viq;
-                    V[static_cast<std::size_t> (i)][static_cast<std::size_t> (q)] = s * vip + c * viq;
-                }
-            }
-        }
-    }
-
-    std::vector<int> idx (static_cast<std::size_t> (n));
-    for (int i = 0; i < n; ++i) idx[static_cast<std::size_t> (i)] = i;
-    std::sort (idx.begin(), idx.end(), [&] (int x, int y)
-               { return A[static_cast<std::size_t> (x)][static_cast<std::size_t> (x)] > A[static_cast<std::size_t> (y)][static_cast<std::size_t> (y)]; });
-
-    eigvals.assign (static_cast<std::size_t> (n), 0.0);
-    eigvecs.assign (static_cast<std::size_t> (n), std::vector<double> (static_cast<std::size_t> (n), 0.0));
-    for (int k = 0; k < n; ++k)
-    {
-        eigvals[static_cast<std::size_t> (k)] = A[static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])][static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])];
-        for (int i = 0; i < n; ++i)
-            eigvecs[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)] = V[static_cast<std::size_t> (i)][static_cast<std::size_t> (idx[static_cast<std::size_t> (k)])];
-    }
-}
-
-// Discrete prolate spheroidal sequences (DPSS / Slepian sequences), the
-// classical solution to "which length-N sequence has its energy most
-// concentrated within normalised frequency band [-W,W]" (Slepian,
-// Landau & Pollak, 1961-62) - and, by the same duality, whose sinc-
-// interpolated continuous-time reconstruction has its energy most
-// concentrated in time.
-//
-// These are the eigenvectors of the classic "sinc" prolate matrix
-// C[m,n] = sin(2*pi*W*(m-n)) / (pi*(m-n)), C[n,n]=2W - but that matrix
-// is a poor numerical basis to eigendecompose directly: past roughly
-// the Shannon number (2*N*W) its eigenvalues cluster exponentially
-// close together, and a generic eigensolver (this file's Jacobi
-// rotation method included) cannot reliably tell two nearly-identical
-// eigenvalues apart - verified directly: at N=81 the top ~17
-// eigenvalues of C all round to 1.0 at 8-digit precision, and the
-// eigenvectors Jacobi returns for them are essentially arbitrary
-// rotations *within* that near-degenerate subspace rather than the
-// true even/odd DPSS pair, silently corrupting the basis. The standard
-// fix (Slepian 1978; used by every production DPSS implementation,
-// e.g. scipy.signal.windows.dpss's default method) is to instead
-// eigendecompose the *tridiagonal* matrix that provably commutes with
-// C and therefore shares its exact eigenvectors, but whose own
-// eigenvalues are analytically well separated even when C's are
-// exponentially close - so a plain eigensolver applied to T alone
-// recovers the correct, cleanly-separated eigenvectors, already sorted
-// by decreasing concentration (verified directly against C's own
-// eigenvalues at N=19: the parity pattern and relative ordering match
-// exactly, and at N=81/161 - where C's own Jacobi solve was previously
-// shown to mix parities - T's eigenvectors remain cleanly even/odd to
-// machine precision throughout).
-//
-// Returns up to maxK EVEN half-coefficient vectors (length M+1 each,
-// half[m] = the full sequence's value at index M+m), in decreasing
-// concentration order. No eigenvalue-floor cutoff is applied here -
-// unlike the sinc matrix, T's own eigenvalues aren't literally
-// concentration ratios, and more importantly the *right* number of
-// directions to keep depends on what the LP can actually do with them,
-// not a fixed numerical threshold; see attemptDesign's ProlateBasis
-// branch, which grows K until the passband/stopband spec is feasible
-// (or gives up and lets the outer M-search try a larger M, exactly as
-// it already does for the Minimax path).
-inline std::vector<std::vector<double>> computeEvenDpssHalfVectors (int M, double bandwidthNormalized, int maxK)
-{
-    const int N = 2 * M + 1;
-    double W = bandwidthNormalized;
-    if (W <= 0.0) W = 1.0e-6;
-    if (W >= 0.5) W = 0.5 - 1.0e-6;
-
-    std::vector<std::vector<double>> T (static_cast<std::size_t> (N), std::vector<double> (static_cast<std::size_t> (N), 0.0));
-    for (int i = 0; i < N; ++i)
-    {
-        double x = static_cast<double> (N - 1) / 2.0 - static_cast<double> (i);
-        T[static_cast<std::size_t> (i)][static_cast<std::size_t> (i)] = x * x * std::cos (2.0 * M_PI * W);
-        if (i + 1 < N)
-        {
-            double off = static_cast<double> (i + 1) * static_cast<double> (N - 1 - i) / 2.0;
-            T[static_cast<std::size_t> (i)][static_cast<std::size_t> (i + 1)] = off;
-            T[static_cast<std::size_t> (i + 1)][static_cast<std::size_t> (i)] = off;
-        }
-    }
-
-    std::vector<double> eigvals;
-    std::vector<std::vector<double>> eigvecs;
-    jacobiEigenSymmetric (T, eigvals, eigvecs);
-
-    const int center = M; // (N-1)/2 for N=2M+1
-    auto isEven = [&] (int k)
-    {
-        double maxAsym = 0.0;
-        for (int i = 0; i < N; ++i)
-            maxAsym = std::max (maxAsym, std::fabs (eigvecs[static_cast<std::size_t> (i)][static_cast<std::size_t> (k)] - eigvecs[static_cast<std::size_t> (N - 1 - i)][static_cast<std::size_t> (k)]));
-        return maxAsym < 1.0e-6;
-    };
-    auto extractHalf = [&] (int k)
-    {
-        std::vector<double> half (static_cast<std::size_t> (M + 1));
-        for (int m = 0; m <= M; ++m)
-            half[static_cast<std::size_t> (m)] = eigvecs[static_cast<std::size_t> (center + m)][static_cast<std::size_t> (k)];
-        return half;
-    };
-
-    std::vector<std::vector<double>> result;
-    for (int k = 0; k < N && static_cast<int> (result.size()) < maxK; ++k)
-    {
-        if (! isEven (k)) continue;
-        result.push_back (extractHalf (k));
-    }
-
-    return result;
-}
-
 struct AttemptResult
 {
     std::vector<double> a;
     bool feasible = false;
     double worstStopbandDb = 0.0;
+    // Temporal-concentration quality score for this candidate (see
+    // computeTemporalMetrics::rPeakPercent below) - only meaningful when
+    // feasible is true; used to pick the best among several compliant
+    // stopEdge/M candidates instead of just the first one found (see
+    // attemptDesign's candidate sweep and designParametricFIR's M-search).
+    double rPeakPercent = 1.0e300;
 };
 
-inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
+// attemptDesign now sweeps several stopband-edge candidates per M (see
+// the tail of this function) and, per the "search more thoroughly"
+// decision, keeps searching past the first compliant one - overallDeadline
+// (shared across every M and every candidate within it, set by the
+// caller in designParametricFIR) bounds the total worst-case cost so a
+// single M can never run away with the whole search budget.
+inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::steady_clock::time_point overallDeadline)
 {
     const int numVars = M + 1;
     const double Fs = spec.sampleRateHz;
@@ -717,234 +539,6 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             double val = (row == col ? 1.0 : 0.0) - 2.0 * u[static_cast<std::size_t> (row)] * u[static_cast<std::size_t> (col)] / unorm2;
             Z[static_cast<std::size_t> (row) * static_cast<std::size_t> (reducedVars) + static_cast<std::size_t> (col - 1)] = val;
         }
-    }
-
-    // ProlateBasis mode: restrict the design-variable space directly to
-    // linear combinations of the leading even DPSS shapes, a = sum_k
-    // c[k]*dpss[k]. DC=1 (e^T a = 1) becomes a single linear constraint
-    // on those combination coefficients, e^T (sum_k c[k]*dpss[k]) = 1,
-    // i.e. dot(g, c) = 1 where g[k] = e^T dpss[k] - handled by exactly
-    // the same null-space technique used above for the original
-    // numVars-dim e/a problem, just applied to this K-dim g instead:
-    // c0 = g/(g.g) is one particular solution, W is an orthonormal basis
-    // for null(g), and c = c0 + W*w satisfies the constraint for every w.
-    // Mapping back through a = sum_k c[k]*dpss[k] gives a brand new
-    // (a0, Z, reducedVars) triple in the *original* numVars-dim tap
-    // space - which is deliberately NOT built by projecting the DPSS
-    // vectors onto the already-DC-reduced null space from above (an
-    // earlier version of this code did exactly that, and it silently
-    // discarded most of each DPSS vector's shape: the top DPSS vector is
-    // strongly lowpass/positive, so most of its energy IS the DC-aligned
-    // component that projecting onto null(e) throws away, leaving a
-    // subspace with essentially no lowpass character left to design
-    // with). Deriving DC=1 *within* the DPSS combination space instead
-    // keeps each DPSS shape whole.
-    //
-    // How many leading directions K to keep: first find the *minimal*
-    // feasible K (grow K one DPSS direction at a time until a quick
-    // passband+stopband feasibility probe succeeds - no sidelobe/ringing
-    // objective yet, just "does any point in this subspace meet the
-    // spectral spec at all"), then deliberately grow past that minimum
-    // by a fixed multiplier before actually building the basis used for
-    // the real sidelobe-minimising solve below.
-    //
-    // This two-step shape (minimal-feasible, then multiply) is not a
-    // decoration - the minimal-feasible K on its own was measured
-    // directly to be a *bad* choice: at the plugin's own 192 kHz/20 kHz/
-    // 0.5 dB/98 dB default point (19 taps), minimal K leaves the LP so
-    // little room that its best achievable ringing is R_peak=18.2%
-    // (worse than a plain Kaiser window), while simply allowing more of
-    // the *already-computed, already-ranked* DPSS directions - K scaled
-    // up by kGrowthMultiplier at the same spec - lets the same
-    // bisection reach R_peak=6.3% at 1.6x and effectively matches
-    // Minimax by the time K approaches the full available set. Since
-    // feasibility is monotonic in K (each extra DPSS direction strictly
-    // extends, never shrinks, the achievable set - adding one more
-    // direction with coefficient 0 always recovers the previous
-    // solution exactly), any K at or above the minimal feasible one is
-    // guaranteed feasible too, so growing past it needs no further
-    // feasibility re-probing.
-    //
-    // kGrowthMultiplier is a plain heuristic, not derived from an
-    // optimality condition - it trades off "meaningfully restricted
-    // subspace" against "not crippling the achievable ringing", and at
-    // typical operating points pushes K close to (sometimes equal to)
-    // the full available set, at which point ProlateBasis's own
-    // sidelobe-minimising solve converges toward Minimax's. That is an
-    // accepted, known limitation of this basis-restriction approach as
-    // a whole, not something a better multiplier can fully avoid: the
-    // rigorous way to target genuine continuous-time concentration
-    // without this tension is the full QCQP/SOCP reformulation of the
-    // true energy objective, not a restricted linear basis at all - see
-    // the top-of-file discussion. If even the largest available K still
-    // cannot meet the spec, the full null space is used instead for
-    // this M so the caller's usual infeasible-M handling (the outer
-    // M-search simply tries a larger M) still applies.
-    constexpr double kGrowthMultiplier = 2.5;
-    if (spec.designMethod == DesignMethod::ProlateBasis)
-    {
-        const double bandwidthNormalized = fc / Fs;
-        // Request numVars (=M+1), not reducedVars (=M): numVars is the
-        // *true* total count of even half-coefficient directions (the
-        // even eigenvectors of the full N=2M+1 tridiagonal matrix split
-        // M+1 even / M odd, verified directly) - passing reducedVars
-        // here silently excluded the single least-concentrated even
-        // direction, capping ProlateBasis's own null-space dimension at
-        // reducedVars-1 (=M-1) even when K uses everything available,
-        // one short of Minimax's own reducedVars (=M). At the LP's
-        // actual optimum that missing direction can matter a great
-        // deal - measured directly: the gap this left behind was large
-        // enough to be visible on a hardware loopback measurement even
-        // after fixing the separate minimal-K issue above.
-        auto dpssAll = computeEvenDpssHalfVectors (M, bandwidthNormalized, numVars);
-        const int maxAvailableK = static_cast<int> (dpssAll.size());
-
-        // Build (a0, Z, reducedVars) from the first K DPSS directions;
-        // returns false (leaving outputs untouched) if that K is
-        // numerically degenerate for the DC-reduction step.
-        auto buildBasisForK = [&] (int K, std::vector<double>& outA0, std::vector<double>& outZ, int& outReduced) -> bool
-        {
-            if (K < 2) return false;
-            std::vector<double> g (static_cast<std::size_t> (K));
-            for (int k = 0; k < K; ++k)
-            {
-                double dot = 0.0;
-                for (int i = 0; i < numVars; ++i)
-                    dot += e[static_cast<std::size_t> (i)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
-                g[static_cast<std::size_t> (k)] = dot;
-            }
-            double gSq = 0.0;
-            for (double v : g) gSq += v * v;
-            if (gSq <= 1.0e-12) return false;
-
-            std::vector<double> c0 (static_cast<std::size_t> (K));
-            for (int k = 0; k < K; ++k) c0[static_cast<std::size_t> (k)] = g[static_cast<std::size_t> (k)] / gSq;
-
-            double normG = std::sqrt (gSq);
-            std::vector<double> ug = g;
-            double alphaG = (g[0] >= 0.0) ? -normG : normG;
-            ug[0] -= alphaG;
-            double unormG2 = 0.0;
-            for (double v : ug) unormG2 += v * v;
-            if (unormG2 <= 1.0e-15) return false;
-
-            const int newReduced = K - 1;
-            std::vector<double> W (static_cast<std::size_t> (K) * static_cast<std::size_t> (newReduced));
-            for (int col = 1; col < K; ++col)
-                for (int row = 0; row < K; ++row)
-                {
-                    double val = (row == col ? 1.0 : 0.0) - 2.0 * ug[static_cast<std::size_t> (row)] * ug[static_cast<std::size_t> (col)] / unormG2;
-                    W[static_cast<std::size_t> (row) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (col - 1)] = val;
-                }
-
-            outA0.assign (static_cast<std::size_t> (numVars), 0.0);
-            for (int i = 0; i < numVars; ++i)
-            {
-                double sum = 0.0;
-                for (int k = 0; k < K; ++k)
-                    sum += c0[static_cast<std::size_t> (k)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
-                outA0[static_cast<std::size_t> (i)] = sum;
-            }
-            outZ.assign (static_cast<std::size_t> (numVars) * static_cast<std::size_t> (newReduced), 0.0);
-            for (int i = 0; i < numVars; ++i)
-                for (int j = 0; j < newReduced; ++j)
-                {
-                    double sum = 0.0;
-                    for (int k = 0; k < K; ++k)
-                        sum += W[static_cast<std::size_t> (k) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (j)] * dpssAll[static_cast<std::size_t> (k)][static_cast<std::size_t> (i)];
-                    outZ[static_cast<std::size_t> (i) * static_cast<std::size_t> (newReduced) + static_cast<std::size_t> (j)] = sum;
-                }
-            outReduced = newReduced;
-            return true;
-        };
-
-        // Quick feasibility probe for a candidate (a0K, ZK, redK): plain
-        // passband band + a representative near-Nyquist stopband band,
-        // no sidelobe bound - mirrors what solveForStopEdge's own
-        // "noSidelobe" check does, just self-contained here since the
-        // real freqToLinear/tryRho closures below aren't defined yet
-        // (they close over a0/Z/reducedVars themselves, which is
-        // exactly what this probe is deciding).
-        auto probeFeasible = [&] (const std::vector<double>& a0K, const std::vector<double>& ZK, int redK) -> bool
-        {
-            auto freqRow = [&] (double f, std::vector<double>& outZ, double& outConstant)
-            {
-                auto row = cosRow (f);
-                outConstant = 0.0;
-                for (int j = 0; j < numVars; ++j) outConstant += row[static_cast<std::size_t> (j)] * a0K[static_cast<std::size_t> (j)];
-                outZ.assign (static_cast<std::size_t> (redK), 0.0);
-                for (int k = 0; k < redK; ++k)
-                {
-                    double sum = 0.0;
-                    for (int j = 0; j < numVars; ++j)
-                        sum += row[static_cast<std::size_t> (j)] * ZK[static_cast<std::size_t> (j) * static_cast<std::size_t> (redK) + static_cast<std::size_t> (k)];
-                    outZ[static_cast<std::size_t> (k)] = sum;
-                }
-            };
-
-            std::vector<std::vector<double>> A;
-            std::vector<double> b;
-            const int pbPoints = std::max (10, 2 * M);
-            for (int i = 0; i < pbPoints; ++i)
-            {
-                double f = fc * static_cast<double> (i) / static_cast<double> (pbPoints - 1);
-                std::vector<double> z; double c;
-                freqRow (f, z, c);
-                A.push_back (z); b.push_back (1.0 - c);
-                std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
-                A.push_back (neg); b.push_back (c - gainFloor);
-            }
-            double totalAvail = std::max (1.0, nyquist - fc);
-            double guardW = std::min (2000.0, totalAvail * 0.03);
-            guardW = std::max (guardW, 200.0);
-            guardW = std::min (guardW, totalAvail);
-            double probeStopEdge = std::max (fc, nyquist - guardW);
-            const int sbPoints = std::max (25, 4 * M);
-            for (int i = 0; i < sbPoints; ++i)
-            {
-                double f = probeStopEdge + (nyquist - probeStopEdge) * (static_cast<double> (i) + 0.5) / static_cast<double> (sbPoints);
-                std::vector<double> z; double c;
-                freqRow (f, z, c);
-                A.push_back (z); b.push_back (eps - c);
-                std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
-                A.push_back (neg); b.push_back (c + eps);
-            }
-            return solveLPFeasibility (A, b, redK).feasible;
-        };
-
-        int minimalFeasibleK = -1;
-        for (int K = std::min (3, maxAvailableK); K <= maxAvailableK; ++K)
-        {
-            std::vector<double> a0K, ZK; int redK = 0;
-            if (! buildBasisForK (K, a0K, ZK, redK)) continue;
-            if (probeFeasible (a0K, ZK, redK)) { minimalFeasibleK = K; break; }
-        }
-
-        if (minimalFeasibleK > 0)
-        {
-            // Grow past the minimal feasible K (see the comment above) -
-            // feasibility is monotonic in K, so no re-probe is needed;
-            // if buildBasisForK happens to be degenerate exactly at the
-            // grown target (rare - only when its own Householder step
-            // is numerically ill-conditioned), fall back down toward the
-            // minimal feasible K rather than silently keeping the full
-            // null space, since minimalFeasibleK is already known-good.
-            int targetK = std::min (maxAvailableK, static_cast<int> (std::ceil (static_cast<double> (minimalFeasibleK) * kGrowthMultiplier)));
-            std::vector<double> a0K, ZK; int redK = 0;
-            bool built = false;
-            for (int K = targetK; K >= minimalFeasibleK && ! built; --K)
-                built = buildBasisForK (K, a0K, ZK, redK);
-            if (built)
-            {
-                a0 = a0K;
-                Z = ZK;
-                reducedVars = redK;
-            }
-        }
-        // If no K worked at all, fall through and keep the full null
-        // space (already built above) for this M - the outer M-search
-        // treats it exactly like any other infeasible attempt and tries
-        // a larger M, where more DPSS directions become available.
     }
 
     // A "coefficient row": a[i] as a linear function of y (constant term
@@ -1097,7 +691,22 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         double bestRho = 1.0;
         bool everFeasible = false;
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (6);
+        // Per-candidate deadline: kept at the original, proven 6 seconds
+        // (NOT raised, and NOT tied to the shared overallDeadline) -
+        // measured directly that raising this cap, or letting it float up
+        // to whatever remains of a much larger overallDeadline, made a
+        // demanding spec's grid-refinement loop keep grinding through more
+        // rounds under time pressure at large M without actually
+        // converging any better, and could come back with a WORSE (even
+        // spuriously infeasible/degenerate) result than the tighter,
+        // faster-to-bail-out original cap did - non-deterministically,
+        // since it depends on real wall-clock progress through the
+        // bisection/grid-refinement loops, not just on this M's own
+        // difficulty. The "search more thoroughly" budget increase (see
+        // designParametricFIR's own comment) is spent on trying MORE tap
+        // counts within overallDeadline instead, not on letting any single
+        // candidate run longer.
+        const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now() + std::chrono::seconds (6));
 
         const int maxGridRounds = 4;
         int gridRound = 0;
@@ -1109,7 +718,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             {
                 auto noSidelobe = tryRho (curPb, curSb, mainLobeStart, 0.0, false);
                 if (! noSidelobe.feasible)
-                    return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0 };
+                    return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0, 1.0e300 };
                 everFeasible = true;
                 if (bestY.empty()) { bestY = noSidelobe.y; bestRho = 1.0e300; } // safe fallback, overwritten below if bisection succeeds
 
@@ -1169,7 +778,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         }
 
         if (! everFeasible)
-            return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0 };
+            return { std::vector<double> (static_cast<std::size_t> (numVars), 0.0), false, 0.0, 1.0e300 };
 
         auto a = reconstruct (bestY);
         double worstStopbandDb = -1.0e300;
@@ -1191,23 +800,37 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             if (resp > 1.0 + 0.01 || resp < gainFloor - 0.02) pbCompliant = false;
         }
 
-        return { a, sbCompliant && pbCompliant, worstStopbandDb };
+        // Full symmetric tap array, purely to score this candidate's
+        // actual temporal concentration (R_peak) - meeting the spectral
+        // spec is necessary but not sufficient for good ringing
+        // behaviour (see top-of-file comment), and different stopEdge
+        // choices meet the same spec with genuinely different ringing.
+        std::vector<double> fullTaps (static_cast<std::size_t> (2 * M + 1));
+        for (int m = 0; m <= M; ++m)
+        {
+            fullTaps[static_cast<std::size_t> (M - m)] = a[static_cast<std::size_t> (m)];
+            fullTaps[static_cast<std::size_t> (M + m)] = a[static_cast<std::size_t> (m)];
+        }
+        const double rPeak = computeTemporalMetrics (fullTaps, Fs).rPeakPercent;
+
+        return { a, sbCompliant && pbCompliant, worstStopbandDb, rPeak };
     };
 
     double totalAvailable = nyquist - fc;
     if (totalAvailable < 1.0) totalAvailable = 1.0;
+    const double minSpan = totalAvailable * 0.02;
 
-    // FreeTransition mode (see top-of-file comment): skip the paper's
-    // fixed mirror-rule candidate search entirely. solveForStopEdge
-    // already treats [stopEdge, Nyquist] as the only hard-enforced
-    // region and everything below stopEdge as a free transition with no
-    // pointwise frequency constraint of its own (only the passband band
-    // and the sidelobe/rho ringing bound reach that far) - so this mode
-    // is just a single solveForStopEdge call with stopEdge pushed to a
-    // narrow guard band right at Nyquist, reusing the exact same solver.
-    // Guard width: at least 200 Hz (so the LP row and dense-verify sweep
-    // stay numerically meaningful, not a single point), at most 2 kHz or
-    // 3% of the available [cutoff, Nyquist] span, whichever is smaller.
+    // FreeTransition mode (see top-of-file comment): skip the candidate
+    // sweep entirely. solveForStopEdge already treats [stopEdge,
+    // Nyquist] as the only hard-enforced region and everything below
+    // stopEdge as a free transition with no pointwise frequency
+    // constraint of its own (only the passband band and the sidelobe/
+    // rho ringing bound reach that far) - so this mode is just a single
+    // solveForStopEdge call with stopEdge pushed to a narrow guard band
+    // right at Nyquist, reusing the exact same solver. Guard width: at
+    // least 200 Hz (so the LP row and dense-verify sweep stay
+    // numerically meaningful, not a single point), at most 2 kHz or 3%
+    // of the available [cutoff, Nyquist] span, whichever is smaller.
     if (spec.stopbandMode == StopbandMode::FreeTransition)
     {
         double guardWidth = std::min (2000.0, totalAvailable * 0.03);
@@ -1218,21 +841,26 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         return solveForStopEdge (freeStopEdge);
     }
 
-    // Fixed geometric rule (see top-of-file comment): reserve an
-    // enforced-stopband width equal to the passband's own width, clamped
-    // to [5%, 60%] of the available [cutoff, Nyquist] band. This
-    // reproduces the paper's own 20/76 kHz edges exactly at 192 kHz/
-    // 20 kHz cutoff, and generalises sanely to other cutoffs/rates.
-    // At most three solveForStopEdge calls per M (bounded cost, no
-    // open-ended series): the paper's fixed rule first, then a
-    // Kaiser-based fallback, then a near-zero-transition last resort.
-    // An open-ended widening series was tried and rejected: for a
-    // cutoff pushed close to Nyquist (little headroom past cutoff), the
-    // fixed rule's width is unreachable at low M, and repeatedly
-    // re-solving at every step of a geometric series - for every M the
-    // outer search tries, up to the 161-tap cap - is what made an
-    // earlier version of this function hang for such specs.
-
+    // FlatMask mode: the original three geometrically-motivated candidates
+    // (the paper's own fixed mirror rule, a Kaiser/Bellanger transition
+    // estimate, and a near-zero-transition last resort), tried in that
+    // order, returning as soon as one is itself dense-verified compliant -
+    // unchanged from before this pass. FlatMask is not reachable from the
+    // plugin itself (see specFromParameters(), which always uses
+    // FreeTransition below) - it exists purely so Tests/
+    // DSPTestDetachedPole.cpp can keep validating directly against the
+    // source article's own published Case B/C numbers, which are pinned to
+    // this exact mirror-width geometry (its documented "-stopbandRejectionDb
+    // held flat across the WHOLE mirror band" contract). Letting a
+    // "find the lowest R_peak among several widths" search loose here
+    // would silently swap in a far narrower enforced region purely
+    // because it rings less, breaking that contract and the reference
+    // validation that depends on it - the "search more thoroughly"
+    // improvement instead lives one level up, in designParametricFIR's own
+    // M-search below, which benefits FreeTransition (the plugin's actual,
+    // only mode) too and does not have this problem: a larger M under the
+    // SAME stopEdge rule only ever adds design freedom, it never changes
+    // which region is enforced.
     double mirrorEnforcedWidth = fc;
     mirrorEnforcedWidth = std::min (mirrorEnforcedWidth, totalAvailable * 0.6);
     mirrorEnforcedWidth = std::max (mirrorEnforcedWidth, totalAvailable * 0.05);
@@ -1243,15 +871,9 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
         return attempt;
     AttemptResult best = attempt;
 
-    // Fallback: a Kaiser/Bellanger transition-width estimate for the
-    // current M - a safe, always-computable value (used on its own by
-    // an earlier, proven version of this file) for specs where the
-    // fixed mirror rule's width genuinely isn't reachable, chiefly a
-    // cutoff with little headroom left to Nyquist.
     double kaiserTransitionWidth = Fs * (spec.stopbandRejectionDb - 7.95) / (14.36 * static_cast<double> (M));
     if (kaiserTransitionWidth < 0.0) kaiserTransitionWidth = 0.0;
     double kaiserStopEdge = fc + kaiserTransitionWidth;
-    const double minSpan = totalAvailable * 0.02;
     if (kaiserStopEdge > nyquist - minSpan) kaiserStopEdge = nyquist - minSpan;
     if (kaiserStopEdge < fc) kaiserStopEdge = fc;
 
@@ -1264,10 +886,6 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
             best = attempt2;
     }
 
-    // Last resort: enforce essentially the entire remaining band
-    // (minimal transition). If even this fails at the current M, a
-    // larger M is genuinely required - the outer M-search in
-    // designParametricFIR tries that next, not this function.
     double narrowStopEdge = fc + minSpan;
     if (narrowStopEdge < fc) narrowStopEdge = fc;
     if (std::fabs (narrowStopEdge - mirrorStopEdge) > 1.0 && std::fabs (narrowStopEdge - kaiserStopEdge) > 1.0)
@@ -1289,7 +907,17 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M)
 // so every design, regardless of how many taps it actually needed, can be
 // zero-padded to the same fixed length and therefore reports the same
 // host latency no matter which slider values are in use.
-inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount = 161)
+// overallDeadlineSeconds defaults to the plugin's own real budget (see
+// the comment below), but is an explicit parameter - not a hardcoded
+// constant - specifically so Tests/DSPTestDetachedPole.cpp can pass a
+// much shorter one: that file calls this function roughly twenty times
+// to verify correctness (unity DC gain, passband/stopband compliance,
+// symmetry, relative comparisons between specs), none of which need the
+// full thorough search to already be exercised - meeting the spec at
+// all happens quickly, at a small M, regardless of the deadline - and it
+// is meant to stay a fast pre-MSVC/JUCE CI gate, not itself take up to
+// 19 * 180 seconds.
+inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount = 161, double overallDeadlineSeconds = 180.0)
 {
     DesignResult result;
     const int maxM = (maxTapCount - 1) / 2;
@@ -1299,57 +927,106 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     int bestM = M;
     bool foundFeasible = false;
 
-    // Overall wall-clock budget across the *whole* M-search: each
-    // attemptDesign() call already bounds itself to a few seconds per
-    // stopEdge candidate, but a demanding spec (chiefly cutoff pushed
-    // close to Nyquist) can still need many M values in sequence before
-    // one succeeds, each a genuine multi-second minimax solve - measured
-    // up to roughly a minute for the most extreme cases. This caps the
-    // worst case: past the deadline, the search stops and returns the
-    // best (least-far-from-compliant) result found so far, exactly like
-    // hitting the tap-count cap - constraintsMet = false, not a crash or
-    // a silent wrong answer.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (45);
+    // Bounds how much LARGER an M is still tried after the first
+    // compliant one is found (see the loop below), as a multiple of that
+    // first feasible M rather than a fixed step count - measured directly
+    // that leaving this open-ended (continuing all the way to maxM, the
+    // full 80/161 taps) can run into a handful of very large, very slow
+    // LP solves for demanding specs (chiefly cutoff pushed close to
+    // Nyquist, where the first feasible M is already large): each
+    // individual stopEdge candidate is itself bounded (see attemptDesign/
+    // solveForStopEdge's own 6-second cap), but that cap is only checked
+    // BETWEEN simplex solves, not inside one, so a single solve at a
+    // large M can still run for a long time uninterrupted - a cost worth
+    // paying once to find the first compliant design, but not worth
+    // risking repeatedly just to see whether a much larger M rings even
+    // less. A relative (not fixed-count) cap means an easy spec whose
+    // first feasible M is already small (e.g. the calibrated Case B
+    // operating point, M=9) gets several more small/cheap tap counts to
+    // try - which is where the measured real win is, R_peak improving
+    // from 3.33% to well under 2% by M=12, see Tests/
+    // DSPTestDetachedPole.cpp - while a demanding spec whose first
+    // feasible M is already large (e.g. M=37) is only allowed a couple of
+    // proportionally-sized steps further, never the far, much slower tail
+    // toward maxM.
+    constexpr double extraSearchMultiplier = 1.35;
+    int maxMAfterFeasible = maxM;
+
+    // Overall wall-clock budget across the *whole* M-search. This search
+    // now runs alone - Prolate/Peak-Energy have been removed, so there is
+    // nothing else competing for the single background design thread -
+    // and it only ever runs once per boundary change (sample rate,
+    // cutoff, attenuation, stopband target, decay ratio), not on every
+    // audio callback or even every UI frame. That trade (a longer wait
+    // after the last slider move, in exchange for genuinely searching for
+    // the best result rather than stopping at the first one that meets
+    // the spec) is the whole point of this pass - see the "search more
+    // thoroughly" decision. Past the deadline, the search stops and
+    // returns the best result found so far, exactly like hitting the
+    // tap-count cap - constraintsMet = false, not a crash or a silent
+    // wrong answer.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (overallDeadlineSeconds));
 
     while (true)
     {
-        auto attempt = detail::attemptDesign (spec, M);
+        auto attempt = detail::attemptDesign (spec, M, deadline);
         ++result.designAttempts;
-        if (attempt.feasible)
-        {
-            best = attempt;
-            bestM = M;
-            foundFeasible = true;
-            break;
-        }
 
-        // Keep the best (least-far-from-compliant) NON-degenerate attempt
-        // seen across the WHOLE search, not just whichever M was tried
-        // last. attemptDesign() has its own explicit all-zero-taps
-        // fallback for "no candidate survived the grid-refinement loop at
-        // all" at this M (see its own "return
-        // { std::vector<double>(numVars,0.0), false, 0.0 }" points) - a
-        // real design always has a nonzero centre/DC coefficient, so
-        // a[0]==0.0 unambiguously flags that sentinel, not a genuine
-        // (if non-compliant) result. Unconditionally overwriting on every
-        // iteration let a LARGER M's spurious all-zero failure silently
-        // stomp an earlier M's perfectly good design - this is what
-        // surfaced as Minimax/Prolate going completely silent once a
-        // background redesign completes, seen both at 44.1 kHz and at
-        // 192 kHz (where the cutoff-to-Nyquist free-transition zone is
-        // far wider and evidently harder for some M values to satisfy).
+        // attemptDesign() has its own explicit all-zero-taps sentinel for
+        // "no candidate survived the grid-refinement loop at all" at this
+        // M (see its own "return { std::vector<double>(numVars,0.0),
+        // false, 0.0, 1.0e300 }" points) - a real design always has a
+        // nonzero centre/DC coefficient, so a[0]==0.0 unambiguously flags
+        // that sentinel, not a genuine (if non-compliant) result.
         const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
         const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
-        if (best.a.empty()
-            || (bestDegenerate && ! attemptDegenerate)
-            || (! attemptDegenerate && ! bestDegenerate && attempt.worstStopbandDb < best.worstStopbandDb))
+
+        if (attempt.feasible)
         {
-            best = attempt;
-            bestM = M;
+            // Once at least one M has produced a spec-compliant design,
+            // keep searching larger M values (rather than stopping here,
+            // the previous behaviour) and only replace the running best
+            // with a candidate that actually rings LESS (lower R_peak) -
+            // more taps can, but does not always, buy better temporal
+            // concentration at the same spec, so this is a genuine
+            // quality comparison, not just "first success wins".
+            if (! foundFeasible)
+                maxMAfterFeasible = std::min (maxM, static_cast<int> (std::ceil (static_cast<double> (M) * extraSearchMultiplier)));
+            if (! foundFeasible || attempt.rPeakPercent < best.rPeakPercent)
+            {
+                best = attempt;
+                bestM = M;
+            }
+            foundFeasible = true;
         }
+        else if (! foundFeasible)
+        {
+            // No feasible M found yet: keep the best (least-far-from-
+            // compliant) NON-degenerate attempt seen across the search so
+            // far, not just whichever M was tried last. Unconditionally
+            // overwriting on every iteration let a LARGER M's spurious
+            // all-zero failure silently stomp an earlier M's perfectly
+            // good design - this is what previously surfaced as Minimax/
+            // Prolate going completely silent once a background redesign
+            // completed, seen both at 44.1 kHz and at 192 kHz.
+            if (best.a.empty()
+                || (bestDegenerate && ! attemptDegenerate)
+                || (! attemptDegenerate && ! bestDegenerate && attempt.worstStopbandDb < best.worstStopbandDb))
+            {
+                best = attempt;
+                bestM = M;
+            }
+        }
+        // else: already have a feasible result and this larger M's attempt
+        // was NOT feasible (a spurious/degenerate result under time
+        // pressure, or a genuinely infeasible M for a spec that is only
+        // feasible in a narrow M range) - harmless, best simply stays as
+        // the last known-good feasible design; maxMAfterFeasible below
+        // still bounds how much further this can go.
 
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
+        if (foundFeasible && M >= maxMAfterFeasible) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 
