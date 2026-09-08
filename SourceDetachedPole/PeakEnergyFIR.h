@@ -75,6 +75,16 @@ using bbk::parametric::detail::amplitudeResponse;
 using bbk::parametric::detail::LPFeasibilityResult;
 using bbk::parametric::detail::solveLPFeasibility;
 
+// A genuine unity-DC-gain lowpass never legitimately needs a half-
+// coefficient magnitude anywhere near this large - every validated design
+// (Case B/C, the 384 kHz/192 kHz sweeps, etc.) stays well under 1.0.
+// Shared at namespace scope (rather than declared separately inside
+// attemptPeakEnergyDesign() and designPeakEnergyFIR(), as it originally
+// was) so both the search itself (which now bounds its own gamma range
+// with it - see attemptPeakEnergyDesign()) and the final post-hoc sanity
+// gate agree on exactly the same threshold.
+constexpr double maxSaneTapMagnitude = 8.0;
+
 inline double dotv (const std::vector<double>& a, const std::vector<double>& b)
 {
     double s = 0.0;
@@ -318,8 +328,16 @@ inline AttemptResult attemptPeakEnergyDesign (const bbk::parametric::FilterSpec&
     // the best result found so far with constraintsMet left however the
     // last check set it (i.e. it can legitimately come back
     // infeasible=false) rather than hanging the background design
-    // thread indefinitely.
-    const auto overallDeadline = std::chrono::steady_clock::now() + std::chrono::seconds (12);
+    // thread indefinitely. Raised from the original 12s: this whole
+    // design only ever runs once, in the background, after the user
+    // stops moving a slider or switches modes - it never blocks audio
+    // (the previous design keeps playing via the cache until this
+    // publishes) and never repeats per-block, so there is no real cost to
+    // giving a genuinely slow-but-convergent spec (measured directly: a
+    // 0.0 dB attenuation-at-cutoff case that legitimately needed more
+    // than 180s) enough time to actually finish rather than being cut off
+    // with a stale, worse M's result.
+    const auto overallDeadline = std::chrono::steady_clock::now() + std::chrono::seconds (60);
 
     const int numVars = M + 1;
     const double Fs = spec.sampleRateHz;
@@ -688,16 +706,54 @@ inline AttemptResult attemptPeakEnergyDesign (const bbk::parametric::FilterSpec&
     // --- gamma bracket: expand outward from the anchor until infeasible,
     // then bisect each side to the boundary. ---
     double gammaAnchor = reconstructFromY (anchorY)[0];
+
+    // Sane search bound, from Minimax's own completely independent search
+    // at this exact spec/M (already proven reliable and fast - typically
+    // well under a second - even at specs where this engine's own gamma
+    // search struggles badly). solveLPFeasibility above returns an
+    // arbitrary EXTREME VERTEX of the feasible polytope, not a
+    // well-conditioned point - and when the passband/stopband constraints
+    // leave a large unconstrained "free" gap between them (which
+    // FreeTransition does whenever cutoff is a small fraction of Nyquist,
+    // e.g. 18.5 kHz cutoff at 192 kHz), that vertex can be enormously far
+    // from anything resembling a real filter. Measured directly on that
+    // exact spec/M: gammaAnchor came back as 5.26, versus Minimax's own
+    // a[0]=0.507 for the identical spec - and the geometric bracket
+    // expansion below then ran away even further (to gammaLo=-582,
+    // gammaHi=914) before ever finding a point feasibleAt() would call
+    // infeasible, feeding the QP wildly out-of-range trial gammas that
+    // diverge rather than merely converge slowly (independently verified:
+    // raising the QP's own iteration cap 20x made the result WORSE, not
+    // better - energy grew to 1e14 and taps to the millions - which only
+    // makes sense if the search range itself is the problem, not the
+    // solver's iteration budget). Bounding both the anchor and the
+    // boundary search to a generous multiple of Minimax's own reference
+    // keeps every gamma trial physically plausible without narrowing the
+    // TRUE objective - a real optimum for this objective is never anywhere
+    // near this bound (every validated design stays under 1.0), so this
+    // can only ever cut off search territory that was already nonsense.
+    double saneBound = maxSaneTapMagnitude;
+    {
+        bbk::parametric::FilterSpec minimaxSpec = spec;
+        minimaxSpec.designMethod = bbk::parametric::DesignMethod::Minimax;
+        auto minimaxRef = bbk::parametric::detail::attemptDesign (minimaxSpec, M);
+        if (! minimaxRef.a.empty() && minimaxRef.a[0] != 0.0)
+            saneBound = std::min (maxSaneTapMagnitude, std::max (0.1, std::fabs (minimaxRef.a[0]) * 4.0));
+    }
+    if (std::fabs (gammaAnchor) > saneBound)
+        gammaAnchor = std::copysign (saneBound, gammaAnchor);
 #ifdef PEAKENERGY_DEBUG
-    std::printf("[dbg] M=%d chosenStopEdge=%.2f reducedVars=%d wCols=%d gammaAnchor=%.6f feasibleAt(anchor)=%d\n",
-        M, chosenStopEdge, reducedVars, wCols, gammaAnchor, (int) feasibleAt (gammaAnchor, nullptr));
+    std::printf("[dbg] M=%d chosenStopEdge=%.2f reducedVars=%d wCols=%d gammaAnchor=%.6f saneBound=%.6f feasibleAt(anchor)=%d\n",
+        M, chosenStopEdge, reducedVars, wCols, gammaAnchor, saneBound, (int) feasibleAt (gammaAnchor, nullptr));
 #endif
     auto findBoundary = [&] (double startFeasible, double dir) -> double
     {
         double lo = startFeasible, step = std::max (1.0e-3, std::fabs (startFeasible) * 0.05) * dir;
         double hi = lo + step;
         int guard = 0;
-        while (feasibleAt (hi, nullptr) && guard++ < 60) { lo = hi; step *= 1.7; hi = lo + step; }
+        while (feasibleAt (hi, nullptr) && guard++ < 60 && std::fabs (hi) < saneBound) { lo = hi; step *= 1.7; hi = lo + step; }
+        if (std::fabs (hi) >= saneBound)
+            hi = std::copysign (saneBound, dir);
         if (! feasibleAt (hi, nullptr))
         {
             for (int it = 0; it < 40; ++it)
@@ -952,42 +1008,64 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
     int bestM = M;
     bool foundFeasible = false;
 
-    // A genuine unity-DC-gain lowpass never legitimately needs a half-
-    // coefficient magnitude anywhere near this large - every validated
-    // design (Case B/C, the 384 kHz/192 kHz sweeps, etc.) stays well
-    // under 1.0. A solution whose raw taps run into the hundreds (while
-    // still summing to ~1.0 DC gain through massive alternating-sign
-    // cancellation) is numerically degenerate: the gamma-bracket search
-    // picked a point where the sparse feasibility grid is satisfied but
-    // the underlying QP reconstruction is wildly ill-conditioned between
-    // grid points. Such a candidate produces an impulse response that's
-    // effectively a huge, clipping oscillation burst rather than a
-    // lowpass - audible, but not remotely what was asked for - so it must
-    // never be preferred over a modest, merely non-compliant one just
-    // because its eta happens to look good.
-    constexpr double maxSaneTapMagnitude = 8.0;
+    // A solution whose raw taps run into the hundreds (while still summing
+    // to ~1.0 DC gain through massive alternating-sign cancellation) is
+    // numerically degenerate: the gamma-bracket search picked a point
+    // where the sparse feasibility grid is satisfied but the underlying QP
+    // reconstruction is wildly ill-conditioned between grid points. Such a
+    // candidate produces an impulse response that's effectively a huge,
+    // clipping oscillation burst rather than a lowpass - audible, but not
+    // remotely what was asked for - so it must never be preferred over a
+    // modest, merely non-compliant one just because its eta happens to
+    // look good. detail::maxSaneTapMagnitude is the same threshold
+    // attemptPeakEnergyDesign() now also uses to bound its own gamma
+    // search (see its own comment) - kept as one shared constant so the
+    // search and this final gate can never disagree with each other.
+    using detail::maxSaneTapMagnitude;
     auto maxAbsTap = [] (const std::vector<double>& a)
     {
         double m = 0.0;
         for (double v : a) m = std::max (m, std::abs (v));
         return m;
     };
+    // A genuine (if imperfect) lowpass attenuates SOMETHING in the
+    // stopband - this floor is deliberately far short of any real target
+    // (typically -80 to -110 dB), it exists purely to catch the OTHER
+    // failure mode measured directly at 192 kHz once the gamma search's
+    // own bracket was bounded to fix the magnitude blow-up above: a
+    // candidate that is no longer huge in raw tap size (maxAbsTap under
+    // the sanity bound) but whose frequency response doesn't attenuate
+    // the stopband at ALL (worstStopbandDb = +7.8 dB - i.e. the "stopband"
+    // is louder than the passband, not a lowpass in any sense) because the
+    // QP solver hit its own iteration cap on a badly-conditioned solve and
+    // returned an unreliable point. Magnitude alone can't tell a merely
+    // non-compliant-but-real lowpass apart from that kind of QP failure -
+    // this can.
+    constexpr double minAcceptableStopbandDb = -20.0;
+
     // A candidate is "sane" only if it is neither the explicit all-zero
     // sentinel attemptPeakEnergyDesign returns when its own gamma search
     // finds nothing feasible at all (a[0]==0.0 unambiguously flags that,
     // exactly as in ParametricFIR.h's own degenerate-sentinel check - a
     // genuine design always has a nonzero centre tap) NOR a wildly
-    // oversized reconstruction (checked above). Missing the sentinel
-    // check here was measured to let an all-zero, eta=0, feasible=false
-    // "result" silently pass the magnitude test (0.0 <= 8.0) and be
-    // accepted as the running best, producing complete silence instead of
-    // ever reaching the Minimax fallback below.
+    // oversized reconstruction NOR a non-attenuating QP-failure result
+    // (both checked above). Missing the sentinel check here was measured
+    // to let an all-zero, eta=0, feasible=false "result" silently pass the
+    // magnitude test (0.0 <= 8.0) and be accepted as the running best,
+    // producing complete silence instead of ever reaching the Minimax
+    // fallback below.
     auto isSane = [&] (const detail::AttemptResult& r)
     {
-        return ! r.a.empty() && r.a[0] != 0.0 && maxAbsTap (r.a) <= maxSaneTapMagnitude;
+        return ! r.a.empty() && r.a[0] != 0.0 && maxAbsTap (r.a) <= maxSaneTapMagnitude
+            && r.worstStopbandDb <= minAcceptableStopbandDb;
     };
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (60);
+    // Outer M-search budget - raised from the original 60s for the same
+    // reason as attemptPeakEnergyDesign()'s own per-attempt budget just
+    // above: this whole function runs once, in the background, per user
+    // change, never blocking audio, so a slower spec is worth waiting out
+    // rather than settling for whatever M it reached in time.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (240);
 
     while (true)
     {
@@ -1043,48 +1121,89 @@ inline PeakEnergyResult designPeakEnergyFIR (const bbk::parametric::FilterSpec& 
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 
-    // Final safety net: even with the sane/degenerate tracking above, the
-    // gamma-bracket QP search can legitimately never produce a single sane
-    // candidate anywhere in the whole M-search within its time budget -
-    // measured directly at 192 kHz (18.5 kHz cutoff, 0.5 dB, -98 dB, the
-    // plugin's own default spec): every one of the few M values reached
-    // before the 60s deadline came back with taps in the hundreds
-    // (alternating sign, cancelling to unity DC gain), because the QP's
-    // own conditioning degrades badly once the passband/stopband corridor
-    // spans such a large fraction of a very high Nyquist. Rather than ever
-    // send that to the audio thread - it is not a lowpass, it is a huge,
-    // effectively-clipping oscillation burst dressed up with unity DC gain
-    // - fall back to Minimax's own full, independent, already-fixed
-    // designParametricFIR search (NOT a single attemptDesign call at
-    // whatever bestM this engine's own troubled search happened to land
-    // on - that was tried first and measured to fail: bestM here can be a
-    // value Minimax's own stopEdge cascade does not handle well either,
-    // e.g. bestM=12 when Minimax actually converges at M=9 for this exact
-    // spec, silently trading one all-zero/degenerate result for another).
-    // designParametricFIR does its own robust multi-M search from scratch
-    // and is independently verified, at this exact spec, to reach
-    // -97.99 dB compliance at M=9. This guarantees Peak-Energy Optimized
-    // can never sound worse than plain Minimax, even in the worst case.
-    const bool needsFallback = ! isSane (best);
-    if (needsFallback)
+    // Final safety net AND final quality gate, both against the same
+    // Minimax reference. Two distinct failure modes were measured at
+    // 192 kHz (18.5 kHz cutoff, 0.5 dB, -98 dB, the plugin's own default
+    // spec) once the gamma search's own bracket was bounded to stop the
+    // magnitude blow-up (see attemptPeakEnergyDesign()'s own comment):
+    //   1. The QP's own conditioning degrades badly enough at this scale
+    //      that the whole M-search can still end without ever finding a
+    //      single sane candidate at all (isSane() below false) - the
+    //      original silent/garbage-output bug this fallback was written
+    //      for.
+    //   2. Even when a candidate IS sane (bounded magnitude, genuinely
+    //      attenuating, not the QP-failure non-lowpass case isSane() also
+    //      now screens for), it can still be a worse choice than simply
+    //      using Minimax - measured directly: a sane, nearly-compliant
+    //      192 kHz candidate with eta=0.204, versus Minimax's own
+    //      naturally-achieved eta=0.660 for the identical spec. Accepting
+    //      that would defeat the entire point of offering "Peak-Energy
+    //      Optimized" as a mode: a user choosing it is explicitly asking
+    //      for MORE energy concentration than Minimax gives them, not
+    //      less, so a result that concentrates energy WORSE than Minimax
+    //      is strictly inferior to Minimax from every angle and must never
+    //      be preferred over it.
+    // Both cases are resolved the same way: fall back to Minimax's own
+    // full, independent, already-fixed designParametricFIR search (NOT a
+    // single attemptDesign call at whatever bestM this engine's own
+    // troubled search happened to land on - that was tried first and
+    // measured to fail: bestM here can be a value Minimax's own stopEdge
+    // cascade does not handle well either, e.g. bestM=12 when Minimax
+    // actually converges at M=9 for this exact spec, silently trading one
+    // all-zero/degenerate result for another). designParametricFIR does
+    // its own robust multi-M search from scratch and is independently
+    // verified, at this exact spec, to reach -97.99 dB compliance and
+    // eta=0.660 at M=9. This guarantees Peak-Energy Optimized can never
+    // sound worse, or concentrate energy worse, than plain Minimax, even
+    // in the worst case - the two possible outcomes for the user are
+    // "genuinely better than Minimax" or "identical to Minimax", never
+    // "worse than Minimax".
+    const bool sane = isSane (best);
+    bool useFallback = ! sane;
+
+    bbk::parametric::DesignResult minimaxFallback;
+    double minimaxEta = 0.0;
+    bool haveMinimaxFallback = false;
+    if (sane)
     {
         bbk::parametric::FilterSpec minimaxSpec = spec;
         minimaxSpec.designMethod = bbk::parametric::DesignMethod::Minimax;
-        auto fallback = bbk::parametric::designParametricFIR (minimaxSpec, maxTapCount);
-        if (! fallback.taps.empty())
+        minimaxFallback = bbk::parametric::designParametricFIR (minimaxSpec, maxTapCount);
+        if (! minimaxFallback.taps.empty())
         {
-            const int centre = (fallback.tapCount - 1) / 2;
+            haveMinimaxFallback = true;
             double sumSq = 0.0;
-            for (double v : fallback.taps) sumSq += v * v;
-            const double centreVal = fallback.taps[static_cast<std::size_t> (centre)];
+            for (double v : minimaxFallback.taps) sumSq += v * v;
+            const int centre = (minimaxFallback.tapCount - 1) / 2;
+            const double centreVal = minimaxFallback.taps[static_cast<std::size_t> (centre)];
+            minimaxEta = (sumSq > 0.0) ? (centreVal * centreVal) / sumSq : 0.0;
+            if (best.eta <= minimaxEta)
+                useFallback = true;
+        }
+    }
 
-            result.taps = fallback.taps;
-            result.tapCount = fallback.tapCount;
-            result.constraintsMet = fallback.constraintsMet;
-            result.achievedStopbandDb = fallback.achievedStopbandDb;
+    if (useFallback)
+    {
+        if (! haveMinimaxFallback)
+        {
+            bbk::parametric::FilterSpec minimaxSpec = spec;
+            minimaxSpec.designMethod = bbk::parametric::DesignMethod::Minimax;
+            minimaxFallback = bbk::parametric::designParametricFIR (minimaxSpec, maxTapCount);
+        }
+        if (! minimaxFallback.taps.empty())
+        {
+            double sumSq = 0.0;
+            for (double v : minimaxFallback.taps) sumSq += v * v;
+            const int centre = (minimaxFallback.tapCount - 1) / 2;
+            const double centreVal = minimaxFallback.taps[static_cast<std::size_t> (centre)];
+
+            result.taps = minimaxFallback.taps;
+            result.tapCount = minimaxFallback.tapCount;
+            result.constraintsMet = minimaxFallback.constraintsMet;
+            result.achievedStopbandDb = minimaxFallback.achievedStopbandDb;
             result.etaAchieved = (sumSq > 0.0) ? (centreVal * centreVal) / sumSq : 0.0;
             result.concentrationDb = (result.etaAchieved > 0.0) ? 10.0 * std::log10 (result.etaAchieved) : -300.0;
-            result.temporal = bbk::parametric::computeTemporalMetrics (fallback.taps, spec.sampleRateHz);
+            result.temporal = bbk::parametric::computeTemporalMetrics (minimaxFallback.taps, spec.sampleRateHz);
             return result;
         }
         // fallback.taps empty is not expected (designParametricFIR always

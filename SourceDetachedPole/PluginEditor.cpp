@@ -322,11 +322,25 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // live and misleading.
     attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
 
-    // Prolate/DPSS Basis and Sidelobe Decay are no-ops once Peak-Energy
-    // Optimized is on - designPeakEnergyFIR() consults neither (see
-    // PeakEnergyFIR.h) - so grey both out rather than leave them looking
-    // live, same principle as the attenuation slider above.
-    prolateBasisButton.setEnabled (! snap.peakEnergyOptimizedOn);
+    // Sidelobe Decay is a no-op once Peak-Energy Optimized is on -
+    // designPeakEnergyFIR() doesn't consult it (see PeakEnergyFIR.h) - so
+    // grey it out rather than leave it looking live, same principle as the
+    // attenuation slider above.
+    //
+    // Prolate/DPSS Basis is a no-op in the same sense, but its own
+    // checkbox is deliberately NEVER disabled (unlike the slider above):
+    // it is the other half of a mutually-exclusive pair with Peak-Energy
+    // Optimized (see enforceModeExclusivity() in PluginProcessor.cpp,
+    // which already turns either one off the instant the other is turned
+    // on). Disabling it here used to make that exclusivity asymmetric in
+    // the worst way - clicking Peak-Energy while Prolate was on correctly
+    // switched straight over, but going the other way (Prolate while
+    // Peak-Energy was on) silently did nothing, because a disabled JUCE
+    // button simply swallows the click. The user then had to uncheck
+    // Peak-Energy first, purely to re-enable the Prolate checkbox, before
+    // they could check it - two clicks and a re-render for what should be
+    // one. Leaving it always enabled makes both directions a single click,
+    // exactly like the Peak-Energy button's own always-enabled state.
     sidelobeDecaySlider.setEnabled (! snap.peakEnergyOptimizedOn);
 
     juce::String text;
