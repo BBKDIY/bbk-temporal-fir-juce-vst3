@@ -561,16 +561,20 @@ int main()
         const double worst = denseWorstDbInBand (caseB.taps, caseBSpec.sampleRateHz, guard.first, guard.second);
         check (worst <= -97.5, "[Case B calibrated] worst-case stopband over 94-96 kHz meets the article's -97.98 dB");
 
-        // The M-search now compares candidate tap counts on settling time
-        // (T_0.1%), not R_peak (see ParametricFIR.h's own comment on why:
-        // a lower R_peak does not always mean faster settling, measured
-        // directly at this exact operating point). With that change this
-        // search correctly recognizes that the article's own 19 taps
-        // already settles as fast as any larger M does here, so it no
-        // longer trades away settling time for a marginally better R_peak
-        // - check settling directly, at least as tight a bound as R_peak/
-        // E_ZC get, rather than leaving it unchecked.
-        check (caseB.temporal.settlingSampleSpan <= 18, "[Case B calibrated] settling span is at least as good as the article's published 18-sample T_0.1%");
+        // The M-search compares candidate tap counts primarily on R_peak
+        // (see ParametricFIR.h's own comment on why - settling span alone
+        // is structurally biased toward whichever M is smallest, since a
+        // shorter filter's impulse response is trivially zero, and so
+        // "settled", beyond its own shorter length), with settling time
+        // only breaking near-ties. At this exact operating point that
+        // means the search is free to spend MORE taps than the article's
+        // own 19 if doing so meaningfully lowers R_peak further - measured
+        // directly, it does (down to ~1.5%, well under the article's
+        // 3.33%), at the cost of a longer settling span than the article's
+        // 18 samples. That is the intended, correct trade-off (lower
+        // ringing over faster settling), not a regression, so settling is
+        // only printed here for visibility, not asserted against the
+        // article's own figure.
         check (caseB.temporal.rPeakPercent <= 3.33 + 0.5, "[Case B calibrated] R_peak is at least as good as the article's published 3.33%");
         check (caseB.temporal.eZcPercent <= 0.61 + 0.15, "[Case B calibrated] E_ZC is at least as good as the article's published 0.61%");
         check (caseB.temporal.centerTapPercent > 0.0 && caseB.temporal.centerTapPercent < 100.0,
@@ -578,6 +582,41 @@ int main()
 
         std::printf ("  [Case B calibrated] atten=%.4fdB taps=%d worst(94-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% settling=%.5fms centerTap=%.3f%% (article: 19 taps, 3.33%%, 0.61%%, 0.094ms)\n",
             caseBSpec.attenuationAtCutoffDb, caseB.tapCount, worst, caseB.temporal.rPeakPercent, caseB.temporal.eZcPercent, caseB.temporal.settlingMs, caseB.temporal.centerTapPercent);
+    }
+
+    // --- Regression: relaxing the stopband target must never make the ---
+    // chosen design WORSE. Directly reproduces a real bug report: at
+    // 44.1kHz/18500Hz/0.05dB, tightening from 80dB to 95dB min. stopband
+    // rejection was found to make the *chosen* design's R_peak visibly
+    // BETTER (6.24% at 65 taps) than the looser 80dB target's own choice
+    // (9.75% at 43 taps) - backwards, since any design compliant with a
+    // deeper (95dB) target is trivially compliant with a shallower (80dB)
+    // one too, so the achievable best at 80dB can only be as good or
+    // better than at 95dB, never worse. Root cause: the M-search used to
+    // compare candidates on settling span alone, which is structurally
+    // capped by (and so biased toward) whichever M is smallest, and its
+    // search window was sized relative to the first feasible M - a
+    // looser target makes a much smaller M feasible first, shrinking that
+    // window before it ever reaches back to the larger, genuinely
+    // lower-R_peak design. Fixed by comparing on R_peak primarily (with
+    // settling only breaking near-ties) and by extending the search based
+    // on whether R_peak keeps improving, not a fixed window relative to
+    // the first feasible M.
+    {
+        FilterSpec tight { 44100.0, 18500.0, 0.05, 95.0 };
+        tight.stopbandMode = StopbandMode::FreeTransition;
+        FilterSpec loose = tight;
+        loose.stopbandRejectionDb = 80.0;
+
+        auto tightResult = designParametricFIR (tight, maxTapCount, kTestDeadlineSeconds);
+        auto looseResult = designParametricFIR (loose, maxTapCount, kTestDeadlineSeconds);
+
+        check (tightResult.constraintsMet && looseResult.constraintsMet,
+            "[stopband monotonicity] both the 95dB and 80dB targets report their own targets as met");
+        check (looseResult.temporal.rPeakPercent <= tightResult.temporal.rPeakPercent + 0.5,
+            "[stopband monotonicity] relaxing 95dB to 80dB does not make the chosen design's R_peak worse");
+        std::printf ("  [stopband monotonicity] 95dB: taps=%d R_peak=%.3f%%  |  80dB: taps=%d R_peak=%.3f%%\n",
+            tightResult.tapCount, tightResult.temporal.rPeakPercent, looseResult.tapCount, looseResult.temporal.rPeakPercent);
     }
 
     // --- 384 kHz operating point (upstream upsampling scenario) -----------

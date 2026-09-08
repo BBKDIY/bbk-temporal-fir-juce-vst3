@@ -1049,30 +1049,43 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     int bestM = M;
     bool foundFeasible = false;
 
-    // Bounds how much LARGER an M is still tried after the first
-    // compliant one is found (see the loop below), as a multiple of that
-    // first feasible M rather than a fixed step count - measured directly
-    // that leaving this open-ended (continuing all the way to maxM, the
-    // full 80/161 taps) can run into a handful of very large, very slow
-    // LP solves for demanding specs (chiefly cutoff pushed close to
-    // Nyquist, where the first feasible M is already large): each
-    // individual stopEdge candidate is itself bounded (see attemptDesign/
-    // solveForStopEdge's own 6-second cap), but that cap is only checked
-    // BETWEEN simplex solves, not inside one, so a single solve at a
-    // large M can still run for a long time uninterrupted - a cost worth
-    // paying once to find the first compliant design, but not worth
-    // risking repeatedly just to see whether a much larger M settles even
-    // faster. A relative (not fixed-count) cap means an easy spec whose
-    // first feasible M is already small (e.g. the calibrated Case B
-    // operating point, M=9) gets several more small/cheap tap counts to
-    // try - which is where the measured real win is (see Tests/
-    // DSPTestDetachedPole.cpp for the exact before/after numbers) - while
-    // a demanding spec whose first
-    // feasible M is already large (e.g. M=37) is only allowed a couple of
-    // proportionally-sized steps further, never the far, much slower tail
-    // toward maxM.
-    constexpr double extraSearchMultiplier = 1.35;
-    int maxMAfterFeasible = maxM;
+    // How the search decides when to stop looking for a BETTER M once at
+    // least one feasible one has been found (see the loop below). This was
+    // previously a fixed relative window (try up to 1.35x the first
+    // feasible M, then give up) - measured directly to cause a real
+    // regression: loosening the stopband target (e.g. 95dB -> 80dB) makes
+    // a much SMALLER M newly feasible, which shrinks this window and can
+    // make the search stop before ever re-trying the larger M that gave
+    // the better (lower-R_peak) result under the tighter target - even
+    // though that exact same larger-M design remains fully valid (and
+    // objectively better) under the looser target too, since a design
+    // compliant with a deeper stopband requirement is trivially compliant
+    // with a shallower one. Relaxing a constraint can only ever enlarge
+    // the feasible set, so the best achievable result should never get
+    // worse - the search now reflects that directly: instead of a window
+    // sized off the first feasible M, it keeps extending as long as larger
+    // M's keep meaningfully improving R_peak (see the comparison below),
+    // and only gives up after a run of tries that fail to do so. The
+    // shared overall deadline below remains the hard backstop against
+    // runaway time on demanding specs, same as before.
+    constexpr int maxNonImprovingAttempts = 3;
+    int nonImprovingAttempts = 0;
+
+    // Separate, harder cap: even while R_peak keeps *technically* clearing
+    // the "meaningfully better" bar below, stop chasing it after this many
+    // extra attempts past the first feasible M. Measured directly that a
+    // loose spec (plenty of stopband headroom to spare) can keep finding
+    // another >=10%-relative R_peak reduction for many consecutive larger
+    // M's in a row - each one individually reasonable, but each also a
+    // full LP solve at a growing tap count, and the run of them together
+    // can still eat the whole per-spec deadline chasing steadily smaller
+    // absolute gains. This bounds the worst case to a fixed, small number
+    // of extra solves regardless of how persistently R_peak keeps
+    // improving, while still comfortably covering the jump the original
+    // monotonicity bug fix needs (first-feasible to the genuinely better
+    // M is a handful of the search's own M-step increments apart).
+    constexpr int maxExtraAttemptsAfterFeasible = 8;
+    int extraAttemptsAfterFeasible = 0;
 
     // Overall wall-clock budget across the *whole* M-search. This search
     // now runs alone - Prolate/Peak-Energy have been removed, so there is
@@ -1102,28 +1115,89 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // that sentinel, not a genuine (if non-compliant) result.
         const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
         const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
+        const bool wasFeasibleBefore = foundFeasible;
+        if (wasFeasibleBefore)
+            ++extraAttemptsAfterFeasible;
 
         if (attempt.feasible)
         {
             // Once at least one M has produced a spec-compliant design,
-            // keep searching larger M values (rather than stopping here,
-            // the previous behaviour) and only replace the running best
-            // with a candidate that actually SETTLES FASTER (shorter
-            // T_0.1% sample span) - more taps can, but does not always,
-            // buy a shorter settling time at the same spec, so this is a
-            // genuine quality comparison, not just "first success wins".
-            // Compared on settlingSampleSpan, not rPeakPercent (see
-            // AttemptResult's own comment): the two do not always move
-            // together, and settling time is the metric this plugin
-            // exists to minimize, so it is what should drive this choice
-            // directly.
+            // keep searching larger M values (rather than stopping here)
+            // for one that's genuinely BETTER. Primary criterion is
+            // R_peak (ringing) - the paper's own quality measure - not
+            // settling span: a filter's T_0.1% settling span can never
+            // exceed roughly half its own tap count (everything beyond
+            // the last tap is exactly zero, trivially "settled"), so
+            // comparing settling span *across different M* structurally
+            // favours whichever M is smallest, regardless of how much it
+            // is actually ringing relative to its own length - this is
+            // what caused the exact regression this fixes (loosening a
+            // stopband target let a much shorter, higher-ringing M win
+            // outright: R_peak went from 6.24% at 65 taps/95dB to 9.75%
+            // at 43 taps/80dB, even though the 65-tap/95dB design remains
+            // fully compliant, and strictly better, at 80dB too - nothing
+            // about relaxing that constraint should make the achievable
+            // result worse). Settling span is now only a tie-breaker,
+            // used when R_peak is close enough to be a wash - this is
+            // what "shorter taps given the same other metrics" actually
+            // means.
+            //
+            // The bar for "meaningfully better" scales with the current
+            // best R_peak itself (an absolute floor of 0.05 points, or
+            // 10% relative, whichever is larger) rather than a fixed tiny
+            // absolute amount - measured directly that a fixed 0.05-point
+            // floor let almost every larger M count as "improving" by a
+            // sliver, since more taps very often buys at least a small
+            // R_peak reduction even once the curve has genuinely
+            // flattened. That kept resetting the patience counter below
+            // and turned what should be a quick search into one that rode
+            // every demanding spec's own deadline (each large-M solve
+            // itself is not free - see attemptDesign's own comments) -
+            // a real, measured regression (multiple specs in this test
+            // suite alone went from single-digit-second designs to
+            // hitting their full per-spec deadline). Requiring a
+            // proportionally larger step before it counts keeps the fix
+            // for the original monotonicity bug (that needed a 36%
+            // relative jump, 9.75% to 6.24%, comfortably over this bar)
+            // while letting the search give up quickly once further gains
+            // are genuinely marginal.
+            constexpr double rPeakImprovementFloorAbs = 0.05; // percentage points
+            constexpr double rPeakImprovementRel = 0.10; // 10%
+            bool improved = false;
             if (! foundFeasible)
-                maxMAfterFeasible = std::min (maxM, static_cast<int> (std::ceil (static_cast<double> (M) * extraSearchMultiplier)));
-            if (! foundFeasible || attempt.settlingSampleSpan < best.settlingSampleSpan)
             {
                 best = attempt;
                 bestM = M;
+                improved = true;
             }
+            else
+            {
+                const double requiredImprovement = std::max (rPeakImprovementFloorAbs, best.rPeakPercent * rPeakImprovementRel);
+                const double rPeakDelta = best.rPeakPercent - attempt.rPeakPercent; // >0 => attempt is better
+                if (rPeakDelta > requiredImprovement)
+                {
+                    best = attempt;
+                    bestM = M;
+                    improved = true;
+                }
+                else if (rPeakDelta > -requiredImprovement
+                         && attempt.settlingSampleSpan < best.settlingSampleSpan)
+                {
+                    // Near-tie on R_peak (within that same scaled band,
+                    // not just a fixed absolute amount) - use settling as
+                    // the tie-break. Not counted as a "real" improvement
+                    // for the patience counter below, so a string of
+                    // near-identical R_peak values (which any small
+                    // settling gain would otherwise reset) can't
+                    // indefinitely postpone giving up the search.
+                    best = attempt;
+                    bestM = M;
+                }
+            }
+            if (improved)
+                nonImprovingAttempts = 0;
+            else if (foundFeasible)
+                ++nonImprovingAttempts;
             foundFeasible = true;
         }
         else if (! foundFeasible)
@@ -1144,15 +1218,25 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
                 bestM = M;
             }
         }
-        // else: already have a feasible result and this larger M's attempt
-        // was NOT feasible (a spurious/degenerate result under time
-        // pressure, or a genuinely infeasible M for a spec that is only
-        // feasible in a narrow M range) - harmless, best simply stays as
-        // the last known-good feasible design; maxMAfterFeasible below
-        // still bounds how much further this can go.
+        else if (foundFeasible)
+        {
+            // Already have a feasible result and this larger M's attempt
+            // was NOT feasible (a spurious/degenerate result under time
+            // pressure, or a genuinely infeasible M for a spec that is
+            // only feasible in a narrow M range) - best simply stays as
+            // the last known-good feasible design. This DOES count toward
+            // nonImprovingAttempts: measured directly that leaving it
+            // uncounted let a run of infeasible/degenerate larger M's
+            // (which cost a full, sometimes slow, LP solve each - see
+            // attemptDesign's own comments) pass for free against the
+            // patience counter, so the search kept paying for several
+            // more of them one M-step at a time instead of giving up
+            // once it was clearly past the design's feasible range.
+            ++nonImprovingAttempts;
+        }
 
         // FlatMask-only safety valve: the "keep searching past the first
-        // feasible M, prefer whichever settles fastest" logic above
+        // feasible M, prefer whichever has the lower R_peak" logic above
         // is only sound when every M's own "feasible" flag means compliance
         // over the SAME enforced-stopband width - true for FreeTransition
         // (a single fixed guard-band rule, unchanged by M - see attemptDesign's
@@ -1183,7 +1267,8 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
-        if (foundFeasible && M >= maxMAfterFeasible) break;
+        if (foundFeasible && nonImprovingAttempts >= maxNonImprovingAttempts) break;
+        if (foundFeasible && extraAttemptsAfterFeasible >= maxExtraAttemptsAfterFeasible) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 

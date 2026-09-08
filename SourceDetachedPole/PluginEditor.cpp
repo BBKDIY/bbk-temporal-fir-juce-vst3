@@ -298,8 +298,9 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
          << "Design method: Minimax - the article's own minimum-peak-sidelobe method, searched "
-            "thoroughly across tap counts and stopband-edge candidates for the best (fastest-"
-            "settling) compliant result (see the design-attempts count below)\n"
+            "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
+            "ringing, shortest-settling as tie-break) compliant result (see the design-attempts "
+            "count below)\n"
          << "Sidelobe decay: " << juce::String (snap.sidelobeDecayRatio, 3)
          << (snap.sidelobeDecayRatio >= 0.999
               ? " (flat, no decay - unchanged behaviour)"
