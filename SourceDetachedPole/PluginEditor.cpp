@@ -325,7 +325,10 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
          << "Temporal concentration (from the article's own metrics):\n"
          << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "
          << juce::String (snap.temporal.eZcPercent, 3) << "%  |  T_0.1% "
-         << juce::String (snap.temporal.settlingMs, 4) << " ms (" << snap.temporal.settlingSampleSpan << " samples)\n";
+         << juce::String (snap.temporal.settlingMs, 4) << " ms (" << snap.temporal.settlingSampleSpan << " samples)\n"
+         << "  Center-tap gain " << juce::String (snap.temporal.centerTapPercent, 2)
+         << "% (share of a non-oversampling DAC's instantaneous impulse kept in the single "
+            "centre sample; the rest is time-smeared across the other taps)\n";
 
     if (snap.constraintsMet)
     {

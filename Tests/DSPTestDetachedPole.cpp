@@ -438,8 +438,17 @@ int main()
         checkNear (tm.eZcPercent, 0.4839, 0.01, "[Case C reference] computed E_ZC matches the paper's 0.4839%");
         check (tm.settlingSampleSpan == 18, "[Case C reference] computed T_0.1% sample span matches the paper's 18 intervals");
         checkNear (tm.settlingMs, 0.09375, 0.001, "[Case C reference] computed T_0.1% matches the paper's 0.09375 ms");
-        std::printf ("  [Case C reference] R_peak=%.4f%% E_ZC=%.4f%% T0.1%%=%.5fms (span=%d) groupDelay=%.5fms\n",
-            tm.rPeakPercent, tm.eZcPercent, tm.settlingMs, tm.settlingSampleSpan, tm.groupDelayMs);
+        // centerTapPercent is our own addition, not from the paper - sanity-check it
+        // against the coefficients directly: any real, unity-DC lowpass necessarily
+        // spreads some energy across its non-centre taps, so the centre tap alone
+        // must sit strictly between 0% and 100% of a NOS DAC's instantaneous impulse.
+        // (This particular published coefficient set has no sidelobe decay applied,
+        // so it lands around 41% - well below Case B's calibrated ~55% - confirming
+        // the metric tracks real per-design ringing differences, not a fixed constant.)
+        check (tm.centerTapPercent > 0.0 && tm.centerTapPercent < 100.0,
+            "[Case C reference] center-tap gain sits strictly between 0% and 100% of a NOS DAC's instantaneous impulse");
+        std::printf ("  [Case C reference] R_peak=%.4f%% E_ZC=%.4f%% T0.1%%=%.5fms (span=%d) groupDelay=%.5fms centerTap=%.3f%%\n",
+            tm.rPeakPercent, tm.eZcPercent, tm.settlingMs, tm.settlingSampleSpan, tm.groupDelayMs, tm.centerTapPercent);
 
         // Now hand the *same* practical spec to this engine's own solver
         // (not the paper's coefficients) and confirm it independently
@@ -564,9 +573,11 @@ int main()
         check (caseB.temporal.settlingSampleSpan <= 18, "[Case B calibrated] settling span is at least as good as the article's published 18-sample T_0.1%");
         check (caseB.temporal.rPeakPercent <= 3.33 + 0.5, "[Case B calibrated] R_peak is at least as good as the article's published 3.33%");
         check (caseB.temporal.eZcPercent <= 0.61 + 0.15, "[Case B calibrated] E_ZC is at least as good as the article's published 0.61%");
+        check (caseB.temporal.centerTapPercent > 0.0 && caseB.temporal.centerTapPercent < 100.0,
+            "[Case B calibrated] center-tap gain sits strictly between 0% and 100% of a NOS DAC's instantaneous impulse");
 
-        std::printf ("  [Case B calibrated] atten=%.4fdB taps=%d worst(94-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% settling=%.5fms (article: 19 taps, 3.33%%, 0.61%%, 0.094ms)\n",
-            caseBSpec.attenuationAtCutoffDb, caseB.tapCount, worst, caseB.temporal.rPeakPercent, caseB.temporal.eZcPercent, caseB.temporal.settlingMs);
+        std::printf ("  [Case B calibrated] atten=%.4fdB taps=%d worst(94-96kHz)=%.3fdB R_peak=%.3f%% E_ZC=%.4f%% settling=%.5fms centerTap=%.3f%% (article: 19 taps, 3.33%%, 0.61%%, 0.094ms)\n",
+            caseBSpec.attenuationAtCutoffDb, caseB.tapCount, worst, caseB.temporal.rPeakPercent, caseB.temporal.eZcPercent, caseB.temporal.settlingMs, caseB.temporal.centerTapPercent);
     }
 
     // --- 384 kHz operating point (upstream upsampling scenario) -----------

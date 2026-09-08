@@ -214,6 +214,23 @@ struct FilterSpec
 // 8.4): the exact published 19-tap coefficients reproduce the paper's
 // stated 3.5007% R_peak, 0.4839% E_ZC, and an 18-sample-interval
 // T_0.1% span (0.09375 ms at 192 kHz) - see Tests/DSPTestDetachedPole.cpp.
+//
+// centerTapPercent is not from the paper: it is the fraction of the
+// filter's total (unity, by construction - see designParametricFIR) DC
+// gain that arrives in the single centre/peak sample itself, as a
+// percentage. A true non-oversampling DAC with no reconstruction filter
+// at all has an impulse response that IS a single sample, so 100% of its
+// output for a given input sample arrives at that one instant -
+// centerTapPercent is how close any given design of ours gets to that
+// same instantaneous delivery, versus spreading it across the rest of
+// the impulse response to achieve the requested anti-aliasing. It is a
+// direct, cheap-to-compute proxy for the "transients feel averaged/less
+// punchy" perceptual trade-off inherent to any reconstruction filtering:
+// lower values mean more of the original instant is smeared into
+// neighbouring samples, higher values (closer to 100%) mean less of it
+// is. This is a genuinely different question from R_peak/E_ZC above,
+// which describe energy OUTSIDE the main lobe - centerTapPercent
+// describes how much sits, specifically, in the one centre sample.
 struct TemporalMetrics
 {
     double rPeakPercent = 0.0;
@@ -221,6 +238,7 @@ struct TemporalMetrics
     double settlingMs = 0.0;
     int settlingSampleSpan = 0;
     double groupDelayMs = 0.0;
+    double centerTapPercent = 0.0;
 };
 
 inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, double sampleRateHz)
@@ -237,6 +255,12 @@ inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, 
         if (v > peakAbs) { peakAbs = v; peakIdx = i; }
     }
     if (peakAbs <= 0.0) return m;
+
+    // See TemporalMetrics::centerTapPercent's own comment above. Uses the
+    // signed tap value (not peakAbs) deliberately - a well-formed unity-DC
+    // lowpass always has a positive centre tap in practice, but this
+    // should report the true signed reality rather than assume it.
+    m.centerTapPercent = taps[static_cast<std::size_t> (peakIdx)] * 100.0;
 
     const double peakSign = (taps[static_cast<std::size_t> (peakIdx)] >= 0.0) ? 1.0 : -1.0;
 
@@ -830,10 +854,48 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
             if (violPb.empty() && violSb.empty())
                 break;
 
+            // Greedily thin the violation list before injecting: violPb/
+            // violSb come from a linear dense sweep (fc/dense and (nyquist-
+            // stopEdge)/dense resolution respectively), so a genuinely
+            // violating REGION (not just a single frequency) shows up as a
+            // long run of consecutive, near-identical entries - taking the
+            // first 20/40 in sweep order can inject a cluster of points
+            // spaced by only the dense-sweep's own tiny step (a fraction of
+            // a Hz for a narrow FreeTransition guard band), rather than 20/
+            // 40 points actually spread across the violating span. Measured
+            // directly as the root cause of a real bug: those near-
+            // duplicate, nearly-parallel constraint rows make the simplex
+            // tableau numerically near-degenerate, and it can then report a
+            // spurious "infeasible" for a problem that is easily feasible
+            // (verified independently: the exact same M/spec solves at once
+            // against a fresh, evenly-spaced dense grid). Enforcing a
+            // minimum gap between injected points (scaled to the region's
+            // own width, not the dense-sweep step) spreads the same point
+            // budget across the actual violating span instead of burning it
+            // on one tight cluster - both fixing the degeneracy and, as a
+            // side effect, covering more of a wide violating region.
+            const double pbMinGap = fc * 0.002;
+            const double sbMinGap = (nyquist - stopEdge) * 0.002;
             int added = 0;
-            for (double f : violPb) { if (added++ >= 20) break; curPb.push_back (f); }
+            double lastAdded = -1.0e300;
+            for (double f : violPb)
+            {
+                if (added >= 20) break;
+                if (f - lastAdded < pbMinGap) continue;
+                curPb.push_back (f);
+                lastAdded = f;
+                ++added;
+            }
             added = 0;
-            for (double f : violSb) { if (added++ >= 40) break; curSb.push_back (f); }
+            lastAdded = -1.0e300;
+            for (double f : violSb)
+            {
+                if (added >= 40) break;
+                if (f - lastAdded < sbMinGap) continue;
+                curSb.push_back (f);
+                lastAdded = f;
+                ++added;
+            }
         }
 
         if (! everFeasible)
