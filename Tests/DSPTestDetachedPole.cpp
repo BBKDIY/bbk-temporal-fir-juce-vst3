@@ -46,10 +46,24 @@ namespace
 // This file calls it about twenty times purely to verify correctness -
 // unity DC gain, passband/stopband compliance, symmetry, and relative
 // comparisons between specs - all of which are settled at the *smallest*
-// feasible tap count, well before any deadline. A short deadline here
-// keeps this file's own stated purpose (a fast pre-MSVC/JUCE CI gate)
-// true without weakening any of its checks.
-constexpr double kTestDeadlineSeconds = 20.0;
+// feasible tap count, well before any deadline, so a much shorter
+// deadline than production's is normally plenty.
+//
+// This is intentionally generous rather than tuned to the minimum that
+// happened to work locally: the search's own internal deadline checks
+// only run BETWEEN individual LP solves, not inside one (see
+// ParametricFIR.h's own comment on this), so how far a demanding spec
+// (chiefly cutoff pushed close to Nyquist, e.g. the "44.1k-tight"/
+// "48k-deep" cases below) gets within a given wall-clock budget is
+// sensitive to real machine speed - measured directly to differ enough
+// between this development machine and the CI runner's hardware that a
+// tighter value which passed locally still failed there. 90 seconds
+// keeps this file's own stated purpose (a CI gate, not an interactive
+// tool) true - the whole suite still finishes in low single-digit
+// minutes - while leaving comfortable headroom against that per-machine
+// variance instead of chasing it with an ever-more-precisely-tuned
+// constant.
+constexpr double kTestDeadlineSeconds = 90.0;
 
 int checksRun = 0;
 int checksFailed = 0;
