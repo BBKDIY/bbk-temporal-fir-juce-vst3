@@ -803,22 +803,28 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // instead of silently accepting whatever the fallback produced.
         bool sidelobeBisectionSucceeded = false;
 
-        // Per-candidate deadline: kept at the original, proven 6 seconds
-        // (NOT raised, and NOT tied to the shared overallDeadline) -
-        // measured directly that raising this cap, or letting it float up
-        // to whatever remains of a much larger overallDeadline, made a
-        // demanding spec's grid-refinement loop keep grinding through more
-        // rounds under time pressure at large M without actually
-        // converging any better, and could come back with a WORSE (even
-        // spuriously infeasible/degenerate) result than the tighter,
-        // faster-to-bail-out original cap did - non-deterministically,
-        // since it depends on real wall-clock progress through the
-        // bisection/grid-refinement loops, not just on this M's own
-        // difficulty. The "search more thoroughly" budget increase (see
-        // designParametricFIR's own comment) is spent on trying MORE tap
-        // counts within overallDeadline instead, not on letting any single
-        // candidate run longer.
-        const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now() + std::chrono::seconds (6));
+        // Per-candidate deadline. A prior experiment raising this (or
+        // floating it up to whatever remained of overallDeadline) was
+        // reverted because it made a demanding spec come back WORSE,
+        // non-deterministically - but that was BEFORE the
+        // sidelobeBisectionSucceeded gate above existed. At the time, a
+        // bisection cut off mid-search fell back to bestY's unconstrained
+        // no-sidelobe solution and that fallback was still reported
+        // feasible=true, so extra time just meant more chances to grind
+        // into that trap at a large, slow-to-shape M instead of moving on.
+        // Now that a cut-off bisection is correctly reported infeasible
+        // (forcing the M-search to keep looking rather than accept the
+        // fallback), the actual failure mode measured on CI hardware is
+        // different: for the spec behind the stopband-monotonicity bug,
+        // round 0 alone took ~5.3s against this cap on the CI runner,
+        // leaving no time to clear the remaining violations - so a
+        // genuinely convergeable M was being cut off before it could
+        // finish, not saved by a bad fallback. Raised from 6 to 15 seconds
+        // - still a hard, fixed cap (not tied to overallDeadline) so total
+        // search time stays bounded via the outer loop's own deadline and
+        // attempt-count caps, just wide enough for round 0's LP-heavy setup
+        // cost plus a few refinement rounds to actually finish converging.
+        const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now() + std::chrono::seconds (15));
 
         // Raised from 4: a diagnostic dump on the exact spec behind the
         // stopband-monotonicity bug (see designParametricFIR's own
