@@ -83,13 +83,22 @@
 // typically a few seconds when several M values must be tried, and up
 // to tens of seconds in the most demanding cases (chiefly cutoff pushed
 // close to Nyquist, which forces both a large M and many M attempts).
-// Two wall-clock budgets bound the worst case rather than letting it run
-// unbounded: 6 seconds per stopEdge candidate inside attemptDesign, and
-// 45 seconds for the whole M-search in designParametricFIR - past
-// either, the best (least-far-from-compliant) result found so far is
-// returned with constraintsMet = false, the same signal used when the
-// tap-count cap is hit. During a slider drag this means the audible
-// filter can noticeably lag the slider and only catch up a few seconds
+// Three wall-clock budgets bound the worst case rather than letting it run
+// unbounded: 6 seconds (advisory, loop-control only) per stopEdge candidate
+// inside attemptDesign, 180 seconds for the whole M-search in
+// designParametricFIR (the caller may pass a shorter one - see its own
+// parameter comment), and, as a hard backstop against a single simplex
+// solve running away uninterrupted on slower hardware (solveLPFeasibility
+// has no *implicit* limit of its own beyond a fixed iteration cap), an
+// explicit deadline check inside that solve's own pivot loop, bound to the
+// overall M-search budget rather than the tighter 6-second one - tying it
+// to the tighter cap was tried and measured to abort perfectly good,
+// still-converging solves that only needed a few seconds more, actively
+// regressing a spec that the looser (no internal check at all) original
+// code handled fine. Past any of these, the best (least-far-from-compliant)
+// result found so far is returned with constraintsMet = false, the same
+// signal used when the tap-count cap is hit. During a slider drag this
+// means the audible filter can noticeably lag the slider and only catch up a few seconds
 // after it stops moving, rather than following it in real time - a
 // direct, accepted cost of computing the article's actual minimum-
 // ringing result instead of an approximation of it.
@@ -312,7 +321,8 @@ struct LPFeasibilityResult
     std::vector<double> y;
 };
 
-inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<double>>& Arows, const std::vector<double>& b, int n)
+inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<double>>& Arows, const std::vector<double>& b, int n,
+                                                std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max())
 {
     const int numRows = static_cast<int> (Arows.size());
 
@@ -389,6 +399,23 @@ inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<dou
     const int maxIters = 20000;
     for (int iter = 0; iter < maxIters; ++iter)
     {
+        // Checked every 64 pivots (not every one - steady_clock::now() has
+        // real overhead and a single pivot is cheap) so that a single LP
+        // solve can never run past the caller's deadline uninterrupted,
+        // however slow the machine or however large this particular
+        // tableau is. Before this check existed, the deadlines threaded
+        // through attemptDesign/solveForStopEdge were only ever tested
+        // BETWEEN whole simplex solves, not inside one - so one slow solve
+        // at a large M could silently blow through the entire budget on
+        // slower hardware (measured directly as the cause of CI-only
+        // failures that did not reproduce locally). Bailing out here
+        // returns the same "infeasible" sentinel as genuine infeasibility
+        // (pivotRow < 0, below) - the caller already treats that as a
+        // legitimate, expected outcome to degrade gracefully from, not a
+        // crash or an ambiguous error.
+        if ((iter & 63) == 0 && std::chrono::steady_clock::now() > deadline)
+            return { false, {} };
+
         int pivotCol = -1;
         for (int j = 0; j < numCols; ++j)
         {
@@ -662,7 +689,22 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
                 A.push_back (lo); b.push_back (c0 + ci);             // -a[i] - a[0] <= 0
             }
         }
-        return solveLPFeasibility (A, b, reducedVars);
+        // The safety-net deadline passed here is the FULL overallDeadline
+        // (the whole M-search's budget, e.g. 90s in the test file or 180s
+        // in the plugin) - deliberately NOT solveForStopEdge's own tighter,
+        // local ~6-second cap. That local cap is advisory/loop-control only
+        // (it decides when to stop bisecting or refining the grid, exactly
+        // as validated before this safety net existed); using it as the
+        // hard per-solve cutoff too was tried and measured to actively
+        // regress a previously-succeeding hard case (a single solve that
+        // genuinely needs ~8-10s to converge was aborted at 6s and came
+        // back "infeasible" even though the overall search still had ample
+        // time left). The real problem this net exists for is a solve that
+        // is degenerate/pathological and would otherwise run for minutes -
+        // bounding it against the whole search's own budget (rather than
+        // one stopEdge candidate's slice of it) stops that runaway cost
+        // without punishing ordinary, if slow-on-this-hardware, solves.
+        return solveLPFeasibility (A, b, reducedVars, overallDeadline);
     };
 
     // Solve for one specific stopEdge choice (the boundary between the
