@@ -137,7 +137,6 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -326,14 +325,6 @@ struct DesignResult
 
 namespace detail
 {
-
-// TEMPORARY DIAGNOSTIC FLAG - not part of the real design/search API. When
-// set true by a caller (see Tests/DSPTestDetachedPole.cpp), solveForStopEdge
-// prints its own round-by-round timing/progress to stderr. Defaults off
-// (false) so it is a no-op for every normal caller, including the plugin
-// itself. Remove once the CI-only stopband-monotonicity investigation is
-// closed out.
-inline bool diagVerbose = false;
 
 // Two-phase simplex for linear feasibility: does there exist a *free*
 // vector y (size n) such that, for every row i, dot(Arows[i], y) <= b[i]?
@@ -840,23 +831,10 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // of giving up on rounds before it runs out of actual time.
         const int maxGridRounds = 10;
         int gridRound = 0;
-        const auto solveStartTime = std::chrono::steady_clock::now();
         for (; gridRound < maxGridRounds; ++gridRound)
         {
             if (std::chrono::steady_clock::now() > deadline)
-            {
-                if (diagVerbose)
-                {
-                    const double elapsedMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - solveStartTime).count();
-                    std::fprintf (stderr, "  [diag solveForStopEdge] M=%d stopEdge=%.1f DEADLINE HIT at round=%d elapsed=%.1fms\n", M, stopEdge, gridRound, elapsedMs);
-                }
                 break;
-            }
-            if (diagVerbose)
-            {
-                const double elapsedMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - solveStartTime).count();
-                std::fprintf (stderr, "  [diag solveForStopEdge] M=%d stopEdge=%.1f starting round=%d elapsed=%.1fms\n", M, stopEdge, gridRound, elapsedMs);
-            }
 
             for (int mlIter = 0; mlIter < 2; ++mlIter)
             {
@@ -911,12 +889,6 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
                 double resp = std::fabs (amplitudeResponse (a, f, Fs));
                 if (resp > eps * 1.002)
                     violSb.push_back (f);
-            }
-            if (diagVerbose)
-            {
-                const double elapsedMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - solveStartTime).count();
-                std::fprintf (stderr, "  [diag solveForStopEdge] M=%d stopEdge=%.1f round=%d done: violPb=%zu violSb=%zu elapsed=%.1fms\n",
-                    M, stopEdge, gridRound, violPb.size(), violSb.size(), elapsedMs);
             }
             if (violPb.empty() && violSb.empty())
                 break;

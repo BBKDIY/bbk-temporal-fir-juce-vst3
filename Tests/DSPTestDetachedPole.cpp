@@ -26,7 +26,6 @@
 #include "../SourceDetachedPole/DetachedPoleFilter.h"
 #include "../SourceDetachedPole/ParametricFIR.h"
 
-#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -618,24 +617,6 @@ int main()
             "[stopband monotonicity] relaxing 95dB to 80dB does not make the chosen design's R_peak worse");
         std::printf ("  [stopband monotonicity] 95dB: taps=%d R_peak=%.3f%%  |  80dB: taps=%d R_peak=%.3f%%\n",
             tightResult.tapCount, tightResult.temporal.rPeakPercent, looseResult.tapCount, looseResult.temporal.rPeakPercent);
-
-        // TEMPORARY DIAGNOSTIC: raising maxGridRounds (4 -> 10) in
-        // ParametricFIR.h did not change this CI runner's own result at
-        // all (same 75-tap/88% answer came back unchanged), which only
-        // makes sense if the per-candidate 6-second deadline - not the
-        // round count - is what's actually cutting M=24 off before it can
-        // converge on this machine. Turning on solveForStopEdge's own
-        // verbose round/timing trace for exactly this M directly answers
-        // that: if it never gets past round 1-2 before "DEADLINE HIT"
-        // appears, the deadline is the real binding constraint here, not
-        // rounds. Remove once the real root cause is confirmed and fixed.
-        {
-            detail::diagVerbose = true;
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (10);
-            auto r = detail::attemptDesign (loose, 24, deadline);
-            detail::diagVerbose = false;
-            std::printf ("  [diag M=24 80dB result] feasible=%d worstSB=%.4fdB Rpeak=%.3f%%\n", r.feasible, r.worstStopbandDb, r.rPeakPercent);
-        }
     }
 
     // --- 384 kHz operating point (upstream upsampling scenario) -----------
