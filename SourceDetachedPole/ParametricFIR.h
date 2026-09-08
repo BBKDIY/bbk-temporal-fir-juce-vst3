@@ -1066,6 +1066,36 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // the last known-good feasible design; maxMAfterFeasible below
         // still bounds how much further this can go.
 
+        // FlatMask-only safety valve: the "keep searching past the first
+        // feasible M, prefer whichever has the lowest R_peak" logic above
+        // is only sound when every M's own "feasible" flag means compliance
+        // over the SAME enforced-stopband width - true for FreeTransition
+        // (a single fixed guard-band rule, unchanged by M - see attemptDesign's
+        // own comment), but NOT true for FlatMask: attemptDesign's per-M
+        // candidate sweep (mirror -> Kaiser -> narrow, see above) can fall
+        // through to a much NARROWER candidate at one M than at another, and
+        // a narrower enforced region is both easier to satisfy and rings
+        // less (lower R_peak) almost by construction - not because it is a
+        // genuinely better full-width design. Comparing R_peak *across*
+        // FlatMask M's can therefore let a narrow-candidate M with a
+        // technically-true but much weaker "feasible" flag win purely on
+        // that basis, silently reintroducing the exact "flat across the
+        // WHOLE mirror band" contract violation already found and reverted
+        // once for FlatMask's own per-M candidate selection (see attemptDesign's
+        // comment) - just one level up, across M instead of within one M.
+        // Measured directly: CI (not this development machine) hit exactly
+        // this on the Case C validation spec - M=21's narrow fallback
+        // candidate won the cross-M R_peak comparison over M=25's proper
+        // mirror-band-compliant one, and the resulting "compliant" design
+        // was only -19.75 dB over the paper's own 76-96 kHz band (vs. the
+        // requested ~98 dB) - not a marginal miss, a completely different,
+        // much narrower region being reported as compliant. FlatMask exists
+        // purely for that paper validation (see its own top-of-file
+        // comment) and is never reached by the plugin, so it loses nothing
+        // by keeping the original, pre-"search more thoroughly" behaviour:
+        // stop at the first feasible M, exactly as before this pass.
+        if (foundFeasible && spec.stopbandMode == StopbandMode::FlatMask) break;
+
         if (M >= maxM) break;
         if (std::chrono::steady_clock::now() > deadline) break;
         if (foundFeasible && M >= maxMAfterFeasible) break;
