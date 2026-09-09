@@ -545,7 +545,27 @@ struct AttemptResult
 // (shared across every M and every candidate within it, set by the
 // caller in designParametricFIR) bounds the total worst-case cost so a
 // single M can never run away with the whole search budget.
-inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::steady_clock::time_point overallDeadline)
+//
+// perCandidateSeconds is the separate, per-stopEdge-candidate cap used
+// inside solveForStopEdge below (see its own comment - default 15s,
+// unchanged for the live plugin and for every existing caller that
+// doesn't pass this explicitly, e.g. designParametricFIR and the DSP
+// test suite). It exists as a parameter (not just the hardcoded
+// constant it used to be) because it turned out to matter for more than
+// just latency: measured directly that on a slower/more contended CPU
+// (this repo's own offline sweep tool, run in a shared sandbox), 15
+// seconds is sometimes not enough for the grid-refinement loop to reach
+// its actual converged optimum, and the run silently keeps whatever
+// partially-refined candidate it had at the cutoff instead - genuinely
+// worse (higher R_peak, sometimes even failing the stopband target)
+// than the same spec/M solved with more wall-clock, not a different
+// design. The live plugin doesn't need to change (it already budgets
+// for real-time responsiveness, and the outer M-search's own patience/
+// deadline logic already treats a capped-out candidate as "not this M,
+// try another" correctly) - only offline, non-interactive regeneration
+// of the prebuilt filter bank benefits from raising this past 15s.
+inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::steady_clock::time_point overallDeadline,
+                                     double perCandidateSeconds = 15.0)
 {
     const int numVars = M + 1;
     const double Fs = spec.sampleRateHz;
@@ -811,11 +831,17 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // leaving no time to clear the remaining violations - so a
         // genuinely convergeable M was being cut off before it could
         // finish, not saved by a bad fallback. Raised from 6 to 15 seconds
-        // - still a hard, fixed cap (not tied to overallDeadline) so total
-        // search time stays bounded via the outer loop's own deadline and
-        // attempt-count caps, just wide enough for round 0's LP-heavy setup
-        // cost plus a few refinement rounds to actually finish converging.
-        const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now() + std::chrono::seconds (15));
+        // (the live-plugin default) - still a hard, fixed PER-CANDIDATE
+        // cap (not tied to overallDeadline) so total search time stays
+        // bounded via the outer loop's own deadline and attempt-count
+        // caps, just wide enough for round 0's LP-heavy setup cost plus a
+        // few refinement rounds to actually finish converging - or, for
+        // offline bank regeneration (see perCandidateSeconds's own
+        // comment on attemptDesign above), wide enough for ALL
+        // maxGridRounds rounds to finish regardless of how slow the
+        // machine running it is.
+        const auto deadline = std::min (overallDeadline, std::chrono::steady_clock::now()
+            + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (perCandidateSeconds)));
 
         // Raised from 4: a diagnostic dump on the exact spec behind the
         // stopband-monotonicity bug (see designParametricFIR's own

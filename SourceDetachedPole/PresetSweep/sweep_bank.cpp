@@ -5,7 +5,7 @@
 // results can be post-processed into a precomputed filter bank header.
 //
 // Usage:
-//   sweep_bank <sampleRateHz> <attenuationDb> <mMin> <mMax> <perCandidateSeconds> <maxNonImprovingAfterFeasible> <outCsv>
+//   sweep_bank <sampleRateHz> <attenuationDb> <mMin> <mMax> <perCandidateSeconds> <maxNonImprovingAfterFeasible> <outCsv> [solverSecondsPerCandidate]
 //
 // Appends one row per M to outCsv (creating it with a header row if it
 // doesn't exist yet), skipping any (sampleRateHz,attenuationDb,M) already
@@ -13,6 +13,19 @@
 // early once maxNonImprovingAfterFeasible consecutive M's in a row have
 // failed to beat the best feasible R_peak seen so far (0 disables early
 // stopping - always run to mMax).
+//
+// perCandidateSeconds (positional arg 5, unchanged) bounds how long THIS
+// TOOL spends per M overall (its own timing/printout, not a solver
+// setting). solverSecondsPerCandidate (new, optional, default 15 to
+// match the live plugin) is the actual per-stopEdge-candidate cap passed
+// down into attemptDesign/solveForStopEdge - see ParametricFIR.h's own
+// comment on attemptDesign's perCandidateSeconds parameter for why this
+// needed to become overridable: 15s, the live plugin's real-time-
+// appropriate default, is sometimes not enough for the grid-refinement
+// loop to actually converge on a slower/shared CPU, silently keeping a
+// worse partially-refined candidate instead of failing loudly - which is
+// exactly the kind of thing this offline, non-interactive tool can (and
+// for bank quality, should) afford to wait past.
 
 #include "ParametricFIR.h"
 
@@ -27,9 +40,9 @@
 
 int main (int argc, char** argv)
 {
-    if (argc != 8)
+    if (argc != 8 && argc != 9)
     {
-        std::fprintf (stderr, "usage: %s <sampleRateHz> <attenuationDb> <mMin> <mMax> <perCandidateSeconds> <maxNonImprovingAfterFeasible> <outCsv>\n", argv[0]);
+        std::fprintf (stderr, "usage: %s <sampleRateHz> <attenuationDb> <mMin> <mMax> <perCandidateSeconds> <maxNonImprovingAfterFeasible> <outCsv> [solverSecondsPerCandidate]\n", argv[0]);
         return 1;
     }
 
@@ -40,6 +53,7 @@ int main (int argc, char** argv)
     const double perCandidateSeconds = std::atof (argv[5]);
     const int maxNonImprovingAfterFeasible = std::atoi (argv[6]);
     const std::string outCsv = argv[7];
+    const double solverSecondsPerCandidate = (argc == 9) ? std::atof (argv[8]) : 15.0;
 
     // Normalise rate/atten to the exact text this program itself writes to
     // the CSV (see rateKey/attenKey below), NOT the raw argv text - "0.10"
@@ -143,7 +157,7 @@ int main (int argc, char** argv)
 
         const auto t0 = std::chrono::steady_clock::now();
         const auto deadline = t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (perCandidateSeconds));
-        auto attempt = bbk::parametric::detail::attemptDesign (spec, M, deadline);
+        auto attempt = bbk::parametric::detail::attemptDesign (spec, M, deadline, solverSecondsPerCandidate);
         const double elapsedS = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
 
         const int N = 2 * M + 1;
