@@ -251,12 +251,43 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
 {
     using namespace bbk::detachedpole::presetbank;
 
+    // If the user has saved their own override for this exact sample rate
+    // + attenuation, Default mode should snap cutoff/stopband/decay to
+    // THAT operating point instead of the factory bank's fixed one -
+    // otherwise saveCurrentAsOverride() would be pointless: re-enabling
+    // Default would always force the sliders back to the factory point
+    // first, and the subsequent override lookup in requestBoundaryRedesign()
+    // (an exact full-spec match) would then never hit, silently falling
+    // back to the plain factory bank entry instead of the user's override.
+    // Matched on sample rate + attenuation only, not the full spec -
+    // cutoff/stopband/decay are exactly what this function is about to
+    // decide, so they can't be part of the lookup key here.
+    const auto spec = specFromParameters();
+
+    double targetCutoffHz = presetCutoffHz;
+    double targetStopbandRejectionDb = presetStopbandRejectionDb;
+    double targetSidelobeDecayRatio = presetSidelobeDecayRatio;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        for (auto& e : userOverrides)
+        {
+            if (e.spec.sampleRateHz == spec.sampleRateHz && e.spec.attenuationAtCutoffDb == spec.attenuationAtCutoffDb)
+            {
+                targetCutoffHz = e.spec.cutoffHz;
+                targetStopbandRejectionDb = e.spec.stopbandRejectionDb;
+                targetSidelobeDecayRatio = e.spec.sidelobeDecayRatio;
+                break;
+            }
+        }
+    }
+
     if (auto* cutoffParam = parameters.getParameter ("cutoff"))
-        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (presetCutoffHz)));
+        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (targetCutoffHz)));
     if (auto* stopbandParam = parameters.getParameter ("stopband"))
-        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (presetStopbandRejectionDb)));
+        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetStopbandRejectionDb)));
     if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
-        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (presetSidelobeDecayRatio)));
+        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSidelobeDecayRatio)));
 }
 
 void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
