@@ -42,8 +42,14 @@ inline const BankEntry* findEntry (double sampleRateHz, double attenuationDb)
     const double snappedAtten = snapToNearestAttenuationStep (attenuationDb);
     for (const auto& e : bank())
     {
+        // Matched against nominalAttenuationDb (the fixed 0.05dB-spaced
+        // step), NOT attenuationAtCutoffDb - a fine-tune pass over the
+        // sweep can leave the entry's actual design point nudged slightly
+        // off its nominal step (see PresetFilterBank.h's own comment), so
+        // matching on the exact design value would break this lookup for
+        // any entry that fine-tuning improved.
         if (std::fabs (e.sampleRateHz - sampleRateHz) <= 0.5
-            && std::fabs (e.attenuationAtCutoffDb - snappedAtten) <= 1.0e-6)
+            && std::fabs (e.nominalAttenuationDb - snappedAtten) <= 1.0e-6)
             return &e;
     }
     return nullptr;
