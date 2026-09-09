@@ -283,10 +283,15 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     if (snap.tapCount == 0)
     {
         // Shown at cold start and again on every sample-rate change - the
-        // redesign for the new rate runs entirely in the background (it
-        // can take several seconds for some cutoff/rate combinations) and
+        // redesign for the new rate runs entirely in the background and
         // never blocks playback; audio passes through unfiltered (delay-
-        // matched, no clicks) until it completes and crossfades in.
+        // matched, no clicks) until it completes and crossfades in. In
+        // Default mode this resolves near-instantly (an instant bank
+        // lookup, not a search) unless the rate isn't one of the 7 the
+        // bank covers; in Custom mode the live search can now take up to
+        // several minutes (see requestBoundaryRedesign()'s own comment on
+        // why that's an acceptable trade now that Default gives an
+        // always-available fallback while it runs).
         metricsReadout.setText ("Designing filter for " + juce::String (processor.getCurrentSampleRateForUI(), 0)
                                  + " Hz... (unfiltered pass-through meanwhile)", juce::dontSendNotification);
         return;

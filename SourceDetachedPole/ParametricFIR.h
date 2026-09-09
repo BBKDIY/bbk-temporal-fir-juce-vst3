@@ -1116,7 +1116,15 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
 // all happens quickly, at a small M, regardless of the deadline - and it
 // is meant to stay a fast pre-MSVC/JUCE CI gate, not itself take up to
 // 19 * 180 seconds.
-inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount = 161, double overallDeadlineSeconds = 180.0)
+// perCandidateSeconds forwards to attemptDesign's own parameter of the same
+// name (default 15.0, matching its own default and every pre-existing
+// caller's actual behaviour) - see that parameter's comment in attemptDesign
+// for why a caller might want to raise it (this plugin's live Custom-mode
+// search does, at a larger overallDeadlineSeconds too - see
+// PluginProcessor.cpp - now that Default mode gives an always-available
+// instant fallback while a longer Custom search runs in the background).
+inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount = 161, double overallDeadlineSeconds = 180.0,
+                                          double perCandidateSeconds = 15.0)
 {
     DesignResult result;
     const int maxM = (maxTapCount - 1) / 2;
@@ -1181,7 +1189,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
     while (true)
     {
-        auto attempt = detail::attemptDesign (spec, M, deadline);
+        auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
         ++result.designAttempts;
 
         // attemptDesign() has its own explicit all-zero-taps sentinel for

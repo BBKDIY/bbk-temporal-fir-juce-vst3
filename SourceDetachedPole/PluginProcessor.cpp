@@ -421,7 +421,14 @@ void BBKDetachedPoleAudioProcessor::run()
                 continue;
         }
 
-        auto result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount);
+        // Custom-mode's live search: 900s overall / 60s per candidate,
+        // both well above ParametricFIR.h's own real-time-appropriate
+        // defaults (180s/15s). Safe to be this patient now that Default
+        // mode (see requestBoundaryRedesign()) gives an always-available
+        // instant result while this runs in the background - Custom was
+        // previously tuned to not make the user wait too long for SOME
+        // result, but that's no longer the only result they have.
+        auto result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0);
 
         // Re-check staleness after the (possibly slow - see
         // ParametricFIR.h for how thorough this search now is)
