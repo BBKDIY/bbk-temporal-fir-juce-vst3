@@ -303,10 +303,17 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // exact same filter that was already computed. A real spec change
         // never takes this early-return path (specsEqual is exact, not
         // fuzzy - see its own comment) and proceeds exactly as before.
-        if (specsEqual (spec, currentBoundarySpec) && boundaryEpoch != 0)
+        // presetModeOn is compared alongside the spec itself (see
+        // currentBoundaryPresetMode's own comment) - toggling Default
+        // on/off must always force at least one fresh lookup/design even
+        // when every FilterSpec field is unchanged, since the two modes
+        // pull the result from different places (instant bank lookup vs.
+        // live search).
+        if (specsEqual (spec, currentBoundarySpec) && presetModeOn == currentBoundaryPresetMode && boundaryEpoch != 0)
             return;
 
         currentBoundarySpec = spec;
+        currentBoundaryPresetMode = presetModeOn;
         ++boundaryEpoch;
         taskQueue.clear(); // also discards any now-stale in-flight live design
 

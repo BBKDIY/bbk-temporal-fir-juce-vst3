@@ -245,6 +245,16 @@ private:
     int boundaryEpoch = 0;                     // guarded by specLock
     bbk::parametric::FilterSpec currentBoundarySpec; // guarded by specLock
 
+    // Also guarded by specLock, alongside currentBoundarySpec: the
+    // specsEqual() dedup below only compares FilterSpec fields, which say
+    // nothing about presetMode - toggling Default on/off changes where the
+    // result comes from (instant bank lookup vs. live search) even when
+    // every FilterSpec field is unchanged (e.g. the user never touched
+    // cutoff/attenuation/stopband/decay), so the dedup must also notice
+    // that transition or it silently keeps showing whichever result was
+    // already published.
+    bool currentBoundaryPresetMode = false;
+
     juce::SpinLock resultLock;
     bbk::parametric::DesignResult latestResult;
     bbk::parametric::FilterSpec latestSpec;
