@@ -56,6 +56,22 @@ namespace
     constexpr float autoHeadroomReleasePerSecond = 0.5f;
     constexpr double autoHeadroomCooldownSeconds = 3.0;
 
+    // Exact (not tolerance-based) comparison: every field here is either a
+    // fixed enum or a double built the same deterministic way each time
+    // (an atomic-loaded float widened to double, then at most a jmin/cast
+    // against another such value - see specFromParameters()), so two
+    // requests built from literally unchanged parameter values reproduce
+    // the same bit pattern, not just a "close enough" one. That is exactly
+    // what lets this be used as a real memory - see requestBoundaryRedesign().
+    inline bool specsEqual (const bbk::parametric::FilterSpec& a, const bbk::parametric::FilterSpec& b) noexcept
+    {
+        return a.sampleRateHz == b.sampleRateHz
+            && a.cutoffHz == b.cutoffHz
+            && a.attenuationAtCutoffDb == b.attenuationAtCutoffDb
+            && a.stopbandRejectionDb == b.stopbandRejectionDb
+            && a.stopbandMode == b.stopbandMode
+            && a.sidelobeDecayRatio == b.sidelobeDecayRatio;
+    }
 }
 
 BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
@@ -228,6 +244,22 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
+
+        // The "memory": a parameter listener fires on every value the host
+        // writes, not just ones that actually changed - some hosts resend
+        // the automation value at the playhead when transport starts (or
+        // resend full state on stop), which used to land here as an
+        // apparently-fresh boundary change even though the resulting spec
+        // is identical to the one already active (or already mid-design)
+        // for currentBoundarySpec. Without this check that still discarded
+        // and restarted whatever was queued/running, so hitting stop then
+        // play could re-trigger the full multi-second LP search for the
+        // exact same filter that was already computed. A real spec change
+        // never takes this early-return path (specsEqual is exact, not
+        // fuzzy - see its own comment) and proceeds exactly as before.
+        if (specsEqual (spec, currentBoundarySpec) && boundaryEpoch != 0)
+            return;
+
         currentBoundarySpec = spec;
         ++boundaryEpoch;
         taskQueue.clear();
