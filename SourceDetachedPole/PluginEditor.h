@@ -26,6 +26,15 @@ private:
     juce::ToggleButton bypassButton { "Bypass" };
     juce::ToggleButton amplitudeRelaxationButton { "Amplitude Relaxation" };
 
+    // On: cutoff/stopband/sidelobeDecay are forced to the precomputed
+    // preset-bank operating point (18.5 kHz / 95 dB / decay 1.0) and the
+    // matching filter for the current sample rate + attenuation step loads
+    // instantly, no background search. Those three sliders are greyed out
+    // (still showing the forced values, per the chosen UI - see
+    // timerCallback()) while this is on; Attenuation stays live since it's
+    // what selects which of the 10 precomputed steps is used.
+    juce::ToggleButton defaultModeButton { "Default (instant, prebuilt)" };
+
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
     juce::Label attenuationLabel;
@@ -51,6 +60,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sidelobeDecayAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> defaultModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
 

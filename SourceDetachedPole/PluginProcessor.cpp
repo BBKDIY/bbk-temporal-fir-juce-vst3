@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "PresetBankLookup.h"
 
 #include <cmath>
 
@@ -86,6 +87,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
+    parameters.addParameterListener ("presetMode", &paramListener);
 
     startThread();
 }
@@ -102,6 +104,7 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
+    parameters.removeParameterListener ("presetMode", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -138,6 +141,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
 
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "bypass", 1 }, "Bypass", false));
+
+    // Off by default (so every existing session/preset keeps behaving
+    // exactly as before): when on, Cutoff/Min. Stopband Rejection/
+    // Sidelobe Decay are forced to the exact operating point a large
+    // offline sweep found to work well across every supported sample
+    // rate (18.5kHz/95dB/no decay - see SourceDetachedPole/PresetSweep/),
+    // and the design comes from an instant table lookup keyed on sample
+    // rate + Attenuation instead of a live search - no multi-second (or,
+    // for a demanding spec, multi-minute) wait after a slider move. Falls
+    // back to a live Custom-mode design if the host's sample rate isn't
+    // one of the 7 the bank was swept for (see requestBoundaryRedesign
+    // and PresetBankLookup.h::findEntry).
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "presetMode", 1 }, "Default", false));
 
     // On (default): the attenuation slider above is used as-is (a Case
     // C-style spectrally relaxed design). Off: the attenuation slider is
@@ -226,6 +243,18 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     return spec;
 }
 
+void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
+{
+    using namespace bbk::detachedpole::presetbank;
+
+    if (auto* cutoffParam = parameters.getParameter ("cutoff"))
+        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (presetCutoffHz)));
+    if (auto* stopbandParam = parameters.getParameter ("stopband"))
+        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (presetStopbandRejectionDb)));
+    if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
+        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (presetSidelobeDecayRatio)));
+}
+
 void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 {
     // May be called from the message thread (typical - a slider moved) or
@@ -241,6 +270,23 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         return;
 
     const auto spec = specFromParameters();
+
+    // Default mode: an instant lookup instead of a live design, IF the
+    // host's current sample rate is one of the 7 the bank was swept for.
+    // Looked up here (before the lock below) since it only reads static
+    // table data - no need to hold specLock for it. The bank always
+    // matches spec.attenuationAtCutoffDb, not the raw slider value:
+    // amplitudeRelaxation off substitutes caseBNearFlatAttenuationDb
+    // (well outside the swept 0.05-0.50dB grid), so relaxation-off specs
+    // correctly find no entry and fall back to a live design below,
+    // rather than silently returning some unrelated preset.
+    const bool presetModeOn = parameters.getRawParameterValue ("presetMode")->load() > 0.5f;
+    const auto* presetEntry = presetModeOn
+        ? bbk::detachedpole::presetbank::findEntry (spec.sampleRateHz, spec.attenuationAtCutoffDb)
+        : nullptr;
+
+    bool haveInstantResult = false;
+    bbk::parametric::DesignResult instantResult;
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -262,19 +308,38 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
         currentBoundarySpec = spec;
         ++boundaryEpoch;
-        taskQueue.clear();
+        taskQueue.clear(); // also discards any now-stale in-flight live design
 
-        DesignTask task;
-        task.spec = spec;
-        task.epoch = boundaryEpoch;
-        taskQueue.push_back (task);
+        if (presetEntry != nullptr)
+        {
+            haveInstantResult = true;
+            instantResult.taps = presetEntry->taps;
+            instantResult.tapCount = presetEntry->tapCount;
+            instantResult.constraintsMet = true;
+            instantResult.achievedStopbandDb = presetEntry->achievedStopbandDb;
+            instantResult.designAttempts = 0;
+            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+        }
+        else
+        {
+            DesignTask task;
+            task.spec = spec;
+            task.epoch = boundaryEpoch;
+            taskQueue.push_back (task);
+        }
     }
 
-    notify();
+    // publishResult() takes specLock itself (briefly, for versionCounter) -
+    // must be called after the block above releases it, not from inside.
+    if (haveInstantResult)
+        publishResult (spec, instantResult, true);
+    else
+        notify();
 }
 
 void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec,
-                                                     const bbk::parametric::DesignResult& result)
+                                                     const bbk::parametric::DesignResult& result,
+                                                     bool fromPresetBank)
 {
     int version;
     {
@@ -310,6 +375,7 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
         uiSnapshot.constraintsMet = result.constraintsMet;
         uiSnapshot.designAttempts = result.designAttempts;
+        uiSnapshot.fromPresetBank = fromPresetBank;
         uiSnapshot.taps = result.taps;
         uiSnapshot.temporal = result.temporal;
     }

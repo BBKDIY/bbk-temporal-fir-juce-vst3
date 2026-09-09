@@ -39,6 +39,15 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "bypass", bypassButton);
 
+    // Default vs Custom: see the member comment on defaultModeButton. Grey-
+    // out of the affected sliders happens in timerCallback() (they need to
+    // track the parameter live, not just this button's own clicks - e.g.
+    // host automation of "presetMode").
+    defaultModeButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (defaultModeButton);
+    defaultModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "presetMode", defaultModeButton);
+
     prepareLabel (cutoffLabel, 13.0f, false, juce::Justification::centredLeft);
     cutoffLabel.setText ("Cutoff", juce::dontSendNotification);
     addAndMakeVisible (cutoffLabel);
@@ -182,6 +191,7 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     {
         auto row = area.removeFromTop (24);
         bypassButton.setBounds (row.removeFromRight (100));
+        defaultModeButton.setBounds (row.removeFromRight (220));
         sampleRate.setBounds (row);
     }
     area.removeFromTop (10);
@@ -290,6 +300,19 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // live and misleading.
     attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
 
+    // Default mode: cutoff/stopband/sidelobeDecay are forced to the
+    // preset-bank operating point (see forcePresetOperatingPoint()) and
+    // ignored by the design itself, so grey them out - per the chosen UI,
+    // they stay visible and keep showing the forced values (the sliders
+    // themselves already reflect those values via their own attachments,
+    // since forcePresetOperatingPoint() writes through the real
+    // parameters). Attenuation is left alone: it still picks which of the
+    // 10 precomputed steps is used, so it stays live in both modes.
+    const bool presetModeOn = processor.getAPVTS().getRawParameterValue ("presetMode")->load() > 0.5f;
+    cutoffSlider.setEnabled (! presetModeOn);
+    stopbandSlider.setEnabled (! presetModeOn);
+    sidelobeDecaySlider.setEnabled (! presetModeOn);
+
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
         if (bypassParam->load() > 0.5f)
@@ -297,10 +320,15 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
 
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
-         << "Design method: Minimax - the article's own minimum-peak-sidelobe method, searched "
-            "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
-            "ringing, shortest-settling as tie-break) compliant result (see the design-attempts "
-            "count below)\n"
+         << "Design method: " << (snap.fromPresetBank
+              ? "Default - instant lookup in a precomputed filter bank (18.5 kHz cutoff, 95 dB "
+                "stopband, sidelobe decay 1.0, one of 10 attenuation steps chosen by the slider "
+                "above); no background search."
+              : "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "
+                "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
+                "ringing, shortest-settling as tie-break) compliant result (see the design-"
+                "attempts count below).")
+         << "\n"
          << "Sidelobe decay: " << juce::String (snap.sidelobeDecayRatio, 3)
          << (snap.sidelobeDecayRatio >= 0.999
               ? " (flat, no decay - unchanged behaviour)"

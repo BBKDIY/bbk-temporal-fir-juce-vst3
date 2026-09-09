@@ -118,6 +118,7 @@ public:
         double achievedStopbandDb = 0.0;
         bool constraintsMet = false;
         int designAttempts = 0;
+        bool fromPresetBank = false; // instant lookup (see requestBoundaryRedesign), not a live search
         std::vector<double> taps; // the actual (unpadded) symmetric taps
 
         // Temporal-concentration metrics from the article ("Impulse-
@@ -150,9 +151,23 @@ private:
     // Bumps versionCounter and writes latestResult/latestSpec/
     // latestVersion/uiSnapshot exactly once, so the audio thread's existing
     // version-based crossfade pickup in process() always sees the newest
-    // published design.
+    // published design. fromPresetBank just tags the UI snapshot (see
+    // DesignSnapshot) - it doesn't change how the result is applied.
     void publishResult (const bbk::parametric::FilterSpec& spec,
-                         const bbk::parametric::DesignResult& result);
+                         const bbk::parametric::DesignResult& result,
+                         bool fromPresetBank = false);
+
+    // Called when the "presetMode" parameter turns on (see ParamListener
+    // below): forces cutoff/stopband/sidelobeDecay to the exact operating
+    // point the preset bank was swept at, via setValueNotifyingHost - the
+    // same "processor drives another parameter's value directly" pattern
+    // already used for the Auto Headroom ratchet (see process()). This
+    // makes the greyed-out sliders in Default mode show the values that
+    // are actually in effect, rather than whatever Custom-mode position
+    // they were last left at, and means specFromParameters() never needs
+    // its own separate preset/custom branch - it just always reads
+    // whatever the parameters currently hold.
+    void forcePresetOperatingPoint();
 
     juce::AudioProcessorValueTreeState parameters;
 
@@ -160,8 +175,19 @@ private:
     {
         BBKDetachedPoleAudioProcessor& owner;
         explicit ParamListener (BBKDetachedPoleAudioProcessor& o) : owner (o) {}
-        void parameterChanged (const juce::String&, float) override
+        void parameterChanged (const juce::String& parameterID, float newValue) override
         {
+            // Order matters: force cutoff/stopband/decay to the preset
+            // operating point BEFORE requesting a redesign below, so that
+            // redesign already sees the corrected spec instead of one
+            // that's about to be superseded a moment later by the
+            // parameter changes forcePresetOperatingPoint() itself
+            // triggers (each of which re-enters this same listener and
+            // requests its own redesign in turn - harmless, see that
+            // method's own comment, just a couple of extra superseded
+            // requests exactly like a fast slider drag already causes).
+            if (parameterID == "presetMode" && newValue > 0.5f)
+                owner.forcePresetOperatingPoint();
             owner.requestBoundaryRedesign();
         }
     } paramListener { *this };
