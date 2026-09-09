@@ -158,6 +158,9 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsButton.onClick = [this] { toggleCoefficientsPopup(); };
     addAndMakeVisible (coefficientsButton);
 
+    saveAsDefaultButton.onClick = [this] { processor.saveCurrentAsOverride(); };
+    addAndMakeVisible (saveAsDefaultButton);
+
     coefficientsBox.setMultiLine (true);
     coefficientsBox.setReadOnly (true);
     coefficientsBox.setScrollbarsShown (true);
@@ -228,7 +231,9 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     metricsReadout.setBounds (area.removeFromTop (215));
 
     area.removeFromTop (8);
-    coefficientsButton.setBounds (area.removeFromTop (26).removeFromLeft (200));
+    auto buttonRow = area.removeFromTop (26);
+    coefficientsButton.setBounds (buttonRow.removeFromLeft (200));
+    saveAsDefaultButton.setBounds (buttonRow.removeFromRight (160));
 
     area.removeFromTop (8);
     coefficientsBox.setBounds (area);
@@ -323,16 +328,31 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         if (bypassParam->load() > 0.5f)
             text << "BYPASSED (dry signal, delay-matched - no filtering audible)\n";
 
+    juce::String designMethodText;
+    switch (snap.source)
+    {
+        using ResultSource = BBKDetachedPoleAudioProcessor::ResultSource;
+        case ResultSource::PresetBank:
+            designMethodText = "Default - instant lookup in a precomputed filter bank (18.5 kHz cutoff, 95 dB "
+                                "stopband, sidelobe decay 1.0, one of 10 attenuation steps chosen by the slider "
+                                "above); no background search.";
+            break;
+        case ResultSource::UserOverride:
+            designMethodText = "User Override - instant lookup of a filter you saved yourself for this exact "
+                                "operating point (see Save as Default); no background search.";
+            break;
+        case ResultSource::LiveSearch:
+        default:
+            designMethodText = "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "
+                                "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
+                                "ringing, shortest-settling as tie-break) compliant result (see the design-"
+                                "attempts count below).";
+            break;
+    }
+
     text << "Design: " << snap.tapCount << " taps, group delay "
          << bbk::detachedpole::latencySamples << " samples fixed (host-reported latency never changes)\n"
-         << "Design method: " << (snap.fromPresetBank
-              ? "Default - instant lookup in a precomputed filter bank (18.5 kHz cutoff, 95 dB "
-                "stopband, sidelobe decay 1.0, one of 10 attenuation steps chosen by the slider "
-                "above); no background search."
-              : "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "
-                "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
-                "ringing, shortest-settling as tie-break) compliant result (see the design-"
-                "attempts count below).")
+         << "Design method: " << designMethodText
          << "\n"
          << "Sidelobe decay: " << juce::String (snap.sidelobeDecayRatio, 3)
          << (snap.sidelobeDecayRatio >= 0.999

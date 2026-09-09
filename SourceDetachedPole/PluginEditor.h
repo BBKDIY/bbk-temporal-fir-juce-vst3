@@ -54,6 +54,12 @@ private:
     juce::TextEditor coefficientsBox;
     bool coefficientsVisible = false;
 
+    // Persists whatever is currently published (Default, Custom, or an
+    // existing override) as a user override for its own exact spec - see
+    // BBKDetachedPoleAudioProcessor::saveCurrentAsOverride(). Always
+    // enabled; saving an already-instant result is harmless, just pointless.
+    juce::TextButton saveAsDefaultButton { "Save as Default" };
+
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;

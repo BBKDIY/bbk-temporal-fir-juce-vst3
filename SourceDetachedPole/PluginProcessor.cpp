@@ -89,6 +89,10 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
     parameters.addParameterListener ("presetMode", &paramListener);
 
+    // Loaded once here, not per-lookup - see userOverrides' own comment in
+    // PluginProcessor.h.
+    userOverrides = bbk::detachedpole::useroverrides::loadAll();
+
     startThread();
 }
 
@@ -255,6 +259,76 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
         decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (presetSidelobeDecayRatio)));
 }
 
+void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
+{
+    // Whatever is currently published - a live Custom-mode result, a
+    // Default-mode bank entry, or even an existing override - becomes the
+    // new override for its own exact spec. Reads the UI snapshot rather
+    // than latestResult/latestSpec directly since that's already the
+    // single point that's guaranteed consistent (spec and result written
+    // together under uiSnapshotLock in publishResult()).
+    const auto snap = getDesignSnapshotForUI();
+
+    // Nothing designed yet (e.g. called before the very first design
+    // completes) - silently do nothing rather than persist a hollow entry.
+    if (snap.tapCount <= 0 || snap.taps.empty())
+        return;
+
+    bbk::detachedpole::useroverrides::OverrideEntry entry;
+    entry.spec.sampleRateHz = snap.sampleRateHz;
+    entry.spec.cutoffHz = snap.cutoffHz;
+    entry.spec.attenuationAtCutoffDb = snap.attenuationAtCutoffDb;
+    entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
+    entry.spec.stopbandMode = snap.stopbandMode;
+    entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
+    entry.tapCount = snap.tapCount;
+    entry.achievedStopbandDb = snap.achievedStopbandDb;
+    entry.taps = snap.taps;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+
+        bool replaced = false;
+        for (auto& e : userOverrides)
+        {
+            if (specsEqual (e.spec, entry.spec))
+            {
+                e = entry;
+                replaced = true;
+                break;
+            }
+        }
+        if (! replaced)
+            userOverrides.push_back (entry);
+    }
+
+    // Persist to disk. userOverrides is only ever appended/replaced-in-
+    // place above, so copying it out here (rather than holding specLock
+    // across the file write) is safe - saveAll() takes a snapshot by
+    // value anyway.
+    std::vector<bbk::detachedpole::useroverrides::OverrideEntry> toSave;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        toSave = userOverrides;
+    }
+    bbk::detachedpole::useroverrides::saveAll (toSave);
+
+    // Reflect the save immediately in the UI as a UserOverride result -
+    // the spec hasn't changed, so requestBoundaryRedesign()'s own dedup
+    // guard would otherwise no-op this and leave the "Design method:"
+    // label saying Custom/Default even though a saved override now exists
+    // for this exact spec.
+    bbk::parametric::DesignResult result;
+    result.taps = entry.taps;
+    result.tapCount = entry.tapCount;
+    result.constraintsMet = true;
+    result.achievedStopbandDb = entry.achievedStopbandDb;
+    result.designAttempts = 0;
+    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz);
+
+    publishResult (entry.spec, result, ResultSource::UserOverride);
+}
+
 void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 {
     // May be called from the message thread (typical - a slider moved) or
@@ -287,6 +361,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
     bool haveInstantResult = false;
     bbk::parametric::DesignResult instantResult;
+    ResultSource instantSource = ResultSource::LiveSearch;
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -317,9 +392,37 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         ++boundaryEpoch;
         taskQueue.clear(); // also discards any now-stale in-flight live design
 
-        if (presetEntry != nullptr)
+        // User overrides win regardless of Default/Custom mode (checked
+        // even when presetEntry above is null, i.e. Custom mode or an
+        // untabled sample rate) - see saveCurrentAsOverride()'s own
+        // comment. userOverrides is guarded by this same specLock (see its
+        // declaration in the header) since this function, like the rest of
+        // the specLock-guarded block, can run on the audio thread.
+        const bbk::detachedpole::useroverrides::OverrideEntry* overrideEntry = nullptr;
+        for (auto& e : userOverrides)
+        {
+            if (specsEqual (e.spec, spec))
+            {
+                overrideEntry = &e;
+                break;
+            }
+        }
+
+        if (overrideEntry != nullptr)
         {
             haveInstantResult = true;
+            instantSource = ResultSource::UserOverride;
+            instantResult.taps = overrideEntry->taps;
+            instantResult.tapCount = overrideEntry->tapCount;
+            instantResult.constraintsMet = true;
+            instantResult.achievedStopbandDb = overrideEntry->achievedStopbandDb;
+            instantResult.designAttempts = 0;
+            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+        }
+        else if (presetEntry != nullptr)
+        {
+            haveInstantResult = true;
+            instantSource = ResultSource::PresetBank;
             instantResult.taps = presetEntry->taps;
             instantResult.tapCount = presetEntry->tapCount;
             instantResult.constraintsMet = true;
@@ -339,14 +442,14 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     // publishResult() takes specLock itself (briefly, for versionCounter) -
     // must be called after the block above releases it, not from inside.
     if (haveInstantResult)
-        publishResult (spec, instantResult, true);
+        publishResult (spec, instantResult, instantSource);
     else
         notify();
 }
 
 void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec,
                                                      const bbk::parametric::DesignResult& result,
-                                                     bool fromPresetBank)
+                                                     ResultSource source)
 {
     int version;
     {
@@ -382,7 +485,7 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
         uiSnapshot.constraintsMet = result.constraintsMet;
         uiSnapshot.designAttempts = result.designAttempts;
-        uiSnapshot.fromPresetBank = fromPresetBank;
+        uiSnapshot.source = source;
         uiSnapshot.taps = result.taps;
         uiSnapshot.temporal = result.temporal;
     }

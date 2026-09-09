@@ -7,6 +7,7 @@
 #include <vector>
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
+#include "UserPresetOverrides.h"
 
 // BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
@@ -102,6 +103,17 @@ public:
     // gives an objective signal instead of relying on hearing it.
     juce::uint32 getLastClipTimeMsForUI() const noexcept { return lastClipTimeMs.load(); }
 
+    // Where a published design actually came from - shown in the editor's
+    // metrics readout and used to decide whether "Save as Default" is
+    // meaningful (saving an already-instant result just re-saves the same
+    // taps under the same spec, which is harmless but pointless).
+    enum class ResultSource
+    {
+        LiveSearch,   // Custom mode: a fresh designParametricFIR() search
+        PresetBank,   // Default mode: instant lookup in the compiled-in factory bank
+        UserOverride  // instant lookup in a filter the user saved themselves (see saveCurrentAsOverride)
+    };
+
     // A snapshot of the most recently completed design, safe to read from
     // the message thread at any time (used by the editor's metrics
     // readout and the "show coefficients" popup).
@@ -118,7 +130,7 @@ public:
         double achievedStopbandDb = 0.0;
         bool constraintsMet = false;
         int designAttempts = 0;
-        bool fromPresetBank = false; // instant lookup (see requestBoundaryRedesign), not a live search
+        ResultSource source = ResultSource::LiveSearch;
         std::vector<double> taps; // the actual (unpadded) symmetric taps
 
         // Temporal-concentration metrics from the article ("Impulse-
@@ -129,6 +141,17 @@ public:
         bbk::parametric::TemporalMetrics temporal;
     };
     DesignSnapshot getDesignSnapshotForUI() const;
+
+    // Persists the currently-published design (whatever it is - a live
+    // Custom-mode result, a Default-mode bank entry, or even an existing
+    // override) as a user override for its own exact spec (sample rate,
+    // cutoff, attenuation, stopband, decay - see UserPresetOverrides.h).
+    // From then on, ANY time that exact spec recurs - in either Default or
+    // Custom mode, this session or a future one - requestBoundaryRedesign()
+    // finds and uses it instantly, ahead of both the compiled-in factory
+    // bank and a fresh live search. A no-op if nothing has been designed
+    // yet (tapCount == 0).
+    void saveCurrentAsOverride();
 
 private:
     void run() override; // juce::Thread - background redesign worker
@@ -151,11 +174,11 @@ private:
     // Bumps versionCounter and writes latestResult/latestSpec/
     // latestVersion/uiSnapshot exactly once, so the audio thread's existing
     // version-based crossfade pickup in process() always sees the newest
-    // published design. fromPresetBank just tags the UI snapshot (see
+    // published design. source just tags the UI snapshot (see
     // DesignSnapshot) - it doesn't change how the result is applied.
     void publishResult (const bbk::parametric::FilterSpec& spec,
                          const bbk::parametric::DesignResult& result,
-                         bool fromPresetBank = false);
+                         ResultSource source = ResultSource::LiveSearch);
 
     // Called when the "presetMode" parameter turns on (see ParamListener
     // below): forces cutoff/stopband/sidelobeDecay to the exact operating
@@ -254,6 +277,15 @@ private:
     // that transition or it silently keeps showing whichever result was
     // already published.
     bool currentBoundaryPresetMode = false;
+
+    // Guarded by specLock (not message-thread-only: requestBoundaryRedesign()
+    // - which searches this - can run on the audio thread too, same as
+    // currentBoundarySpec above). Loaded once in the constructor and
+    // updated by saveCurrentAsOverride(); kept in memory so a lookup
+    // (potentially once per parameter tick, e.g. mid slider-drag) never
+    // has to hit disk - see UserPresetOverrides.h's own comment on why
+    // the file itself isn't cached at that layer.
+    std::vector<bbk::detachedpole::useroverrides::OverrideEntry> userOverrides;
 
     juce::SpinLock resultLock;
     bbk::parametric::DesignResult latestResult;
