@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 #include "PresetBankLookup.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace
@@ -251,32 +252,42 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
 {
     using namespace bbk::detachedpole::presetbank;
 
-    // If the user has saved their own override for this exact sample rate
-    // + attenuation, Default mode should snap cutoff/stopband/decay to
-    // THAT operating point instead of the factory bank's fixed one -
-    // otherwise saveCurrentAsOverride() would be pointless: re-enabling
-    // Default would always force the sliders back to the factory point
-    // first, and the subsequent override lookup in requestBoundaryRedesign()
-    // (an exact full-spec match) would then never hit, silently falling
-    // back to the plain factory bank entry instead of the user's override.
-    // Matched on sample rate + attenuation only, not the full spec -
-    // cutoff/stopband/decay are exactly what this function is about to
-    // decide, so they can't be part of the lookup key here.
+    // If the user has saved an override for this sample rate, Default mode
+    // should recall THAT entire operating point - cutoff, attenuation,
+    // stopband AND decay - rather than just snapping cutoff/stopband/decay
+    // to the factory bank's fixed point and leaving attenuation wherever
+    // the slider happens to be. Earlier behaviour only recalled the
+    // override when the slider was already sitting on the exact
+    // attenuation it was saved at, which meant wandering the Attenuation
+    // slider away and then re-enabling Default silently fell back to the
+    // factory entry for whatever attenuation was currently dialed in -
+    // technically consistent with the exact-spec-match design, but not
+    // what "save as MY default" means to a user: it should mean "this is
+    // now the one thing Default recalls," full stop, the same way
+    // reopening a saved preset recalls every field it was saved with.
+    //
+    // Matched on sample rate alone, most-recently-saved wins (userOverrides
+    // is kept in save order - see saveCurrentAsOverride() - so the last
+    // entry matching this rate is the one to use). Only sample rate can be
+    // part of this lookup key: every other field is exactly what this
+    // function is about to decide.
     const auto spec = specFromParameters();
 
     double targetCutoffHz = presetCutoffHz;
+    double targetAttenuationDb = spec.attenuationAtCutoffDb;
     double targetStopbandRejectionDb = presetStopbandRejectionDb;
     double targetSidelobeDecayRatio = presetSidelobeDecayRatio;
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
-        for (auto& e : userOverrides)
+        for (auto it = userOverrides.rbegin(); it != userOverrides.rend(); ++it)
         {
-            if (e.spec.sampleRateHz == spec.sampleRateHz && e.spec.attenuationAtCutoffDb == spec.attenuationAtCutoffDb)
+            if (it->spec.sampleRateHz == spec.sampleRateHz)
             {
-                targetCutoffHz = e.spec.cutoffHz;
-                targetStopbandRejectionDb = e.spec.stopbandRejectionDb;
-                targetSidelobeDecayRatio = e.spec.sidelobeDecayRatio;
+                targetCutoffHz = it->spec.cutoffHz;
+                targetAttenuationDb = it->spec.attenuationAtCutoffDb;
+                targetStopbandRejectionDb = it->spec.stopbandRejectionDb;
+                targetSidelobeDecayRatio = it->spec.sidelobeDecayRatio;
                 break;
             }
         }
@@ -284,6 +295,8 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
 
     if (auto* cutoffParam = parameters.getParameter ("cutoff"))
         cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (targetCutoffHz)));
+    if (auto* attenuationParam = parameters.getParameter ("attenuation"))
+        attenuationParam->setValueNotifyingHost (attenuationParam->convertTo0to1 (static_cast<float> (targetAttenuationDb)));
     if (auto* stopbandParam = parameters.getParameter ("stopband"))
         stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetStopbandRejectionDb)));
     if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
@@ -319,18 +332,15 @@ void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
 
-        bool replaced = false;
-        for (auto& e : userOverrides)
-        {
-            if (specsEqual (e.spec, entry.spec))
-            {
-                e = entry;
-                replaced = true;
-                break;
-            }
-        }
-        if (! replaced)
-            userOverrides.push_back (entry);
+        // Erase-then-push_back (not update-in-place) so the just-saved
+        // entry always ends up last - forcePresetOperatingPoint() relies
+        // on vector order to find the MOST RECENTLY saved override for a
+        // sample rate (scanning from the back), since there's no separate
+        // timestamp field.
+        userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
+                                              [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
+                              userOverrides.end());
+        userOverrides.push_back (entry);
     }
 
     // Persist to disk. userOverrides is only ever appended/replaced-in-

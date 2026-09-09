@@ -181,20 +181,25 @@ private:
                          ResultSource source = ResultSource::LiveSearch);
 
     // Called when the "presetMode" parameter turns on (see ParamListener
-    // below): forces cutoff/stopband/sidelobeDecay to an operating point,
-    // via setValueNotifyingHost - the same "processor drives another
-    // parameter's value directly" pattern already used for the Auto
-    // Headroom ratchet (see process()). Normally that's the fixed point
-    // the preset bank was swept at, but if a user override (see
-    // saveCurrentAsOverride()) exists for the current sample rate +
-    // attenuation, its own cutoff/stopband/decay are used instead, so
-    // re-enabling Default reproduces the saved override rather than
-    // clobbering it back to the factory point first. This makes the
-    // greyed-out sliders in Default mode show the values that are
-    // actually in effect, rather than whatever Custom-mode position they
-    // were last left at, and means specFromParameters() never needs its
-    // own separate preset/custom branch - it just always reads whatever
-    // the parameters currently hold.
+    // below): forces cutoff/attenuation/stopband/sidelobeDecay to an
+    // operating point, via setValueNotifyingHost - the same "processor
+    // drives another parameter's value directly" pattern already used for
+    // the Auto Headroom ratchet (see process()). Normally that's the fixed
+    // point the preset bank was swept at (attenuation left alone, so the
+    // slider still picks one of the 10 precomputed steps) - but if the
+    // user has saved an override (see saveCurrentAsOverride()) for the
+    // current sample rate, ALL FOUR are instead snapped to that override's
+    // own values, attenuation included: "save as my default" means Default
+    // should always recall that exact saved point, not just the same
+    // cutoff/stopband/decay with whichever attenuation the slider happens
+    // to be sitting on. If more than one override exists for this rate,
+    // the most recently saved one wins (see saveCurrentAsOverride()'s
+    // ordering). This makes the greyed-out sliders in Default mode show
+    // the values that are actually in effect, rather than whatever
+    // Custom-mode position they were last left at, and means
+    // specFromParameters() never needs its own separate preset/custom
+    // branch - it just always reads whatever the parameters currently
+    // hold.
     void forcePresetOperatingPoint();
 
     juce::AudioProcessorValueTreeState parameters;

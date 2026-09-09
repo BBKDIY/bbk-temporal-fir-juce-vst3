@@ -310,14 +310,19 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // live and misleading.
     attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
 
-    // Default mode: cutoff/stopband/sidelobeDecay are forced to the
-    // preset-bank operating point (see forcePresetOperatingPoint()) and
-    // ignored by the design itself, so grey them out - per the chosen UI,
-    // they stay visible and keep showing the forced values (the sliders
-    // themselves already reflect those values via their own attachments,
-    // since forcePresetOperatingPoint() writes through the real
-    // parameters). Attenuation is left alone: it still picks which of the
-    // 10 precomputed steps is used, so it stays live in both modes.
+    // Default mode: cutoff/stopband/sidelobeDecay are forced to an
+    // operating point the instant Default turns on (the factory bank's
+    // fixed point, or a saved override's own point if one exists for this
+    // sample rate - see forcePresetOperatingPoint()) and ignored by the
+    // design itself, so grey them out - per the chosen UI, they stay
+    // visible and keep showing the forced values (the sliders themselves
+    // already reflect those values via their own attachments, since
+    // forcePresetOperatingPoint() writes through the real parameters).
+    // Attenuation stays enabled in both modes too - forcePresetOperatingPoint()
+    // snaps it once at the moment Default turns on (to the override's own
+    // attenuation if one exists, otherwise left as-is so it still picks
+    // among the 10 factory steps), but afterwards it's still live: you can
+    // drag it to browse the other factory steps even with Default checked.
     const bool presetModeOn = processor.getAPVTS().getRawParameterValue ("presetMode")->load() > 0.5f;
     cutoffSlider.setEnabled (! presetModeOn);
     stopbandSlider.setEnabled (! presetModeOn);
