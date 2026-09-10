@@ -1443,4 +1443,62 @@ inline int minimumFeasibleTapCount (const FilterSpec& spec, int maxTapCount = 16
     return 2 * hi + 1;
 }
 
+// Runs the design engine at a single, caller-specified tap count instead
+// of designParametricFIR's own M-search over increasing M. Used by Manual
+// tap-count mode (see PluginProcessor.cpp): the user picks a tap count
+// directly - after minimumFeasibleTapCount() above has already been used
+// to silently raise any request below the spec's true feasible floor, per
+// its own comment - and the design should honour exactly that size rather
+// than the engine searching for a different, "better" one of its own
+// choosing. Otherwise this is exactly one iteration of designParametricFIR's
+// own loop body: a single attemptDesign() call at the requested M, then the
+// same centre-symmetric tap-array construction from the half-length
+// coefficients attemptDesign returns.
+//
+// tapCount is expected to be odd (2*M+1 for some M >= 0), matching every
+// tap count this engine can actually produce - the caller (PluginProcessor.cpp)
+// only ever passes an odd value, since both its "manualTapCount" parameter
+// (stepped by 2) and minimumFeasibleTapCount()'s own return value are
+// always odd. An even value is still handled safely: integer division
+// rounds down to the same M as tapCount-1, exactly like every other place
+// in this codebase that derives M from a tap count.
+//
+// overallDeadlineSeconds/perCandidateSeconds default to designParametricFIR's
+// own defaults for consistency, though the plugin's actual call site passes
+// its own live-search budget, same as it does for designParametricFIR.
+inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCount,
+                                                double overallDeadlineSeconds = 180.0,
+                                                double perCandidateSeconds = 15.0)
+{
+    DesignResult result;
+    const int M = std::max (0, (tapCount - 1) / 2);
+
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (overallDeadlineSeconds));
+
+    auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
+    result.designAttempts = 1;
+
+    // attempt.a is always sized M+1 - either genuinely solved coefficients,
+    // or attemptDesign's own explicit all-zero sentinel when no candidate
+    // survived at this M at all (see its own comment) - so this indexing is
+    // safe either way; a degenerate result simply comes back as
+    // constraintsMet == false with all-zero taps, the same "best effort,
+    // targets not met" shape every other caller in this file already
+    // handles, with no special-casing needed here.
+    const int N = 2 * M + 1;
+    std::vector<double> taps (static_cast<std::size_t> (N));
+    for (int m = 0; m <= M; ++m)
+    {
+        taps[static_cast<std::size_t> (M - m)] = attempt.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (M + m)] = attempt.a[static_cast<std::size_t> (m)];
+    }
+    result.taps = taps;
+    result.tapCount = N;
+    result.constraintsMet = attempt.feasible;
+    result.achievedStopbandDb = attempt.worstStopbandDb;
+    result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz);
+    return result;
+}
+
 } // namespace bbk::parametric

@@ -89,6 +89,8 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
     parameters.addParameterListener ("presetMode", &paramListener);
+    parameters.addParameterListener ("tapCountAuto", &paramListener);
+    parameters.addParameterListener ("manualTapCount", &paramListener);
 
     // Loaded once here, not per-lookup - see userOverrides' own comment in
     // PluginProcessor.h.
@@ -111,6 +113,8 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
     parameters.removeParameterListener ("presetMode", &paramListener);
+    parameters.removeParameterListener ("tapCountAuto", &paramListener);
+    parameters.removeParameterListener ("manualTapCount", &paramListener);
 
     signalThreadShouldExit();
     notify();
@@ -210,6 +214,35 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::ParameterID { "autoHeadroom", 1 },
         "Auto Headroom",
         true));
+
+    // Manual/Auto tap-count selector. On (default, unchanged behaviour):
+    // designParametricFIR()'s own M-search picks whichever tap count gives
+    // the best (lowest-R_peak, shortest-settling tie-break) compliant
+    // result - see run() in this file. Off: the M-search is skipped
+    // entirely and the design runs fixed at whatever "Manual Tap Count"
+    // below is set to (after minimumFeasibleTapCount() - see ParametricFIR.h -
+    // silently raises it if it's below the spec's true feasible floor, since
+    // a request under that floor can only ever come back non-compliant) -
+    // lets you deliberately trade ringing quality for a specific, known tap
+    // count/latency, or pin a value for direct A/B comparison.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "tapCountAuto", 1 },
+        "Tap Count Auto",
+        true));
+
+    // Odd-only, 1 to maxTapCount (161): every value this engine can
+    // actually produce is 2*M+1 for some half-length M (see
+    // DetachedPoleFilter.h::maxHalfLength/maxTapCount), so a step of 2
+    // keeps the slider itself from ever landing on a value the engine
+    // would just silently round down anyway (see designParametricFIRFixedM()
+    // in ParametricFIR.h). Default 19 - the paper's own Case B/C baseline
+    // tap count (see Tests/DSPTestDetachedPole.cpp, which verifies it's
+    // present in the selectable bank).
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "manualTapCount", 1 },
+        "Manual Tap Count",
+        juce::NormalisableRange<float> (1.0f, static_cast<float> (bbk::detachedpole::maxTapCount), 2.0f),
+        19.0f));
 
     return layout;
 }
@@ -466,6 +499,14 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         ? bbk::detachedpole::presetbank::findEntry (spec.sampleRateHz, spec.attenuationAtCutoffDb)
         : nullptr;
 
+    // Also read early, same reasoning as presetModeOn above: needed both
+    // for the "did anything actually change" dedup check below and for
+    // the else branch further down (search-cache gating and the queued
+    // DesignTask itself) - see requestedTapCount's own comment on why it
+    // only matters while manualTapCountOn is true.
+    const bool manualTapCountOn = parameters.getRawParameterValue ("tapCountAuto")->load() <= 0.5f;
+    const int requestedTapCount = static_cast<int> (parameters.getRawParameterValue ("manualTapCount")->load());
+
     bool haveInstantResult = false;
     bbk::parametric::DesignResult instantResult;
     ResultSource instantSource = ResultSource::LiveSearch;
@@ -491,11 +532,23 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // when every FilterSpec field is unchanged, since the two modes
         // pull the result from different places (instant bank lookup vs.
         // live search).
-        if (specsEqual (spec, currentBoundarySpec) && presetModeOn == currentBoundaryPresetMode && boundaryEpoch != 0)
+        // manualTapCountOn is compared unconditionally (Auto->Manual or
+        // Manual->Auto must always force a fresh redesign), but
+        // requestedTapCount only when manualTapCountOn is true - comparing
+        // it unconditionally would force a spurious redesign on every mouse
+        // nudge of the manual slider even while Auto mode is on and
+        // ignoring it entirely.
+        if (specsEqual (spec, currentBoundarySpec)
+            && presetModeOn == currentBoundaryPresetMode
+            && manualTapCountOn == currentBoundaryManualTapCountOn
+            && (! manualTapCountOn || requestedTapCount == currentBoundaryRequestedTapCount)
+            && boundaryEpoch != 0)
             return;
 
         currentBoundarySpec = spec;
         currentBoundaryPresetMode = presetModeOn;
+        currentBoundaryManualTapCountOn = manualTapCountOn;
+        currentBoundaryRequestedTapCount = requestedTapCount;
         ++boundaryEpoch;
         taskQueue.clear(); // also discards any now-stale in-flight live design
 
@@ -545,13 +598,27 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
             // Custom), same reasoning as userOverrides: costs nothing to
             // check, and covers an untabled sample rate in Default mode
             // too.
+            //
+            // Skipped entirely while Manual tap-count mode is on, in both
+            // directions: an existing cache entry may have been produced by
+            // an Auto search that landed on a different (better-ringing)
+            // tap count than the one explicitly dialed in here, so serving
+            // it would silently ignore the user's request - and a Manual-
+            // mode result is a deliberate, one-off A/B point rather than
+            // "the" answer for this spec, so it must never be written back
+            // into the cache either and served later to an Auto-mode
+            // lookup for the same spec (see run()'s matching guard on the
+            // write side).
             const bbk::detachedpole::searchcache::CacheEntry* cacheEntry = nullptr;
-            for (auto& e : searchCache)
+            if (! manualTapCountOn)
             {
-                if (specsEqual (e.spec, spec))
+                for (auto& e : searchCache)
                 {
-                    cacheEntry = &e;
-                    break;
+                    if (specsEqual (e.spec, spec))
+                    {
+                        cacheEntry = &e;
+                        break;
+                    }
                 }
             }
 
@@ -571,6 +638,8 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
                 DesignTask task;
                 task.spec = spec;
                 task.epoch = boundaryEpoch;
+                task.manualTapCount = manualTapCountOn;
+                task.requestedTapCount = requestedTapCount;
                 taskQueue.push_back (task);
             }
         }
@@ -668,7 +737,26 @@ void BBKDetachedPoleAudioProcessor::run()
         // instant result while this runs in the background - Custom was
         // previously tuned to not make the user wait too long for SOME
         // result, but that's no longer the only result they have.
-        auto result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0);
+        //
+        // Manual tap-count mode: skip the auto M-search entirely and design
+        // fixed at exactly task.requestedTapCount, after silently raising it
+        // to the spec's true feasible floor first via minimumFeasibleTapCount()
+        // if it's below that (see its own comment in ParametricFIR.h for why
+        // a request under that floor is never a useful result to show). Uses
+        // the same generous time budget as the Auto path below so the
+        // fixed-M solve gets the same convergence opportunity a search
+        // candidate at that same M would have gotten.
+        bbk::parametric::DesignResult result;
+        if (task.manualTapCount)
+        {
+            const int floor = bbk::parametric::minimumFeasibleTapCount (task.spec, bbk::detachedpole::maxTapCount, 30.0);
+            const int target = juce::jmax (task.requestedTapCount, floor);
+            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, 900.0, 60.0);
+        }
+        else
+        {
+            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0);
+        }
 
         // Re-check staleness after the (possibly slow - see
         // ParametricFIR.h for how thorough this search now is)
@@ -689,7 +777,12 @@ void BBKDetachedPoleAudioProcessor::run()
         // came back empty (a degenerate/failed search, nothing usable to
         // remember). Oldest-first eviction once over the cap: cheap, and a
         // spec searched again naturally re-enters at the back anyway.
-        if (result.tapCount > 0 && ! result.taps.empty())
+        //
+        // Also skipped entirely for a Manual tap-count task - see
+        // requestBoundaryRedesign()'s matching guard on the lookup side for
+        // why a Manual-mode result must never be written into (or served
+        // from) the same cache an Auto search uses.
+        if (! task.manualTapCount && result.tapCount > 0 && ! result.taps.empty())
         {
             bbk::detachedpole::searchcache::CacheEntry entry;
             entry.spec = task.spec;

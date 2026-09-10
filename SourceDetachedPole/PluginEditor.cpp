@@ -99,6 +99,23 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     sidelobeDecayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "sidelobeDecay", sidelobeDecaySlider);
 
+    // Manual/Auto tap-count selector - greying handled in timerCallback()
+    // (needs to track the parameter live, e.g. host automation of
+    // "tapCountAuto", same reasoning as defaultModeButton above).
+    prepareLabel (manualTapCountLabel, 13.0f, false, juce::Justification::centredLeft);
+    manualTapCountLabel.setText ("Manual Tap Count", juce::dontSendNotification);
+    addAndMakeVisible (manualTapCountLabel);
+    prepareSlider (manualTapCountSlider);
+    manualTapCountSlider.setNumDecimalPlacesToDisplay (0); // always a whole (odd) tap count - see the parameter's own step
+    addAndMakeVisible (manualTapCountSlider);
+    manualTapCountAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "manualTapCount", manualTapCountSlider);
+
+    tapCountAutoButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (tapCountAutoButton);
+    tapCountAutoAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "tapCountAuto", tapCountAutoButton);
+
     prepareLabel (headroomCaption, 13.0f, false, juce::Justification::centredLeft);
     headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
     addAndMakeVisible (headroomCaption);
@@ -171,7 +188,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 742);
+    setSize (680, 774);
     startTimerHz (4);
     timerCallback();
 }
@@ -215,6 +232,15 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
 
     sliderRow (stopbandLabel, stopbandSlider);
     sliderRow (sidelobeDecayLabel, sidelobeDecaySlider);
+
+    {
+        auto row = area.removeFromTop (26);
+        manualTapCountLabel.setBounds (row.removeFromLeft (170));
+        manualTapCountSlider.setBounds (row.removeFromLeft (140));
+        row.removeFromLeft (16);
+        tapCountAutoButton.setBounds (row.removeFromLeft (70));
+    }
+    area.removeFromTop (6);
 
     {
         auto row = area.removeFromTop (26);
@@ -327,6 +353,15 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     cutoffSlider.setEnabled (! presetModeOn);
     stopbandSlider.setEnabled (! presetModeOn);
     sidelobeDecaySlider.setEnabled (! presetModeOn);
+
+    // Manual Tap Count is a no-op while Auto is on (the engine's own
+    // M-search picks the tap count instead - see run() in
+    // PluginProcessor.cpp) and, same reasoning as the three sliders just
+    // above, while Default mode is on (an instant bank/override lookup,
+    // not a fresh design at all) - grey it out in either case so it never
+    // looks live and editable when it wouldn't actually do anything.
+    const bool tapCountAutoOn = processor.getAPVTS().getRawParameterValue ("tapCountAuto")->load() > 0.5f;
+    manualTapCountSlider.setEnabled (! presetModeOn && ! tapCountAutoOn);
 
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))

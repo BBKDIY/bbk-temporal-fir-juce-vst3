@@ -307,10 +307,23 @@ private:
     // boundaryEpoch it was queued for (checked again before, and after,
     // the actual design runs - see run() - so a task superseded by a newer
     // boundary change mid-flight is discarded rather than published).
+    //
+    // manualTapCount/requestedTapCount: a snapshot of the "tapCountAuto"/
+    // "manualTapCount" parameters at the moment this task was queued (see
+    // requestBoundaryRedesign()) - run() uses these to decide whether to
+    // call designParametricFIR()'s own auto M-search or the fixed-M
+    // designParametricFIRFixedM() instead (see ParametricFIR.h). Snapshotting
+    // here, rather than re-reading the live parameter inside run(), keeps
+    // this task self-consistent even if the user changes Auto/Manual again
+    // while an older task is still queued or mid-flight - exactly the same
+    // "the task carries what it needs, not a live reference" principle
+    // already used for spec above.
     struct DesignTask
     {
         bbk::parametric::FilterSpec spec;
         int epoch = 0;
+        bool manualTapCount = false;
+        int requestedTapCount = 0; // only meaningful when manualTapCount is true
     };
     std::deque<DesignTask> taskQueue;          // guarded by specLock
     int boundaryEpoch = 0;                     // guarded by specLock
@@ -325,6 +338,19 @@ private:
     // that transition or it silently keeps showing whichever result was
     // already published.
     bool currentBoundaryPresetMode = false;
+
+    // Also guarded by specLock, same reasoning and same purpose as
+    // currentBoundaryPresetMode immediately above: the specsEqual() dedup
+    // says nothing about Manual/Auto tap-count mode either, so a user who
+    // only flips "tapCountAuto" or drags "manualTapCount" - touching no
+    // other parameter - must still force a fresh redesign, not be silently
+    // absorbed by the "nothing really changed" early return. requestedTapCount
+    // only matters while currentBoundaryManualTapCountOn is true (comparing
+    // it while Auto is on would force a spurious redesign every time the
+    // manual slider is nudged with the mouse even though Auto mode ignores
+    // it entirely - see requestBoundaryRedesign()).
+    bool currentBoundaryManualTapCountOn = false;
+    int currentBoundaryRequestedTapCount = 0;
 
     // Guarded by specLock. See captureCustomPointBeforeDefault()/
     // restoreCustomPointBeforeDefault() above for the full story: this is

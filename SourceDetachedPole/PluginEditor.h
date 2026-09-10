@@ -44,6 +44,15 @@ private:
     juce::Label sidelobeDecayLabel;
     juce::Slider sidelobeDecaySlider;
 
+    // Manual/Auto tap-count selector - see "tapCountAuto"/"manualTapCount"
+    // in PluginProcessor.cpp::createParameterLayout(). manualTapCountSlider
+    // is greyed out (see timerCallback()) whenever tapCountAutoButton is
+    // checked (Auto mode ignores it entirely) or Default mode is on (same
+    // reasoning as cutoffSlider/stopbandSlider/sidelobeDecaySlider above).
+    juce::Label manualTapCountLabel;
+    juce::Slider manualTapCountSlider;
+    juce::ToggleButton tapCountAutoButton { "Auto" };
+
     juce::Label headroomCaption;
     juce::Slider headroomSlider;
     juce::ToggleButton autoHeadroomButton { "Auto" };
@@ -64,6 +73,8 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sidelobeDecayAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> manualTapCountAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tapCountAutoAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> defaultModeAttachment;
