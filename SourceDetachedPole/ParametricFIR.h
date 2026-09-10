@@ -1372,4 +1372,75 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     return result;
 }
 
+// Quick probe for Manual tap-count mode (see PluginProcessor.cpp): the
+// smallest odd tap count for which the spec is spectrally achievable AT
+// ALL, independent of ringing quality - i.e. the same feasibility test
+// designParametricFIR's own M-search already uses, but stopping at the
+// very first feasible M instead of continuing to search for the lowest-
+// ringing one. A user-requested manual tap count below this floor can
+// only ever come back "best effort, targets not met" (attemptDesign is
+// infeasible for every M below the true minimum, by construction - see
+// its own stopband/passband constraints), which is never a useful result
+// to actually show, so Manual mode calls this first and silently raises
+// the request up to whatever this returns instead of running the doomed
+// attempt at the too-small size the user typed.
+//
+// Feasibility is monotonic in M in practice for a fixed spec: more taps
+// only ever add design freedom under the same fixed passband/stopband/
+// sidelobe targets, never take it away (verified directly across this
+// engine's own test suite - a compliant design at some M has never been
+// observed to become infeasible at a larger M for the same spec). That
+// lets this use exponential-then-binary search (O(log maxM) attemptDesign
+// calls) rather than a linear scan from M=1 - important because a linear
+// scan checking every M up to a potentially-large true minimum (e.g. a
+// cutoff pushed close to Nyquist can need M in the dozens) would cost as
+// many full LP solves as the minimum itself, which is exactly the cost
+// this quick check exists to avoid paying before even starting the real
+// (ringing-optimizing) search.
+//
+// perCandidateSeconds is deliberately short (3s, vs designParametricFIR's
+// own 15s default): this only needs a yes/no feasibility answer at each
+// candidate M, not a fully grid-refined, lowest-possible-rho solution -
+// see attemptDesign's own comment on what that budget actually buys.
+inline int minimumFeasibleTapCount (const FilterSpec& spec, int maxTapCount = 161, double overallDeadlineSeconds = 30.0)
+{
+    const int maxM = (maxTapCount - 1) / 2;
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (overallDeadlineSeconds));
+
+    auto feasibleAt = [&] (int M)
+    {
+        return detail::attemptDesign (spec, M, deadline, 3.0).feasible;
+    };
+
+    int lo = 0; // known infeasible (never itself checked - a 0-tap filter is degenerate, used only as a search floor)
+    int hi = 1;
+    bool hiFeasible = feasibleAt (hi);
+    while (! hiFeasible && hi < maxM && std::chrono::steady_clock::now() < deadline)
+    {
+        lo = hi;
+        hi = std::min (maxM, hi * 2);
+        hiFeasible = feasibleAt (hi);
+    }
+
+    // Nothing feasible anywhere in [1, maxM] within the time budget - the
+    // spec itself may be unachievable at any tap count this engine allows
+    // (or the probe ran out of time on a very demanding one). Either way,
+    // maxTapCount itself is the only sensible floor to hand back: Manual
+    // mode's caller will attempt exactly that size next, which at least
+    // gives the same best-effort result designParametricFIR's own capped-
+    // out path already produces, rather than silently returning some
+    // smaller, definitely-infeasible number.
+    if (! hiFeasible)
+        return maxTapCount;
+
+    while (hi - lo > 1 && std::chrono::steady_clock::now() < deadline)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (feasibleAt (mid)) hi = mid; else lo = mid;
+    }
+
+    return 2 * hi + 1;
+}
+
 } // namespace bbk::parametric

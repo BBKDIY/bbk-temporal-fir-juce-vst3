@@ -8,6 +8,7 @@
 #include "DetachedPoleFilter.h"
 #include "ParametricFIR.h"
 #include "UserPresetOverrides.h"
+#include "LiveSearchCache.h"
 
 // BBK Parametric FIR: a single parametric constrained-least-squares FIR
 // lowpass (see ParametricFIR.h for the design method). Three user-facing
@@ -111,7 +112,8 @@ public:
     {
         LiveSearch,   // Custom mode: a fresh designParametricFIR() search
         PresetBank,   // Default mode: instant lookup in the compiled-in factory bank
-        UserOverride  // instant lookup in a filter the user saved themselves (see saveCurrentAsOverride)
+        UserOverride, // instant lookup in a filter the user saved themselves (see saveCurrentAsOverride)
+        SearchCache   // instant lookup in a Custom-mode result already searched earlier (see LiveSearchCache.h)
     };
 
     // A snapshot of the most recently completed design, safe to read from
@@ -202,6 +204,36 @@ private:
     // hold.
     void forcePresetOperatingPoint();
 
+    // Called from forcePresetOperatingPoint()'s own start, the instant
+    // Default mode turns on: snapshots cutoff/attenuation/stopband/decay
+    // AS THEY WERE just before forcePresetOperatingPoint() overwrites them,
+    // so restoreCustomPointBeforeDefault() below can put the user's actual
+    // Custom-mode point back once Default is unchecked again. Without this,
+    // those four parameters simply stayed at whatever Default forced them
+    // to forever - so "unchecking Default" looked like it did nothing
+    // (still the Default spec, just now unlabelled as one), and any
+    // redesign that DID fire was for that same Default spec, not the
+    // user's own last Custom entry - which also meant it was never a
+    // search-cache hit (see LiveSearchCache.h), so it silently re-ran a
+    // full live search from scratch instead of recalling anything,
+    // breaking A/B comparison between a Custom find and Default entirely.
+    // Guarded against re-capturing on a resent "on" event (e.g. some hosts
+    // resend automation at the playhead on transport start - see
+    // requestBoundaryRedesign()'s own comment on the same pattern): only
+    // captures when currentBoundaryPresetMode is still false, i.e. this is
+    // a genuine off->on transition, not a repeat of the same state.
+    void captureCustomPointBeforeDefault();
+
+    // Restores whatever captureCustomPointBeforeDefault() saved. Called
+    // when "presetMode" turns back off (see ParamListener below), BEFORE
+    // requestBoundaryRedesign() - so the very next redesign already targets
+    // the user's real last Custom-mode spec (which, if it was searched
+    // before turning Default on, is now instantly recalled from
+    // LiveSearchCache.h rather than re-searched). A no-op if Default was
+    // never actually engaged this session (nothing was ever overwritten),
+    // or if this is a resent "off" event while already off.
+    void restoreCustomPointBeforeDefault();
+
     juce::AudioProcessorValueTreeState parameters;
 
     struct ParamListener final : juce::AudioProcessorValueTreeState::Listener
@@ -211,16 +243,22 @@ private:
         void parameterChanged (const juce::String& parameterID, float newValue) override
         {
             // Order matters: force cutoff/stopband/decay to the preset
-            // operating point BEFORE requesting a redesign below, so that
-            // redesign already sees the corrected spec instead of one
+            // operating point (or restore the pre-Default Custom point,
+            // going the other way) BEFORE requesting a redesign below, so
+            // that redesign already sees the corrected spec instead of one
             // that's about to be superseded a moment later by the
             // parameter changes forcePresetOperatingPoint() itself
             // triggers (each of which re-enters this same listener and
             // requests its own redesign in turn - harmless, see that
             // method's own comment, just a couple of extra superseded
             // requests exactly like a fast slider drag already causes).
-            if (parameterID == "presetMode" && newValue > 0.5f)
-                owner.forcePresetOperatingPoint();
+            if (parameterID == "presetMode")
+            {
+                if (newValue > 0.5f)
+                    owner.forcePresetOperatingPoint(); // captures the pre-Default point itself first - see its own comment
+                else
+                    owner.restoreCustomPointBeforeDefault();
+            }
             owner.requestBoundaryRedesign();
         }
     } paramListener { *this };
@@ -288,6 +326,23 @@ private:
     // already published.
     bool currentBoundaryPresetMode = false;
 
+    // Guarded by specLock. See captureCustomPointBeforeDefault()/
+    // restoreCustomPointBeforeDefault() above for the full story: this is
+    // the user's own cutoff/attenuation/stopband/decay from the instant
+    // before Default was last turned on, put back the instant it's turned
+    // back off. havePreDefaultSnapshot distinguishes "never captured yet"
+    // (Default has never been engaged this session) from a genuinely
+    // all-zero snapshot.
+    struct PreDefaultSnapshot
+    {
+        double cutoffHz = 0.0;
+        double attenuationAtCutoffDb = 0.0;
+        double stopbandRejectionDb = 0.0;
+        double sidelobeDecayRatio = 0.0;
+    };
+    PreDefaultSnapshot preDefaultSnapshot;
+    bool havePreDefaultSnapshot = false;
+
     // Guarded by specLock (not message-thread-only: requestBoundaryRedesign()
     // - which searches this - can run on the audio thread too, same as
     // currentBoundarySpec above). Loaded once in the constructor and
@@ -296,6 +351,13 @@ private:
     // has to hit disk - see UserPresetOverrides.h's own comment on why
     // the file itself isn't cached at that layer.
     std::vector<bbk::detachedpole::useroverrides::OverrideEntry> userOverrides;
+
+    // Also guarded by specLock, same reasoning as userOverrides above.
+    // Oldest-first: run() appends the newest completed live search to the
+    // back and evicts from the front once bbk::detachedpole::searchcache::
+    // maxEntries is exceeded - see LiveSearchCache.h and run()'s own
+    // comment. Loaded once in the constructor.
+    std::vector<bbk::detachedpole::searchcache::CacheEntry> searchCache;
 
     juce::SpinLock resultLock;
     bbk::parametric::DesignResult latestResult;

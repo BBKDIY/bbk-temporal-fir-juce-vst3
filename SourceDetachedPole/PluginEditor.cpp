@@ -346,6 +346,10 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             designMethodText = "User Override - instant lookup of a filter you saved yourself for this exact "
                                 "operating point (see Save as Default); no background search.";
             break;
+        case ResultSource::SearchCache:
+            designMethodText = "Custom - already searched for this exact operating point earlier (this session "
+                                "or a previous one); instant recall, no fresh search.";
+            break;
         case ResultSource::LiveSearch:
         default:
             designMethodText = "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "

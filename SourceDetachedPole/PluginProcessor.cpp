@@ -93,6 +93,7 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     // Loaded once here, not per-lookup - see userOverrides' own comment in
     // PluginProcessor.h.
     userOverrides = bbk::detachedpole::useroverrides::loadAll();
+    searchCache = bbk::detachedpole::searchcache::loadAll();
 
     startThread();
 }
@@ -252,6 +253,10 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
 {
     using namespace bbk::detachedpole::presetbank;
 
+    // Must happen before anything below overwrites the very values it's
+    // trying to save - see its own comment.
+    captureCustomPointBeforeDefault();
+
     // If the user has saved an override for this sample rate, Default mode
     // should recall THAT entire operating point - cutoff, attenuation,
     // stopband AND decay - rather than just snapping cutoff/stopband/decay
@@ -301,6 +306,67 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
         stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetStopbandRejectionDb)));
     if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
         decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSidelobeDecayRatio)));
+}
+
+void BBKDetachedPoleAudioProcessor::captureCustomPointBeforeDefault()
+{
+    const juce::SpinLock::ScopedLockType sl (specLock);
+
+    // currentBoundaryPresetMode still reflects the state BEFORE this
+    // transition (requestBoundaryRedesign(), which updates it, hasn't run
+    // yet for this event - see ParamListener's ordering) - so "already
+    // true" here means this is a resent "on" event for a mode we're
+    // already in (some hosts resend automation at the playhead on
+    // transport start/stop), not a genuine off->on transition. Skipping
+    // the capture in that case is essential: the values visible right now
+    // are already the FORCED Default/override ones, not the user's real
+    // Custom point, so capturing here would silently overwrite the
+    // genuine snapshot taken at the real transition with a copy of
+    // Default's own operating point - exactly the bug this exists to fix,
+    // just moved one step later.
+    if (currentBoundaryPresetMode)
+        return;
+
+    preDefaultSnapshot.cutoffHz = static_cast<double> (parameters.getRawParameterValue ("cutoff")->load());
+    preDefaultSnapshot.attenuationAtCutoffDb = static_cast<double> (parameters.getRawParameterValue ("attenuation")->load());
+    preDefaultSnapshot.stopbandRejectionDb = static_cast<double> (parameters.getRawParameterValue ("stopband")->load());
+    preDefaultSnapshot.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
+    havePreDefaultSnapshot = true;
+}
+
+void BBKDetachedPoleAudioProcessor::restoreCustomPointBeforeDefault()
+{
+    PreDefaultSnapshot snap;
+    bool have;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+
+        // Same resend guard as captureCustomPointBeforeDefault(), mirrored:
+        // currentBoundaryPresetMode still reflects the state before THIS
+        // transition, so "already false" means a resent "off" event while
+        // already off - nothing to restore, and restoring again would be
+        // harmless but pointless.
+        if (! currentBoundaryPresetMode)
+            return;
+
+        snap = preDefaultSnapshot;
+        have = havePreDefaultSnapshot;
+    }
+
+    // Default was never actually engaged this session (e.g. a stray "off"
+    // notification with no prior "on") - nothing was ever overwritten, so
+    // there is nothing to put back.
+    if (! have)
+        return;
+
+    if (auto* cutoffParam = parameters.getParameter ("cutoff"))
+        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (snap.cutoffHz)));
+    if (auto* attenuationParam = parameters.getParameter ("attenuation"))
+        attenuationParam->setValueNotifyingHost (attenuationParam->convertTo0to1 (static_cast<float> (snap.attenuationAtCutoffDb)));
+    if (auto* stopbandParam = parameters.getParameter ("stopband"))
+        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (snap.stopbandRejectionDb)));
+    if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
+        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (snap.sidelobeDecayRatio)));
 }
 
 void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
@@ -473,10 +539,40 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         }
         else
         {
-            DesignTask task;
-            task.spec = spec;
-            task.epoch = boundaryEpoch;
-            taskQueue.push_back (task);
+            // Below both curated sources above: an exact spec we've
+            // already paid to search before, this session or an earlier
+            // one - see LiveSearchCache.h. Checked in every mode (not just
+            // Custom), same reasoning as userOverrides: costs nothing to
+            // check, and covers an untabled sample rate in Default mode
+            // too.
+            const bbk::detachedpole::searchcache::CacheEntry* cacheEntry = nullptr;
+            for (auto& e : searchCache)
+            {
+                if (specsEqual (e.spec, spec))
+                {
+                    cacheEntry = &e;
+                    break;
+                }
+            }
+
+            if (cacheEntry != nullptr)
+            {
+                haveInstantResult = true;
+                instantSource = ResultSource::SearchCache;
+                instantResult.taps = cacheEntry->taps;
+                instantResult.tapCount = cacheEntry->tapCount;
+                instantResult.constraintsMet = true;
+                instantResult.achievedStopbandDb = cacheEntry->achievedStopbandDb;
+                instantResult.designAttempts = 0;
+                instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+            }
+            else
+            {
+                DesignTask task;
+                task.spec = spec;
+                task.epoch = boundaryEpoch;
+                taskQueue.push_back (task);
+            }
         }
     }
 
@@ -586,6 +682,37 @@ void BBKDetachedPoleAudioProcessor::run()
         }
         if (! stillCurrent)
             continue;
+
+        // Remember this result so revisiting the exact same spec later -
+        // this session or a future one - is instant (see LiveSearchCache.h
+        // and requestBoundaryRedesign()'s own lookup). Skipped if the taps
+        // came back empty (a degenerate/failed search, nothing usable to
+        // remember). Oldest-first eviction once over the cap: cheap, and a
+        // spec searched again naturally re-enters at the back anyway.
+        if (result.tapCount > 0 && ! result.taps.empty())
+        {
+            bbk::detachedpole::searchcache::CacheEntry entry;
+            entry.spec = task.spec;
+            entry.tapCount = result.tapCount;
+            entry.achievedStopbandDb = result.achievedStopbandDb;
+            entry.taps = result.taps;
+
+            std::vector<bbk::detachedpole::searchcache::CacheEntry> toSave;
+            {
+                const juce::SpinLock::ScopedLockType sl (specLock);
+
+                searchCache.erase (std::remove_if (searchCache.begin(), searchCache.end(),
+                                                    [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
+                                   searchCache.end());
+                searchCache.push_back (entry);
+
+                while (static_cast<int> (searchCache.size()) > bbk::detachedpole::searchcache::maxEntries)
+                    searchCache.erase (searchCache.begin());
+
+                toSave = searchCache;
+            }
+            bbk::detachedpole::searchcache::saveAll (toSave);
+        }
 
         publishResult (task.spec, result);
     }
