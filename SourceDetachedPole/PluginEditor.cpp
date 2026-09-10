@@ -34,6 +34,14 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     prepareLabel (sampleRate);
     addAndMakeVisible (sampleRate);
 
+    // Lit whenever a background design is actually running (see
+    // processor.isSearchInProgressForUI()'s own comment) - text/colour set
+    // live in timerCallback(), same polling pattern as clipIndicator below.
+    searchIndicator.setJustificationType (juce::Justification::centred);
+    searchIndicator.setColour (juce::Label::textColourId, juce::Colours::white);
+    searchIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
+    addAndMakeVisible (searchIndicator);
+
     bypassButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
     addAndMakeVisible (bypassButton);
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
@@ -212,6 +220,7 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
         auto row = area.removeFromTop (24);
         bypassButton.setBounds (row.removeFromRight (100));
         defaultModeButton.setBounds (row.removeFromRight (220));
+        searchIndicator.setBounds (row.removeFromRight (130));
         sampleRate.setBounds (row);
     }
     area.removeFromTop (10);
@@ -310,6 +319,19 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // (or in some host round-trips, never actually reflected) the real
     // current sample rate.
     sampleRate.setText ("Sample rate: " + juce::String (processor.getCurrentSampleRateForUI(), 0) + " Hz", juce::dontSendNotification);
+
+    // See processor.isSearchInProgressForUI()'s own comment: true whenever
+    // a background design is actually queued or running right now, whether
+    // or not a previous result is already showing (that "previous result
+    // still showing while a newer one computes" case is exactly what this
+    // indicator exists for - the tapCount == 0 branch just below already
+    // covers the separate "nothing has ever finished yet" case with its own
+    // message). Blank the rest of the time so it doesn't clutter this row
+    // when nothing is actually being computed.
+    const bool searching = processor.isSearchInProgressForUI();
+    searchIndicator.setText (searching ? "SEARCHING..." : "", juce::dontSendNotification);
+    searchIndicator.setColour (juce::Label::textColourId,
+                                searching ? juce::Colour (0xffd9a34a) : juce::Colours::transparentWhite);
 
     if (snap.tapCount == 0)
     {

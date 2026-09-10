@@ -23,6 +23,13 @@ private:
     juce::Label title;
     juce::Label subtitle;
     juce::Label sampleRate;
+
+    // Lit whenever processor.isSearchInProgressForUI() is true - see its
+    // own comment in PluginProcessor.h. Updated every timerCallback() tick,
+    // same as clipIndicator below; blank/dim the rest of the time so it
+    // doesn't clutter the top row when nothing is actually being computed.
+    juce::Label searchIndicator;
+
     juce::ToggleButton bypassButton { "Bypass" };
     juce::ToggleButton amplitudeRelaxationButton { "Amplitude Relaxation" };
 

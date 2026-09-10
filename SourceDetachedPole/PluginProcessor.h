@@ -104,6 +104,22 @@ public:
     // gives an objective signal instead of relying on hearing it.
     juce::uint32 getLastClipTimeMsForUI() const noexcept { return lastClipTimeMs.load(); }
 
+    // True whenever a live background design - a Custom-mode search, or
+    // Default mode's own fallback to one when the host's sample rate isn't
+    // one of the compiled-in bank's 7 swept rates - is currently queued or
+    // running for the boundary spec presently in effect, i.e. whatever the
+    // UI is showing right now (see DesignSnapshot) is not yet the freshest
+    // result being computed. Deliberately distinct from DesignSnapshot::
+    // tapCount == 0, which means "no completed design AT ALL yet" (the
+    // cold-start/sample-rate-change case, already shown via its own
+    // "Designing filter for..." message in the editor) - this instead
+    // covers the steady-state case where a PREVIOUS result is already
+    // playing but a newer one is being computed because a boundary
+    // parameter (cutoff, attenuation, stopband, sidelobe decay, Default
+    // on/off, or the Manual/Auto tap-count selector) just changed. See
+    // requestBoundaryRedesign() and run() for where this is set/cleared.
+    bool isSearchInProgressForUI() const noexcept { return searchInProgress.load(); }
+
     // Where a published design actually came from - shown in the editor's
     // metrics readout and used to decide whether "Save as Default" is
     // meaningful (saving an already-instant result just re-saves the same
@@ -414,6 +430,19 @@ private:
     // detection that feeds the Auto Headroom ratchet, so the light and
     // Auto react to the same events, not two independent measurements.
     std::atomic<juce::uint32> lastClipTimeMs { 0 };
+
+    // Backs isSearchInProgressForUI() above. Set true exactly when a
+    // DesignTask is actually queued (requestBoundaryRedesign()'s final
+    // else-branch), set false exactly when a result is published - either
+    // an instant one (bank/override/cache hit, in requestBoundaryRedesign()
+    // itself) or a completed background search (in run(), only on the
+    // branch that actually calls publishResult() - a task discarded as
+    // stale, either before or after running the design, never touches this
+    // flag, since by construction its being stale means a newer boundary
+    // change already updated the flag itself, either back to false via its
+    // own instant result or left it true for its own newly-queued task -
+    // see both call sites' own comments).
+    std::atomic<bool> searchInProgress { false };
 
     // Message-thread-only snapshot of the latest completed design, kept
     // separately from the audio-thread hand-off above so the UI never has

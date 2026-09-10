@@ -641,6 +641,11 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
                 task.manualTapCount = manualTapCountOn;
                 task.requestedTapCount = requestedTapCount;
                 taskQueue.push_back (task);
+
+                // See isSearchInProgressForUI()'s own comment: this is the
+                // one place real background work gets queued, so it's the
+                // one place this needs to turn on.
+                searchInProgress.store (true);
             }
         }
     }
@@ -648,7 +653,18 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     // publishResult() takes specLock itself (briefly, for versionCounter) -
     // must be called after the block above releases it, not from inside.
     if (haveInstantResult)
+    {
         publishResult (spec, instantResult, instantSource);
+
+        // An instant result means there is nothing left to wait for, for
+        // THIS boundary change - see isSearchInProgressForUI()'s own
+        // comment. If an older, now-superseded background task happens to
+        // still be running at this exact moment, its own staleness check
+        // in run() will simply discard its result without touching this
+        // flag once it finishes, so this assignment is never clobbered
+        // late by that stale task.
+        searchInProgress.store (false);
+    }
     else
         notify();
 }
@@ -808,6 +824,15 @@ void BBKDetachedPoleAudioProcessor::run()
         }
 
         publishResult (task.spec, result);
+
+        // See isSearchInProgressForUI()'s own comment: this is the one
+        // place a background search's result actually reaches the UI, so
+        // it's the one place in run() this needs to turn back off. Only
+        // reached on the branch that just confirmed task.epoch ==
+        // boundaryEpoch (stillCurrent) - a stale/discarded task takes the
+        // `continue` above instead and never reaches here, exactly as
+        // isSearchInProgressForUI()'s comment describes.
+        searchInProgress.store (false);
     }
 }
 
