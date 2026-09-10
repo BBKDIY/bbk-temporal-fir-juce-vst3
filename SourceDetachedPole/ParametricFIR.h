@@ -1443,17 +1443,39 @@ inline int minimumFeasibleTapCount (const FilterSpec& spec, int maxTapCount = 16
     return 2 * hi + 1;
 }
 
-// Runs the design engine at a single, caller-specified tap count instead
-// of designParametricFIR's own M-search over increasing M. Used by Manual
-// tap-count mode (see PluginProcessor.cpp): the user picks a tap count
-// directly - after minimumFeasibleTapCount() above has already been used
-// to silently raise any request below the spec's true feasible floor, per
-// its own comment - and the design should honour exactly that size rather
-// than the engine searching for a different, "better" one of its own
-// choosing. Otherwise this is exactly one iteration of designParametricFIR's
-// own loop body: a single attemptDesign() call at the requested M, then the
-// same centre-symmetric tap-array construction from the half-length
-// coefficients attemptDesign returns.
+// Runs the design engine starting at a single, caller-specified tap count,
+// instead of designParametricFIR's own M-search that always starts small
+// (M=9) and climbs. Used by Manual tap-count mode (see PluginProcessor.cpp):
+// the user picks a tap count directly - after minimumFeasibleTapCount()
+// above has already been used to silently raise any request below the
+// spec's true feasible floor, per its own comment - and the design should
+// honour that size if it actually works.
+//
+// It is NOT just one attemptDesign() call at that fixed M, though. That was
+// the original implementation, and it had a real bug: attemptDesign() can
+// return its own explicit all-zero "no candidate survived" sentinel even at
+// an M that minimumFeasibleTapCount()'s own cheap 3s-per-candidate probe
+// reported as feasible (or that the user's own too-low request landed on
+// before being raised) - the two use different perCandidateSeconds budgets
+// and attemptDesign's own grid-refinement search is not perfectly
+// deterministic run to run. A single attempt with no fallback then handed
+// that degenerate sentinel straight to the caller as if it were a genuine
+// (if non-compliant) design - all-zero taps - which is silence, not a
+// "best effort, targets not met" result. Reported directly: Manual mode at
+// 23 taps/18.5kHz/95dB going completely silent while the same spec's Auto
+// search (which never hits this path) works fine.
+//
+// So instead this walks M upward from the requested starting point using
+// the exact same step and degenerate-avoidance discipline as
+// designParametricFIR's own loop below (see attemptDegenerate/bestDegenerate
+// there), but stops at the FIRST feasible M rather than continuing to
+// search for the lowest-ringing one - Manual mode means "honour what I
+// typed, or the smallest bump up from it that actually works," not "search
+// for the best possible design at some size near what I typed," which is
+// what Auto/designParametricFIR is for. This also means a manual request
+// that is already comfortably feasible costs exactly one attemptDesign()
+// call, same as before - the extra walk only ever engages when the
+// requested/floor M itself doesn't pan out.
 //
 // tapCount is expected to be odd (2*M+1 for some M >= 0), matching every
 // tap count this engine can actually produce - the caller (PluginProcessor.cpp)
@@ -1463,40 +1485,93 @@ inline int minimumFeasibleTapCount (const FilterSpec& spec, int maxTapCount = 16
 // rounds down to the same M as tapCount-1, exactly like every other place
 // in this codebase that derives M from a tap count.
 //
+// maxTapCount caps how far this is willing to climb past the requested
+// size - same cap the plugin already uses everywhere else (see
+// bbk::detachedpole::maxTapCount) - so a spec that turns out infeasible at
+// every M still terminates instead of climbing forever, ending in the same
+// "best effort, targets not met" shape as hitting the cap in
+// designParametricFIR.
+//
 // overallDeadlineSeconds/perCandidateSeconds default to designParametricFIR's
 // own defaults for consistency, though the plugin's actual call site passes
 // its own live-search budget, same as it does for designParametricFIR.
 inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCount,
+                                                int maxTapCount = 161,
                                                 double overallDeadlineSeconds = 180.0,
                                                 double perCandidateSeconds = 15.0)
 {
     DesignResult result;
-    const int M = std::max (0, (tapCount - 1) / 2);
+    const int maxM = (maxTapCount - 1) / 2;
+    int M = std::min (maxM, std::max (0, (tapCount - 1) / 2));
 
     const auto deadline = std::chrono::steady_clock::now()
         + std::chrono::duration_cast<std::chrono::steady_clock::duration> (std::chrono::duration<double> (overallDeadlineSeconds));
 
-    auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
-    result.designAttempts = 1;
+    detail::AttemptResult best;
+    int bestM = M;
+    bool foundFeasible = false;
 
-    // attempt.a is always sized M+1 - either genuinely solved coefficients,
-    // or attemptDesign's own explicit all-zero sentinel when no candidate
-    // survived at this M at all (see its own comment) - so this indexing is
-    // safe either way; a degenerate result simply comes back as
-    // constraintsMet == false with all-zero taps, the same "best effort,
-    // targets not met" shape every other caller in this file already
-    // handles, with no special-casing needed here.
-    const int N = 2 * M + 1;
-    std::vector<double> taps (static_cast<std::size_t> (N));
-    for (int m = 0; m <= M; ++m)
+    while (true)
     {
-        taps[static_cast<std::size_t> (M - m)] = attempt.a[static_cast<std::size_t> (m)];
-        taps[static_cast<std::size_t> (M + m)] = attempt.a[static_cast<std::size_t> (m)];
+        auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
+        ++result.designAttempts;
+
+        // Same degenerate-sentinel test as designParametricFIR's own loop -
+        // see its comment just above attemptDegenerate/bestDegenerate for
+        // why a[0]==0.0 unambiguously flags "no candidate survived", not a
+        // genuine non-compliant result.
+        const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
+        const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
+
+        if (attempt.feasible)
+        {
+            // First feasible M wins outright - Manual mode wants the
+            // requested (or floor-raised) size honoured, not optimized
+            // past, so there is no "keep searching for something better"
+            // step here the way designParametricFIR has.
+            best = attempt;
+            bestM = M;
+            foundFeasible = true;
+            break;
+        }
+        else if (best.a.empty()
+                 || (bestDegenerate && ! attemptDegenerate)
+                 || (! attemptDegenerate && ! bestDegenerate && attempt.worstStopbandDb < best.worstStopbandDb))
+        {
+            // Not feasible at this M - keep the best (least-far-from-
+            // compliant), non-degenerate attempt seen so far across the
+            // walk, exactly like designParametricFIR's own "no feasible M
+            // yet" branch, so a later M's spurious all-zero sentinel can
+            // never stomp an earlier M's genuine (if non-compliant) result.
+            best = attempt;
+            bestM = M;
+        }
+
+        if (M >= maxM) break;
+        if (std::chrono::steady_clock::now() > deadline) break;
+        M = std::min (maxM, M + std::max (1, M / 6));
+    }
+
+    // best.a is always sized (bestM)+1 - either genuinely solved
+    // coefficients, or attemptDesign's own all-zero sentinel if literally
+    // every M from the requested starting point up to maxTapCount came
+    // back degenerate (spec unachievable at any size this engine allows,
+    // within the time budget) - so this indexing is safe either way; that
+    // remaining edge case still comes back as constraintsMet == false with
+    // all-zero taps, the same "best effort, targets not met" shape every
+    // other caller in this file already handles, with no special-casing
+    // needed here.
+    const int N = 2 * bestM + 1;
+    std::vector<double> taps (static_cast<std::size_t> (N));
+    for (int m = 0; m <= bestM; ++m)
+    {
+        taps[static_cast<std::size_t> (bestM - m)] = best.a[static_cast<std::size_t> (m)];
+        taps[static_cast<std::size_t> (bestM + m)] = best.a[static_cast<std::size_t> (m)];
     }
     result.taps = taps;
     result.tapCount = N;
-    result.constraintsMet = attempt.feasible;
-    result.achievedStopbandDb = attempt.worstStopbandDb;
+    result.constraintsMet = foundFeasible;
+    result.achievedStopbandDb = best.worstStopbandDb;
     result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz);
     return result;
 }

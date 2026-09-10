@@ -558,13 +558,30 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // comment. userOverrides is guarded by this same specLock (see its
         // declaration in the header) since this function, like the rest of
         // the specLock-guarded block, can run on the audio thread.
+        //
+        // Skipped while Manual tap-count mode is on - same reasoning as the
+        // search-cache guard further down (see its own comment): a saved
+        // override may hold a different tap count than the one explicitly
+        // dialed in here (most commonly whatever Auto's own quality search
+        // picked at the time it was saved), so serving it would silently
+        // ignore the user's manual request exactly the way an unguarded
+        // cache hit would. Bug reported directly: entering a fresh Custom
+        // spec with Manual Tap Count set to 19 still instantly loaded an
+        // existing 29-tap override for that spec instead of running a
+        // fresh fixed-19-tap search - this guard is the fix. Saving a NEW
+        // override (via the "Save as Default" button) is unaffected - that
+        // stays a deliberate, explicit action regardless of Manual/Auto
+        // mode; only this automatic lookup is gated.
         const bbk::detachedpole::useroverrides::OverrideEntry* overrideEntry = nullptr;
-        for (auto& e : userOverrides)
+        if (! manualTapCountOn)
         {
-            if (specsEqual (e.spec, spec))
+            for (auto& e : userOverrides)
             {
-                overrideEntry = &e;
-                break;
+                if (specsEqual (e.spec, spec))
+                {
+                    overrideEntry = &e;
+                    break;
+                }
             }
         }
 
@@ -767,7 +784,7 @@ void BBKDetachedPoleAudioProcessor::run()
         {
             const int floor = bbk::parametric::minimumFeasibleTapCount (task.spec, bbk::detachedpole::maxTapCount, 30.0);
             const int target = juce::jmax (task.requestedTapCount, floor);
-            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, 900.0, 60.0);
+            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, 900.0, 60.0);
         }
         else
         {
