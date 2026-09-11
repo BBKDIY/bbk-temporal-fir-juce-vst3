@@ -1277,6 +1277,23 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     int bestM = M;
     bool foundFeasible = false;
 
+    // Lowest R_peak achieved by ANY feasible candidate seen so far across
+    // the whole search - tracked separately from best.rPeakPercent because
+    // best can be swapped onto a near-tie/better-settling candidate whose
+    // own R_peak is somewhat worse than the true minimum already found.
+    // See its use in the improvement/tie-break comparison below: it fixes
+    // a real bug where comparing each new candidate against the (possibly
+    // already-drifted) *current* best let a chain of individually-small
+    // "close enough, but settles faster" swaps compound over many M's -
+    // measured directly walking an accepted 5.40% R_peak result up to
+    // 8.50% over roughly a dozen tap-count steps, each swap within its own
+    // 10% window, even though the original 5.40% design was never beaten
+    // and was still sitting right there, unbeaten, earlier in the search.
+    // Anchoring every comparison to this fixed historical minimum instead
+    // keeps the near-tie window meaningful ("close to the best ever
+    // found") without letting the reference point itself slide.
+    double bestEverRPeak = 1.0e300;
+
     // How the search decides when to stop looking for a BETTER M once at
     // least one feasible one has been found (see the loop below). This was
     // previously a fixed relative window (try up to 1.35x the first
@@ -1427,12 +1444,18 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
             {
                 best = attempt;
                 bestM = M;
+                bestEverRPeak = attempt.rPeakPercent;
                 improved = true;
             }
             else
             {
-                const double requiredImprovement = std::max (rPeakImprovementFloorAbs, best.rPeakPercent * rPeakImprovementRel);
-                const double rPeakDelta = best.rPeakPercent - attempt.rPeakPercent; // >0 => attempt is better
+                // Anchored to bestEverRPeak (the lowest R_peak seen across
+                // the WHOLE search so far), not to best.rPeakPercent -
+                // see bestEverRPeak's own comment above for why comparing
+                // against the current, possibly-already-drifted best let
+                // successive "close enough" swaps compound.
+                const double requiredImprovement = std::max (rPeakImprovementFloorAbs, bestEverRPeak * rPeakImprovementRel);
+                const double rPeakDelta = bestEverRPeak - attempt.rPeakPercent; // >0 => attempt beats the best ever found
                 if (rPeakDelta > requiredImprovement)
                 {
                     best = attempt;
@@ -1442,12 +1465,14 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
                 else if (rPeakDelta > -requiredImprovement
                          && attempt.settlingSampleSpan < best.settlingSampleSpan)
                 {
-                    // Near-tie on R_peak (within that same scaled band,
-                    // not just a fixed absolute amount) - use settling as
-                    // the tie-break.
+                    // Near-tie on R_peak (within that same scaled band of
+                    // the best EVER found, not just a fixed absolute
+                    // amount) - use settling as the tie-break.
                     best = attempt;
                     bestM = M;
                 }
+                if (attempt.rPeakPercent < bestEverRPeak)
+                    bestEverRPeak = attempt.rPeakPercent;
             }
             (void) improved;
             foundFeasible = true;
