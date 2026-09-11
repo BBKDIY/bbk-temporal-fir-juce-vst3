@@ -529,7 +529,6 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             "nothing downstream can fold that energy back into the audible band.\n"
          << "Achieved worst-case level in the enforced region: " << juce::String (snap.achievedStopbandDb, 2)
          << " dB (Nyquist = " << juce::String (nyquist, 0) << " Hz)\n"
-         << "Design attempts (tap-count/stopband-edge candidates tried): " << snap.designAttempts << "\n"
          << "Temporal concentration (from the article's own metrics):\n"
          << "  R_peak " << juce::String (snap.temporal.rPeakPercent, 2) << "%  |  E_ZC "
          << juce::String (snap.temporal.eZcPercent, 3) << "%  |  T_0.1% "
