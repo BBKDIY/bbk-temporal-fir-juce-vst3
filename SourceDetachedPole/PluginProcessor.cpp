@@ -314,6 +314,37 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::NormalisableRange<float> (1.0f, static_cast<float> (bbk::detachedpole::maxTapCount), 2.0f),
         19.0f));
 
+    // Custom-mode search safety net (see run()): once designParametricFIR()'s
+    // own patience/early-stop logic was removed entirely (it now always
+    // extends toward maxTapCount, stopping only on demand via the Stop
+    // button or this deadline - see ParametricFIR.h's own comment), some
+    // upper bound on how long an unattended search can run is still needed
+    // in case the user simply walks away and forgets it's running. This is
+    // that bound, in whatever unit maxSearchTimeIsHours below selects - NOT
+    // a target (a search that's still improving keeps going the whole time
+    // regardless) - and it's user-adjustable rather than a fixed constant
+    // precisely because "5 minutes" won't be the right margin for every
+    // spec or every machine. 0.1 minute (6s) floor rather than 0 so this
+    // can never be accidentally set to "stop immediately"; 999 ceiling is
+    // generous headroom (with Hours on, up to 999 hours) without allowing
+    // an literally-unbounded value. Default 5.0 (minutes, see
+    // maxSearchTimeIsHours's own default) per direct request.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "maxSearchTimeValue", 1 },
+        "Max Search Time",
+        juce::NormalisableRange<float> (0.1f, 999.0f, 0.1f),
+        5.0f));
+
+    // Off (default): maxSearchTimeValue above is minutes (so the default
+    // operating point is a plain "5 minutes"). On: maxSearchTimeValue is
+    // hours instead, for the rare demanding spec/slow machine combination
+    // where even a generous minutes-scale budget isn't enough and the user
+    // wants to deliberately let a search run unattended for a long time.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "maxSearchTimeIsHours", 1 },
+        "Max Search Time (Hours)",
+        false));
+
     return layout;
 }
 
@@ -780,6 +811,11 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // flag once it finishes, so this assignment is never clobbered
         // late by that stale task.
         searchInProgress.store (false);
+        stopSearchRequested.store (false);
+        {
+            const juce::SpinLock::ScopedLockType sl (searchProgressLock);
+            searchProgress = SearchProgressSnapshot {};
+        }
     }
     else
         notify();
@@ -954,22 +990,42 @@ void BBKDetachedPoleAudioProcessor::run()
                 continue;
         }
 
-        // Custom-mode's live search: 900s overall / 60s per candidate,
-        // both well above ParametricFIR.h's own real-time-appropriate
-        // defaults (180s/15s). Safe to be this patient now that Default
-        // mode (see requestBoundaryRedesign()) gives an always-available
-        // instant result while this runs in the background - Custom was
-        // previously tuned to not make the user wait too long for SOME
-        // result, but that's no longer the only result they have.
+        // This is a genuinely new (non-stale) task about to start - reset
+        // the Stop flag and the live-progress snapshot so neither one leaks
+        // forward from whatever the PREVIOUS task left behind (a stale
+        // stopSearchRequested left set from an earlier Stop click would
+        // otherwise make this brand-new search stop on its very first
+        // round; a stale searchProgress would show the editor a leftover
+        // trial count/best-so-far from the last search for a moment before
+        // this one's own onProgress callback below first fires).
+        stopSearchRequested.store (false);
+        {
+            const juce::SpinLock::ScopedLockType sl (searchProgressLock);
+            searchProgress = SearchProgressSnapshot {};
+        }
+
+        // Custom-mode's live search now has no patience limit of its own
+        // (see ParametricFIR.h's own comment on why that was removed
+        // outright): it always keeps extending toward maxTapCount looking
+        // for a better result, stopping only when the user clicks Stop
+        // (requestStopSearch(), wired to concurrency.shouldStopEarly below),
+        // or when it hits this safety-net deadline - a plain backstop for
+        // an unattended search, not a target, read live from the
+        // "maxSearchTimeValue"/"maxSearchTimeIsHours" parameters (editor-
+        // adjustable, 5 minutes by default) rather than a fixed constant,
+        // per direct request. 60s per candidate is unchanged and still well
+        // above ParametricFIR.h's own real-time-appropriate default (15s) -
+        // safe to be this patient now that Default mode (see
+        // requestBoundaryRedesign()) gives an always-available instant
+        // result while this runs in the background.
         //
         // Manual tap-count mode: skip the auto M-search entirely and design
         // fixed at exactly task.requestedTapCount, after silently raising it
         // to the spec's true feasible floor first via minimumFeasibleTapCount()
         // if it's below that (see its own comment in ParametricFIR.h for why
         // a request under that floor is never a useful result to show). Uses
-        // the same generous time budget as the Auto path below so the
-        // fixed-M solve gets the same convergence opportunity a search
-        // candidate at that same M would have gotten.
+        // the same safety-net deadline as the Auto path below, though in
+        // practice it stops at the first feasible M and rarely needs it.
         //
         // concurrency: lets both searches try several candidate tap counts
         // at once instead of one at a time - see SearchConcurrencyHooks'
@@ -989,20 +1045,38 @@ void BBKDetachedPoleAudioProcessor::run()
         // gets tight mid-search. onWorkerThreadStart lowers each spawned
         // worker's own OS thread priority the same way the priority
         // passed to startThread() above does for this thread itself.
+        // shouldStopEarly/onProgress back requestStopSearch()/
+        // getSearchProgressForUI() - see PluginProcessor.h for the full
+        // story on both.
+        const float maxSearchTimeValue = parameters.getRawParameterValue ("maxSearchTimeValue")->load();
+        const bool maxSearchTimeIsHours = parameters.getRawParameterValue ("maxSearchTimeIsHours")->load() > 0.5f;
+        const double safetyDeadlineSeconds = static_cast<double> (maxSearchTimeValue) * (maxSearchTimeIsHours ? 3600.0 : 60.0);
+
         bbk::parametric::SearchConcurrencyHooks concurrency;
         concurrency.pollConcurrency = [this] { return currentAllowedSearchConcurrency(); };
         concurrency.onWorkerThreadStart = [] { lowerCurrentThreadPriorityForSearchWorker(); };
+        concurrency.shouldStopEarly = [this] { return stopSearchRequested.load(); };
+        concurrency.onProgress = [this] (int attemptsSoFar, bool haveBest, int bestTapCount,
+                                          double bestRPeakPercent, double bestAchievedStopbandDb)
+        {
+            const juce::SpinLock::ScopedLockType sl (searchProgressLock);
+            searchProgress.attemptsSoFar = attemptsSoFar;
+            searchProgress.haveBest = haveBest;
+            searchProgress.bestTapCount = bestTapCount;
+            searchProgress.bestRPeakPercent = bestRPeakPercent;
+            searchProgress.bestAchievedStopbandDb = bestAchievedStopbandDb;
+        };
 
         bbk::parametric::DesignResult result;
         if (task.manualTapCount)
         {
             const int floor = bbk::parametric::minimumFeasibleTapCount (task.spec, bbk::detachedpole::maxTapCount, 30.0);
             const int target = juce::jmax (task.requestedTapCount, floor);
-            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, 900.0, 60.0, concurrency);
+            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, 60.0, concurrency);
         }
         else
         {
-            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0, concurrency);
+            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, 60.0, concurrency);
         }
 
         // Re-check staleness after the (possibly slow - see
@@ -1071,6 +1145,12 @@ BBKDetachedPoleAudioProcessor::DesignSnapshot BBKDetachedPoleAudioProcessor::get
 {
     const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
     return uiSnapshot;
+}
+
+BBKDetachedPoleAudioProcessor::SearchProgressSnapshot BBKDetachedPoleAudioProcessor::getSearchProgressForUI() const
+{
+    const juce::SpinLock::ScopedLockType sl (searchProgressLock);
+    return searchProgress;
 }
 
 void BBKDetachedPoleAudioProcessor::prepareToPlay (double sampleRate, int)

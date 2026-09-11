@@ -185,6 +185,31 @@ struct SearchConcurrencyHooks
     // means do nothing extra (the thread just runs at whatever priority
     // std::async's implementation gives it).
     std::function<void()> onWorkerThreadStart;
+
+    // Polled once per round, same cadence as pollConcurrency - returning
+    // true collapses THAT round's own effective deadline to "now" instead
+    // of the caller's real overallDeadlineSeconds, so every attemptDesign()
+    // call about to be dispatched for the round bails out almost
+    // immediately rather than running its usual per-candidate budget (all
+    // the way down to solveLPFeasibility's own existing "checked every 64
+    // pivots" deadline check - see its own comment - so this needed no
+    // changes to the solver itself). The search then ends exactly like
+    // reaching the real deadline naturally: it reports the best result
+    // found across whichever earlier rounds actually completed, not a
+    // truncated/garbage one from the collapsed round. Null means never
+    // stop early (the original behaviour: only the real deadline, M
+    // exhaustion, or FlatMask's own safety valve end the search).
+    std::function<bool()> shouldStopEarly;
+
+    // Called once per candidate attempt, right after its outcome has been
+    // decided, with the search's running state so far: how many candidates
+    // have been tried in total, and - once at least one is feasible - the
+    // current best design's tap count, R_peak, and achieved stopband
+    // level. Purely informational (e.g. to show "trial N, current best: M
+    // taps, X% R_peak" while the search keeps running) - it never affects
+    // which candidate the search itself picks. Null means do nothing extra.
+    std::function<void (int attemptsSoFar, bool haveBest, int bestTapCount,
+                         double bestRPeakPercent, double bestAchievedStopbandDb)> onProgress;
 };
 
 // See the top-of-file comment for the trade-off between these two modes.
@@ -1265,30 +1290,26 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     // compliant with a deeper stopband requirement is trivially compliant
     // with a shallower one. Relaxing a constraint can only ever enlarge
     // the feasible set, so the best achievable result should never get
-    // worse - the search now reflects that directly: instead of a window
-    // sized off the first feasible M, it keeps extending as long as larger
-    // M's keep meaningfully improving R_peak (see the comparison below),
-    // and only gives up after a run of tries that fail to do so. The
-    // shared overall deadline below remains the hard backstop against
-    // runaway time on demanding specs, same as before.
-    constexpr int maxNonImprovingAttempts = 3;
-    int nonImprovingAttempts = 0;
-
-    // Separate, harder cap: even while R_peak keeps *technically* clearing
-    // the "meaningfully better" bar below, stop chasing it after this many
-    // extra attempts past the first feasible M. Measured directly that a
-    // loose spec (plenty of stopband headroom to spare) can keep finding
-    // another >=10%-relative R_peak reduction for many consecutive larger
-    // M's in a row - each one individually reasonable, but each also a
-    // full LP solve at a growing tap count, and the run of them together
-    // can still eat the whole per-spec deadline chasing steadily smaller
-    // absolute gains. This bounds the worst case to a fixed, small number
-    // of extra solves regardless of how persistently R_peak keeps
-    // improving, while still comfortably covering the jump the original
-    // monotonicity bug fix needs (first-feasible to the genuinely better
-    // M is a handful of the search's own M-step increments apart).
-    constexpr int maxExtraAttemptsAfterFeasible = 8;
-    int extraAttemptsAfterFeasible = 0;
+    // worse - the search reflects that directly: instead of a window sized
+    // off the first feasible M, or giving up after some fixed number of
+    // attempts that fail to improve on it, it keeps extending all the way
+    // to maxM as long as the caller lets it (see overallDeadlineSeconds and
+    // concurrency.shouldStopEarly just below) - there is no separate
+    // "patience" cap of its own.
+    //
+    // This used to give up after a small, fixed run of non-improving (or
+    // merely not-*meaningfully*-improving) attempts past the first
+    // feasible M - reported directly that the parallel search (see
+    // SearchConcurrencyHooks) routinely finished well short of both that
+    // patience limit and the overall deadline, i.e. it was giving up on
+    // "is there something meaningfully better at a larger M" well before
+    // it had to. Removed outright rather than raised again: the caller now
+    // has two better tools for the same trade-off - overallDeadlineSeconds
+    // as a plain safety net (not a target), and concurrency.shouldStopEarly
+    // for stopping on demand and keeping whatever the best result found so
+    // far was (see PluginProcessor.cpp's Stop control) - so there is no
+    // longer a good reason for the search to also guess when to give up on
+    // its own.
 
     // Overall wall-clock budget across the *whole* M-search. This search
     // now runs alone - Prolate/Peak-Energy have been removed, so there is
@@ -1327,7 +1348,19 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
             }
         }
 
-        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, deadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+        // If a stop has already been requested before this round's batch
+        // is even dispatched, collapse the deadline this batch runs under
+        // to "now" instead of the full overallDeadlineSeconds one. Every
+        // in-flight LP solve already re-checks its own deadline every 64
+        // pivots (see solveLPFeasibility's own comment) and returns
+        // infeasible-for-this-attempt once it's past it, so this makes a
+        // Stop request land within that same short polling interval rather
+        // than waiting out the rest of the normal per-candidate budget -
+        // without touching the solver itself.
+        const bool stopRequestedThisRound = concurrency.shouldStopEarly && concurrency.shouldStopEarly();
+        const auto roundDeadline = stopRequestedThisRound ? std::chrono::steady_clock::now() : deadline;
+
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
 
         bool stopSearch = false;
         for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
@@ -1344,9 +1377,6 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // that sentinel, not a genuine (if non-compliant) result.
         const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
         const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
-        const bool wasFeasibleBefore = foundFeasible;
-        if (wasFeasibleBefore)
-            ++extraAttemptsAfterFeasible;
 
         if (attempt.feasible)
         {
@@ -1414,19 +1444,12 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
                 {
                     // Near-tie on R_peak (within that same scaled band,
                     // not just a fixed absolute amount) - use settling as
-                    // the tie-break. Not counted as a "real" improvement
-                    // for the patience counter below, so a string of
-                    // near-identical R_peak values (which any small
-                    // settling gain would otherwise reset) can't
-                    // indefinitely postpone giving up the search.
+                    // the tie-break.
                     best = attempt;
                     bestM = M;
                 }
             }
-            if (improved)
-                nonImprovingAttempts = 0;
-            else if (foundFeasible)
-                ++nonImprovingAttempts;
+            (void) improved;
             foundFeasible = true;
         }
         else if (! foundFeasible)
@@ -1453,16 +1476,16 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
             // was NOT feasible (a spurious/degenerate result under time
             // pressure, or a genuinely infeasible M for a spec that is
             // only feasible in a narrow M range) - best simply stays as
-            // the last known-good feasible design. This DOES count toward
-            // nonImprovingAttempts: measured directly that leaving it
-            // uncounted let a run of infeasible/degenerate larger M's
-            // (which cost a full, sometimes slow, LP solve each - see
-            // attemptDesign's own comments) pass for free against the
-            // patience counter, so the search kept paying for several
-            // more of them one M-step at a time instead of giving up
-            // once it was clearly past the design's feasible range.
-            ++nonImprovingAttempts;
+            // the last known-good feasible design and the search keeps
+            // extending toward maxM regardless (no patience counter to
+            // trip anymore - see overallDeadlineSeconds and
+            // concurrency.shouldStopEarly just below for how this search
+            // actually stops).
         }
+
+        if (concurrency.onProgress)
+            concurrency.onProgress (result.designAttempts, foundFeasible, foundFeasible ? (2 * bestM + 1) : 0,
+                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb);
 
         // FlatMask-only safety valve: the "keep searching past the first
         // feasible M, prefer whichever has the lower R_peak" logic above
@@ -1496,8 +1519,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
         if (M >= maxM) { stopSearch = true; break; }
         if (std::chrono::steady_clock::now() > deadline) { stopSearch = true; break; }
-        if (foundFeasible && nonImprovingAttempts >= maxNonImprovingAttempts) { stopSearch = true; break; }
-        if (foundFeasible && extraAttemptsAfterFeasible >= maxExtraAttemptsAfterFeasible) { stopSearch = true; break; }
+        if (concurrency.shouldStopEarly && concurrency.shouldStopEarly()) { stopSearch = true; break; }
         } // end of per-candidate (in-batch, original order) decision walk
 
         if (stopSearch) break;
@@ -1694,7 +1716,13 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
             }
         }
 
-        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, deadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+        // Same on-demand-stop deadline collapse as designParametricFIR's
+        // own round loop - see its comment for why this is safe to do
+        // without touching solveLPFeasibility itself.
+        const bool stopRequestedThisRound = concurrency.shouldStopEarly && concurrency.shouldStopEarly();
+        const auto roundDeadline = stopRequestedThisRound ? std::chrono::steady_clock::now() : deadline;
+
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
 
         bool stopSearch = false;
         for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
@@ -1710,6 +1738,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
         const bool attemptDegenerate = attempt.a.empty() || attempt.a[0] == 0.0;
         const bool bestDegenerate = best.a.empty() || best.a[0] == 0.0;
 
+        bool foundFeasibleThisAttempt = false;
         if (attempt.feasible)
         {
             // First feasible M wins outright - Manual mode wants the
@@ -1719,8 +1748,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
             best = attempt;
             bestM = M;
             foundFeasible = true;
-            stopSearch = true;
-            break;
+            foundFeasibleThisAttempt = true;
         }
         else if (best.a.empty()
                  || (bestDegenerate && ! attemptDegenerate)
@@ -1735,8 +1763,15 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
             bestM = M;
         }
 
+        if (concurrency.onProgress)
+            concurrency.onProgress (result.designAttempts, foundFeasible, foundFeasible ? (2 * bestM + 1) : 0,
+                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb);
+
+        if (foundFeasibleThisAttempt) { stopSearch = true; break; }
+
         if (M >= maxM) { stopSearch = true; break; }
         if (std::chrono::steady_clock::now() > deadline) { stopSearch = true; break; }
+        if (concurrency.shouldStopEarly && concurrency.shouldStopEarly()) { stopSearch = true; break; }
         } // end of per-candidate (in-batch, original order) decision walk
 
         if (stopSearch) break;

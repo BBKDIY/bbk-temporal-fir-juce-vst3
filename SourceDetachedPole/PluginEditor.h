@@ -60,6 +60,25 @@ private:
     juce::Slider manualTapCountSlider;
     juce::ToggleButton tapCountAutoButton { "Auto" };
 
+    // Custom-mode search safety net (see "maxSearchTimeValue"/
+    // "maxSearchTimeIsHours" in PluginProcessor.cpp::createParameterLayout()
+    // and run()'s own comment): a typable numeric value (styled like
+    // headroomSlider below - click the number to edit directly, or use the
+    // +/- arrows) plus an Hours toggle, defaulting to "5" / minutes. This
+    // bounds how long an unattended search can run - the search itself no
+    // longer has any patience limit of its own and otherwise keeps
+    // searching toward the tap-count ceiling until it's stopped, either by
+    // this deadline or by stopSearchButton below.
+    juce::Label maxSearchTimeLabel;
+    juce::Slider maxSearchTimeSlider;
+    juce::ToggleButton maxSearchTimeHoursButton { "Hours" };
+
+    // Calls processor.requestStopSearch() - immediately loads whatever the
+    // best result found so far is, exactly as if the search had hit its own
+    // deadline (see PluginProcessor.h). Enabled only while
+    // processor.isSearchInProgressForUI() is true - see timerCallback().
+    juce::TextButton stopSearchButton { "Stop" };
+
     juce::Label headroomCaption;
     juce::Slider headroomSlider;
     juce::ToggleButton autoHeadroomButton { "Auto" };
@@ -82,6 +101,8 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sidelobeDecayAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> manualTapCountAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tapCountAutoAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxSearchTimeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> maxSearchTimeHoursAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> defaultModeAttachment;

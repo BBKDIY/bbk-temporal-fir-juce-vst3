@@ -121,6 +121,44 @@ public:
     // requestBoundaryRedesign() and run() for where this is set/cleared.
     bool isSearchInProgressForUI() const noexcept { return searchInProgress.load(); }
 
+    // A snapshot of the in-progress background search's own live progress -
+    // how many candidate tap counts it has tried so far, and the best
+    // (lowest-ringing feasible, or least-far-from-compliant if none is
+    // feasible yet) result found among them - written from
+    // ParametricFIR.h's SearchConcurrencyHooks::onProgress callback (see
+    // run()) roughly once per candidate M, so it updates continuously while
+    // a search runs. Deliberately separate from DesignSnapshot/
+    // getDesignSnapshotForUI() above, which only ever reflects the last
+    // PUBLISHED (actually playing) result: per this plugin's design, the
+    // audio and the "official" metrics readout stay on the previous result
+    // for the whole duration of a search and only switch once, either when
+    // the search finishes on its own, the user clicks Stop
+    // (requestStopSearch() below), or the safety-net deadline is hit - this
+    // snapshot is what lets the editor show live trial-count/best-so-far
+    // progress in the meantime without disturbing what's actually playing.
+    struct SearchProgressSnapshot
+    {
+        int attemptsSoFar = 0;
+        bool haveBest = false;
+        int bestTapCount = 0;
+        double bestRPeakPercent = 0.0;
+        double bestAchievedStopbandDb = 0.0;
+    };
+    SearchProgressSnapshot getSearchProgressForUI() const;
+
+    // Requests that whichever background search is currently in progress
+    // (if any) stop as soon as practical and publish the best result found
+    // so far, exactly as if it had hit maxTapCount or its own deadline -
+    // see ParametricFIR.h's SearchConcurrencyHooks::shouldStopEarly, which
+    // run() wires directly to this flag, and that header's own comment on
+    // how a requested stop collapses the current search round's deadline to
+    // "now" for a fast (sub-second) response rather than waiting out the
+    // rest of a slow candidate's LP solve. A no-op if no search is running.
+    // The flag is reset at the start of every newly-queued task in run(),
+    // so a stop request can never "leak" forward and silently cut short a
+    // later, unrelated search the user didn't ask to stop.
+    void requestStopSearch() noexcept { stopSearchRequested.store (true); }
+
     // Where a published design actually came from - shown in the editor's
     // metrics readout and used to decide whether "Save as Default" is
     // meaningful (saving an already-instant result just re-saves the same
@@ -504,6 +542,23 @@ private:
     // own instant result or left it true for its own newly-queued task -
     // see both call sites' own comments).
     std::atomic<bool> searchInProgress { false };
+
+    // Backs requestStopSearch()/getSearchProgressForUI() above. Reset to
+    // false at the start of every task run() picks up off taskQueue, so a
+    // Stop click can never affect a later, different search. Checked from
+    // the background design thread only (via SearchConcurrencyHooks::
+    // shouldStopEarly - see run()); written from the message thread only
+    // (requestStopSearch()) - a plain atomic bool needs nothing more.
+    std::atomic<bool> stopSearchRequested { false };
+
+    // Guarded by its own lock rather than reusing resultLock/specLock:
+    // ParametricFIR.h's SearchConcurrencyHooks::onProgress (see run()) can
+    // fire once per candidate M, many times a second during a fast search,
+    // and giving it a dedicated lock keeps that frequent write from
+    // contending with the audio thread's own tryEnter() on resultLock or
+    // requestBoundaryRedesign()'s use of specLock.
+    mutable juce::SpinLock searchProgressLock;
+    SearchProgressSnapshot searchProgress;
 
     // A cheap, decaying measure of how much of the audio callback's own
     // available time budget (numSamples / sampleRate) each block's actual

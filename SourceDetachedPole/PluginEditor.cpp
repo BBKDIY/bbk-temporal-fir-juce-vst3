@@ -124,6 +124,32 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     tapCountAutoAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "tapCountAuto", tapCountAutoButton);
 
+    // Custom-mode search safety net - see the member comment in
+    // PluginEditor.h. Same typeable IncDecButtons style as headroomSlider
+    // below (click the number to edit directly, or use the +/- arrows).
+    prepareLabel (maxSearchTimeLabel, 13.0f, false, juce::Justification::centredLeft);
+    maxSearchTimeLabel.setText ("Max Search Time", juce::dontSendNotification);
+    addAndMakeVisible (maxSearchTimeLabel);
+    maxSearchTimeSlider.setSliderStyle (juce::Slider::IncDecButtons);
+    maxSearchTimeSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
+    maxSearchTimeSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
+    maxSearchTimeSlider.setNumDecimalPlacesToDisplay (1);
+    addAndMakeVisible (maxSearchTimeSlider);
+    maxSearchTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "maxSearchTimeValue", maxSearchTimeSlider);
+
+    maxSearchTimeHoursButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    addAndMakeVisible (maxSearchTimeHoursButton);
+    maxSearchTimeHoursAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "maxSearchTimeIsHours", maxSearchTimeHoursButton);
+
+    // Loads whatever the best result found so far is, right away - see
+    // processor.requestStopSearch()'s own comment. Enabled state tracks
+    // processor.isSearchInProgressForUI() live in timerCallback(), same
+    // pattern as the greyed-out sliders above.
+    stopSearchButton.onClick = [this] { processor.requestStopSearch(); };
+    addAndMakeVisible (stopSearchButton);
+
     prepareLabel (headroomCaption, 13.0f, false, juce::Justification::centredLeft);
     headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
     addAndMakeVisible (headroomCaption);
@@ -196,7 +222,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 774);
+    setSize (680, 806);
     startTimerHz (4);
     timerCallback();
 }
@@ -248,6 +274,17 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
         manualTapCountSlider.setBounds (row.removeFromLeft (140));
         row.removeFromLeft (16);
         tapCountAutoButton.setBounds (row.removeFromLeft (70));
+    }
+    area.removeFromTop (6);
+
+    {
+        auto row = area.removeFromTop (26);
+        maxSearchTimeLabel.setBounds (row.removeFromLeft (170));
+        maxSearchTimeSlider.setBounds (row.removeFromLeft (100));
+        row.removeFromLeft (16);
+        maxSearchTimeHoursButton.setBounds (row.removeFromLeft (70));
+        row.removeFromLeft (16);
+        stopSearchButton.setBounds (row.removeFromLeft (90));
     }
     area.removeFromTop (6);
 
@@ -333,6 +370,41 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     searchIndicator.setColour (juce::Label::textColourId,
                                 searching ? juce::Colour (0xffd9a34a) : juce::Colours::transparentWhite);
 
+    // Only meaningful while searching is true - see requestStopSearch()'s
+    // own comment. Disabled the rest of the time so there's nothing to
+    // click (and nothing to visually suggest a search could be running)
+    // when none actually is.
+    stopSearchButton.setEnabled (searching);
+
+    // Appended to whatever metrics text follows below (or shown alone, in
+    // the tapCount == 0 branch just below, when nothing has ever finished
+    // designing yet) whenever a background search is actually running -
+    // see getSearchProgressForUI()'s own comment. Deliberately layered
+    // ALONGSIDE the still-playing previous result's own metrics rather than
+    // replacing them: per the chosen design, the audio (and this readout's
+    // main "Design:"/"Target:"/etc. section) stays on the last published
+    // result for the whole duration of a search and only switches once,
+    // either when the search finishes on its own, Stop is clicked, or the
+    // safety-net deadline is hit.
+    juce::String searchProgressText;
+    if (searching)
+    {
+        const auto progress = processor.getSearchProgressForUI();
+        searchProgressText << "\nSearching for a better result in the background ("
+                            << progress.attemptsSoFar << " candidate(s) tried so far";
+        if (progress.haveBest)
+        {
+            searchProgressText << ", best so far " << progress.bestTapCount << " taps, R_peak "
+                                << juce::String (progress.bestRPeakPercent, 2) << "%, achieved "
+                                << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
+        }
+        else
+        {
+            searchProgressText << ", no feasible candidate yet)";
+        }
+        searchProgressText << " - click Stop to load it immediately, or let it keep looking.\n";
+    }
+
     if (snap.tapCount == 0)
     {
         // Shown at cold start and again on every sample-rate change - the
@@ -341,12 +413,12 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         // matched, no clicks) until it completes and crossfades in. In
         // Default mode this resolves near-instantly (an instant bank
         // lookup, not a search) unless the rate isn't one of the 7 the
-        // bank covers; in Custom mode the live search can now take up to
-        // several minutes (see requestBoundaryRedesign()'s own comment on
-        // why that's an acceptable trade now that Default gives an
-        // always-available fallback while it runs).
+        // bank covers; in Custom mode the live search can now run
+        // indefinitely (see requestBoundaryRedesign()'s own comment and
+        // the Max Search Time safety net) rather than blocking playback.
         metricsReadout.setText ("Designing filter for " + juce::String (processor.getCurrentSampleRateForUI(), 0)
-                                 + " Hz... (unfiltered pass-through meanwhile)", juce::dontSendNotification);
+                                 + " Hz... (unfiltered pass-through meanwhile)" + searchProgressText,
+                                 juce::dontSendNotification);
         return;
     }
 
@@ -460,6 +532,8 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
              << "-tap cap - targets not fully reached. Try relaxing a slider (lower cutoff, more "
                 "attenuation headroom, or a shallower stopband floor).";
     }
+
+    text << searchProgressText;
 
     metricsReadout.setText (text, juce::dontSendNotification);
 
