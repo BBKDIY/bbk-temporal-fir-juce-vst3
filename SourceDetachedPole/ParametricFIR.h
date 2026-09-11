@@ -1361,7 +1361,22 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
                 candidateMs.push_back (cursor);
                 if (cursor >= maxM || static_cast<int> (candidateMs.size()) >= roundConcurrency)
                     break;
-                cursor = std::min (maxM, cursor + std::max (1, cursor / 6));
+                // Steps by exactly 1 (every M from the starting point to
+                // maxM, i.e. every odd tap count) rather than the larger
+                // M/6-scaled jumps used elsewhere in this file - a
+                // deliberate choice for THIS search only, made explicitly:
+                // a full run now visits every one of the ~70 odd tap
+                // counts between 19 and 161 instead of the ~18-point
+                // geometric sample used before, at real extra wall-clock
+                // cost in exchange for genuinely not skipping over any
+                // candidate that might have been the true best. Bounded
+                // the same way as before - overallDeadlineSeconds (the
+                // plugin's configurable safety-net, which can be set to
+                // minutes or hours) and concurrency.shouldStopEarly (the
+                // Stop button) still apply exactly as before; this only
+                // changes how many candidates get visited before either
+                // of those triggers or maxM is reached.
+                cursor = std::min (maxM, cursor + 1);
             }
         }
 
@@ -1555,8 +1570,11 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // original loop's own trailing step, and start the next round
         // from there (which may itself request a different concurrency -
         // see pollConcurrency's own comment on why this is re-polled every
-        // round rather than decided once).
-        M = std::min (maxM, M + std::max (1, M / 6));
+        // round rather than decided once). Steps by exactly 1, matching
+        // the candidateMs-building loop above - see its own comment for
+        // why this search (and only this one) now visits every odd tap
+        // count instead of a geometric sample of them.
+        M = std::min (maxM, M + 1);
     }
 
     int N = 2 * bestM + 1;
