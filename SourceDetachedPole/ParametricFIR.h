@@ -1755,7 +1755,15 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
                 candidateMs.push_back (cursor);
                 if (cursor >= maxM || static_cast<int> (candidateMs.size()) >= roundConcurrency)
                     break;
-                cursor = std::min (maxM, cursor + std::max (1, cursor / 6));
+                // Steps by exactly 1, matching designParametricFIR's own
+                // Auto-mode search (see its own comment on the same
+                // change) - kept consistent between the two rather than
+                // this walk skipping over odd tap counts the Auto search
+                // wouldn't. Manual mode still stops at the FIRST feasible
+                // M either way (see foundFeasibleThisAttempt below), so
+                // this only matters in the (rare) case where several M's
+                // in a row come back degenerate before one is feasible.
+                cursor = std::min (maxM, cursor + 1);
             }
         }
 
@@ -1818,7 +1826,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
         } // end of per-candidate (in-batch, original order) decision walk
 
         if (stopSearch) break;
-        M = std::min (maxM, M + std::max (1, M / 6));
+        M = std::min (maxM, M + 1);
     }
 
     // best.a is always sized (bestM)+1 - either genuinely solved
