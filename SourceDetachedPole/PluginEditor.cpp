@@ -203,7 +203,15 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     clipIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
     addAndMakeVisible (clipIndicator);
 
-    prepareLabel (metricsReadout, 13.0f, false, juce::Justification::centredLeft);
+    // topLeft, not centredLeft: a Label vertically CENTRES its text within
+    // its own bounds, so when the (wrapped, multi-line) metrics text is
+    // taller than the fixed area below it gives it, centring clips BOTH
+    // the top and bottom lines symmetrically - reported directly as "the
+    // central part with the text is not big enough to show full text".
+    // topLeft means any remaining shortfall only ever clips the bottom,
+    // which is far less confusing, and pairs with generously sizing that
+    // area in resized() below so clipping shouldn't normally happen at all.
+    prepareLabel (metricsReadout, 13.0f, false, juce::Justification::topLeft);
     addAndMakeVisible (metricsReadout);
 
     coefficientsButton.onClick = [this] { toggleCoefficientsPopup(); };
@@ -222,7 +230,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 806);
+    setSize (680, 971);
     startTimerHz (4);
     timerCallback();
 }
@@ -300,7 +308,15 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     area.removeFromTop (6);
 
     area.removeFromTop (10);
-    metricsReadout.setBounds (area.removeFromTop (215));
+    // Sized generously (up from 215) for the metrics text's actual worst-
+    // case line count: the "Design method"/"Stopband mode"/"Center-tap
+    // gain" lines alone wrap to 2-3 lines each at this width, plus the
+    // live search-progress addendum (see timerCallback()) adds up to 2
+    // more while a search is running - undersizing this clipped real
+    // content, reported directly ("the central part with the text is not
+    // big enough to show full text"). See setSize() below, which grew by
+    // the same amount this took from the window.
+    metricsReadout.setBounds (area.removeFromTop (380));
 
     area.removeFromTop (8);
     auto buttonRow = area.removeFromTop (26);
