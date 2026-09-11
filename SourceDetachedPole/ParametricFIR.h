@@ -378,6 +378,28 @@ inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, 
     return m;
 }
 
+// How many ranked candidates designParametricFIR()'s Auto-mode search keeps
+// track of and returns (see DesignResult::topCandidates below), instead of
+// just the single best. Chosen to match what the editor can usefully show
+// in one always-visible table (see PluginEditor.cpp) - not a fundamental
+// limit of the search itself, just the UI's own row count.
+constexpr int topCandidateCount = 5;
+
+// One ranked candidate from a top-N search result (see DesignResult::
+// topCandidates below), or a single stored entry in the search cache or a
+// saved override (see LiveSearchCache.h/UserPresetOverrides.h) - everything
+// needed to actually load the filter. Temporal-concentration metrics
+// (R_peak, settling, etc.) are deliberately NOT stored here: they are a
+// pure function of taps + sampleRateHz (see computeTemporalMetrics()), so
+// callers recompute them on demand for display rather than persisting a
+// second, potentially-stale copy of numbers already implied by the taps.
+struct RankedCandidate
+{
+    std::vector<double> taps; // natural length == tapCount, unity DC gain
+    int tapCount = 0;
+    double achievedStopbandDb = 0.0;
+};
+
 struct DesignResult
 {
     std::vector<double> taps;
@@ -386,6 +408,18 @@ struct DesignResult
     double achievedStopbandDb = 0.0;
     int designAttempts = 0;
     TemporalMetrics temporal;
+
+    // Populated only by designParametricFIR()'s Auto-mode M-search (see its
+    // own comment on the top-N tracking that replaces the old single-
+    // "best" logic) - up to topCandidateCount entries, best R_peak first;
+    // taps/tapCount/achievedStopbandDb/temporal above always match
+    // topCandidates[0] exactly when this is non-empty. Left empty by
+    // designParametricFIRFixedM() (Manual tap-count mode has no ranking to
+    // do - it stops at the first feasible M by design, see its own
+    // comment) and by every degenerate/infeasible result from either
+    // function, so callers should treat an empty list as "just use the
+    // top-level fields above", not as an error.
+    std::vector<RankedCandidate> topCandidates;
 };
 
 namespace detail
@@ -586,20 +620,20 @@ struct AttemptResult
     // candidates instead of just the first one found (see attemptDesign's
     // candidate sweep and designParametricFIR's M-search).
     //
-    // settlingSampleSpan (T_0.1%, in samples) - not rPeakPercent - is what
-    // designParametricFIR's M-search actually compares candidate M's on:
-    // a lower R_peak does not always mean faster settling. Measured
-    // directly at the Case B operating point: the 25-tap candidate has a
-    // BETTER R_peak than the paper's own 19-tap design (1.758% vs 3.33%)
-    // but a WORSE (longer) settling time (0.125ms vs 0.094ms) - more taps
-    // bought a smaller relative sidelobe ratio while still adding enough
-    // extra above-threshold samples at the tail to lengthen the actual
-    // settling window. Settling time is the metric this plugin exists to
-    // minimize (see the top-of-file article reference), so the search
-    // should optimize for it directly rather than for a proxy that can
-    // move the wrong way. rPeakPercent is kept alongside it for display/
-    // diagnostics (see PluginEditor.cpp) but no longer drives the
-    // cross-M comparison itself.
+    // rPeakPercent is what designParametricFIR's M-search ranks candidate
+    // M's on (see its own top-N tracking): a lower R_peak does not always
+    // mean faster settling (measured directly at the Case B operating
+    // point: the 25-tap candidate has a BETTER R_peak than the paper's own
+    // 19-tap design - 1.758% vs 3.33% - but a WORSE, i.e. longer, settling
+    // time - 0.125ms vs 0.094ms), so the two metrics can genuinely
+    // disagree on which M is "better". This used to mean the search
+    // optimized settlingSampleSpan directly and only used rPeakPercent as
+    // a display/diagnostic value - removed per direct request: R_peak (the
+    // paper's own quality measure) is what the search ranks on now, full
+    // stop, and the resulting top-N list (see DesignResult::topCandidates)
+    // lets the settling-vs-R_peak trade-off be an explicit, informed CHOICE
+    // in the editor's own table instead of something the search decides
+    // silently on the user's behalf.
     double rPeakPercent = 1.0e300;
     int settlingSampleSpan = INT_MAX;
 };
@@ -1277,22 +1311,17 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     int bestM = M;
     bool foundFeasible = false;
 
-    // Lowest R_peak achieved by ANY feasible candidate seen so far across
-    // the whole search - tracked separately from best.rPeakPercent because
-    // best can be swapped onto a near-tie/better-settling candidate whose
-    // own R_peak is somewhat worse than the true minimum already found.
-    // See its use in the improvement/tie-break comparison below: it fixes
-    // a real bug where comparing each new candidate against the (possibly
-    // already-drifted) *current* best let a chain of individually-small
-    // "close enough, but settles faster" swaps compound over many M's -
-    // measured directly walking an accepted 5.40% R_peak result up to
-    // 8.50% over roughly a dozen tap-count steps, each swap within its own
-    // 10% window, even though the original 5.40% design was never beaten
-    // and was still sitting right there, unbeaten, earlier in the search.
-    // Anchoring every comparison to this fixed historical minimum instead
-    // keeps the near-tie window meaningful ("close to the best ever
-    // found") without letting the reference point itself slide.
-    double bestEverRPeak = 1.0e300;
+    // Every feasible candidate found so far, ranked purely by R_peak
+    // (ascending - index 0 is always the lowest/best), capped at
+    // topCandidateCount entries - see DesignResult::topCandidates and
+    // RankedCandidate's own comments for why this replaced the old single-
+    // "best" tracking (which used to also trade away R_peak for a faster
+    // settling time on a near-tie - see the per-candidate loop below for
+    // the full story). best/bestM above are kept in sync with top5.front()
+    // once this is non-empty, purely so the existing infeasible-branch
+    // tracking and onProgress reporting further down don't need their own
+    // separate "is there a feasible result yet" logic.
+    std::vector<std::pair<int, detail::AttemptResult>> top5;
 
     // How the search decides when to stop looking for a BETTER M once at
     // least one feasible one has been found (see the loop below). This was
@@ -1412,84 +1441,29 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
         if (attempt.feasible)
         {
-            // Once at least one M has produced a spec-compliant design,
-            // keep searching larger M values (rather than stopping here)
-            // for one that's genuinely BETTER. Primary criterion is
-            // R_peak (ringing) - the paper's own quality measure - not
-            // settling span: a filter's T_0.1% settling span can never
-            // exceed roughly half its own tap count (everything beyond
-            // the last tap is exactly zero, trivially "settled"), so
-            // comparing settling span *across different M* structurally
-            // favours whichever M is smallest, regardless of how much it
-            // is actually ringing relative to its own length - this is
-            // what caused the exact regression this fixes (loosening a
-            // stopband target let a much shorter, higher-ringing M win
-            // outright: R_peak went from 6.24% at 65 taps/95dB to 9.75%
-            // at 43 taps/80dB, even though the 65-tap/95dB design remains
-            // fully compliant, and strictly better, at 80dB too - nothing
-            // about relaxing that constraint should make the achievable
-            // result worse). Settling span is now only a tie-breaker,
-            // used when R_peak is close enough to be a wash - this is
-            // what "shorter taps given the same other metrics" actually
-            // means.
-            //
-            // The bar for "meaningfully better" scales with the current
-            // best R_peak itself (an absolute floor of 0.05 points, or
-            // 10% relative, whichever is larger) rather than a fixed tiny
-            // absolute amount - measured directly that a fixed 0.05-point
-            // floor let almost every larger M count as "improving" by a
-            // sliver, since more taps very often buys at least a small
-            // R_peak reduction even once the curve has genuinely
-            // flattened. That kept resetting the patience counter below
-            // and turned what should be a quick search into one that rode
-            // every demanding spec's own deadline (each large-M solve
-            // itself is not free - see attemptDesign's own comments) -
-            // a real, measured regression (multiple specs in this test
-            // suite alone went from single-digit-second designs to
-            // hitting their full per-spec deadline). Requiring a
-            // proportionally larger step before it counts keeps the fix
-            // for the original monotonicity bug (that needed a 36%
-            // relative jump, 9.75% to 6.24%, comfortably over this bar)
-            // while letting the search give up quickly once further gains
-            // are genuinely marginal.
-            constexpr double rPeakImprovementFloorAbs = 0.05; // percentage points
-            constexpr double rPeakImprovementRel = 0.10; // 10%
-            bool improved = false;
-            if (! foundFeasible)
+            // Ranks every feasible candidate purely by R_peak (the paper's
+            // own quality measure) and keeps the topCandidateCount best -
+            // see DesignResult::topCandidates and RankedCandidate's own
+            // comments. This used to instead keep a single "best", with a
+            // settling-time tie-break that let a larger M win over a
+            // lower-R_peak one whenever the two were "close enough" -
+            // removed outright per direct request: R_peak is what this
+            // search optimizes now, full stop, and the top-N list this
+            // produces lets the editor's own top-N table offer the
+            // settling-vs-R_peak trade-off as an explicit, informed CHOICE
+            // instead of the search silently making it.
+            auto insertPos = std::find_if (top5.begin(), top5.end(),
+                [&] (const std::pair<int, detail::AttemptResult>& entry)
+                { return attempt.rPeakPercent < entry.second.rPeakPercent; });
+            if (insertPos != top5.end() || static_cast<int> (top5.size()) < topCandidateCount)
             {
-                best = attempt;
-                bestM = M;
-                bestEverRPeak = attempt.rPeakPercent;
-                improved = true;
+                top5.insert (insertPos, { M, attempt });
+                if (static_cast<int> (top5.size()) > topCandidateCount)
+                    top5.pop_back();
             }
-            else
-            {
-                // Anchored to bestEverRPeak (the lowest R_peak seen across
-                // the WHOLE search so far), not to best.rPeakPercent -
-                // see bestEverRPeak's own comment above for why comparing
-                // against the current, possibly-already-drifted best let
-                // successive "close enough" swaps compound.
-                const double requiredImprovement = std::max (rPeakImprovementFloorAbs, bestEverRPeak * rPeakImprovementRel);
-                const double rPeakDelta = bestEverRPeak - attempt.rPeakPercent; // >0 => attempt beats the best ever found
-                if (rPeakDelta > requiredImprovement)
-                {
-                    best = attempt;
-                    bestM = M;
-                    improved = true;
-                }
-                else if (rPeakDelta > -requiredImprovement
-                         && attempt.settlingSampleSpan < best.settlingSampleSpan)
-                {
-                    // Near-tie on R_peak (within that same scaled band of
-                    // the best EVER found, not just a fixed absolute
-                    // amount) - use settling as the tie-break.
-                    best = attempt;
-                    bestM = M;
-                }
-                if (attempt.rPeakPercent < bestEverRPeak)
-                    bestEverRPeak = attempt.rPeakPercent;
-            }
-            (void) improved;
+
+            best = top5.front().second;
+            bestM = top5.front().first;
             foundFeasible = true;
         }
         else if (! foundFeasible)
@@ -1577,18 +1551,42 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         M = std::min (maxM, M + 1);
     }
 
-    int N = 2 * bestM + 1;
-    std::vector<double> taps (static_cast<std::size_t> (N));
-    for (int m = 0; m <= bestM; ++m)
+    // Shared by the top-level result below and by every entry in
+    // result.topCandidates: expands a half-coefficient array a[0..m] (see
+    // attemptDesign's own comment on this representation) into the full
+    // symmetric tap array DesignResult::taps/RankedCandidate::taps expect.
+    auto buildFullTaps = [] (int m, const std::vector<double>& a)
     {
-        taps[static_cast<std::size_t> (bestM - m)] = best.a[static_cast<std::size_t> (m)];
-        taps[static_cast<std::size_t> (bestM + m)] = best.a[static_cast<std::size_t> (m)];
-    }
+        std::vector<double> fullTaps (static_cast<std::size_t> (2 * m + 1));
+        for (int k = 0; k <= m; ++k)
+        {
+            fullTaps[static_cast<std::size_t> (m - k)] = a[static_cast<std::size_t> (k)];
+            fullTaps[static_cast<std::size_t> (m + k)] = a[static_cast<std::size_t> (k)];
+        }
+        return fullTaps;
+    };
+
+    const std::vector<double> taps = buildFullTaps (bestM, best.a);
     result.taps = taps;
-    result.tapCount = N;
+    result.tapCount = static_cast<int> (taps.size());
     result.constraintsMet = foundFeasible;
     result.achievedStopbandDb = best.worstStopbandDb;
     result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz);
+
+    // See DesignResult::topCandidates's own comment: topCandidates[0]
+    // always matches the top-level fields set just above exactly, since
+    // best/bestM are kept in sync with top5.front() throughout the search
+    // loop above.
+    result.topCandidates.reserve (top5.size());
+    for (auto& entry : top5)
+    {
+        RankedCandidate c;
+        c.taps = buildFullTaps (entry.first, entry.second.a);
+        c.tapCount = static_cast<int> (c.taps.size());
+        c.achievedStopbandDb = entry.second.worstStopbandDb;
+        result.topCandidates.push_back (std::move (c));
+    }
+
     return result;
 }
 
@@ -1743,9 +1741,28 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
 
     while (true)
     {
-        const int roundConcurrency = concurrency.pollConcurrency
-            ? std::max (1, concurrency.pollConcurrency())
-            : 1;
+        // Deliberately always exactly 1 - NOT concurrency.pollConcurrency()
+        // - unlike designParametricFIR's own Auto-mode round loop. Manual
+        // mode's whole contract is "try the requested (or floor-raised) tap
+        // count; only if that genuinely fails, move to the next one; stop
+        // the instant any one of them works" (see foundFeasibleThisAttempt
+        // below) - a strictly serial, one-at-a-time walk, never a search
+        // for the best candidate in some neighbourhood. Dispatching several
+        // candidate M's at once (as Auto deliberately does, to explore more
+        // of the range per unit wall-clock) would compute M+1, M+2, etc.
+        // concurrently even when M itself already succeeds, and
+        // attemptDesignBatch waits for the WHOLE batch before this loop can
+        // even look at the first result - so a slow-to-converge later
+        // candidate in that batch could make Manual mode sit there for as
+        // long as the slowest of them, even though the answer it was going
+        // to use was ready almost immediately. Reported directly as Manual
+        // mode "working exactly like Auto" / "not stopping when it finds
+        // the first solution" - this was the cause: the CHOSEN tap count
+        // was already correct either way (see this function's own top
+        // comment), but real wall-clock time, and the appearance of still
+        // searching, was being wasted on candidates that were never going
+        // to be used once an earlier one in the same batch succeeded.
+        const int roundConcurrency = 1;
 
         std::vector<int> candidateMs;
         {
@@ -1762,7 +1779,10 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
                 // wouldn't. Manual mode still stops at the FIRST feasible
                 // M either way (see foundFeasibleThisAttempt below), so
                 // this only matters in the (rare) case where several M's
-                // in a row come back degenerate before one is feasible.
+                // in a row come back degenerate before one is feasible -
+                // and with roundConcurrency now fixed at 1 just above, this
+                // loop body only ever runs once per round anyway (the
+                // break above fires on the very first push_back).
                 cursor = std::min (maxM, cursor + 1);
             }
         }

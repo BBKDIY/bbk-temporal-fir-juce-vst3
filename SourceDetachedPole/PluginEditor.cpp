@@ -217,8 +217,50 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsButton.onClick = [this] { toggleCoefficientsPopup(); };
     addAndMakeVisible (coefficientsButton);
 
-    saveAsDefaultButton.onClick = [this] { processor.saveCurrentAsOverride(); };
+    // Saves whichever row is CURRENTLY ACTIVE (snap.selectedIndex) - see
+    // this button's own header comment. Re-reads the snapshot at click
+    // time rather than capturing anything, so it always reflects whatever
+    // is actually playing right now, including a switch made moments ago
+    // via a row's own Use button below.
+    saveAsDefaultButton.onClick = [this]
+    {
+        const auto snap = processor.getDesignSnapshotForUI();
+        processor.saveTopCandidateAsOverride (snap.selectedIndex);
+    };
     addAndMakeVisible (saveAsDefaultButton);
+
+    // Forces a genuinely fresh search regardless of any existing cache/
+    // override entry for the current spec - see requestFreshSearch()'s own
+    // comment.
+    reSearchButton.onClick = [this] { processor.requestFreshSearch(); };
+    addAndMakeVisible (reSearchButton);
+
+    prepareLabel (topCandidatesHeader, 13.0f, true, juce::Justification::centredLeft);
+    topCandidatesHeader.setText ("Top Results (best R_peak first) - Custom/Auto only", juce::dontSendNotification);
+    addAndMakeVisible (topCandidatesHeader);
+
+    // One row per possible ranked candidate (see DesignSnapshot::
+    // topCandidates) - text and visibility for each are filled in per-tick
+    // by timerCallback() based on how many candidates the current snapshot
+    // actually has; a row with nothing to show is simply hidden rather than
+    // left blank, so Manual-mode/Default-mode results (which have none)
+    // don't leave 5 empty rows sitting on screen.
+    for (int i = 0; i < bbk::parametric::topCandidateCount; ++i)
+    {
+        auto& rowLabel = candidateRowLabels[static_cast<std::size_t> (i)];
+        prepareLabel (rowLabel, 12.0f, false, juce::Justification::centredLeft);
+        addAndMakeVisible (rowLabel);
+
+        auto& useButton = useCandidateButtons[static_cast<std::size_t> (i)];
+        useButton.setButtonText ("Use");
+        useButton.onClick = [this, i] { processor.selectTopCandidate (i); };
+        addAndMakeVisible (useButton);
+
+        auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
+        saveButton.setButtonText ("Save");
+        saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i); };
+        addAndMakeVisible (saveButton);
+    }
 
     coefficientsBox.setMultiLine (true);
     coefficientsBox.setReadOnly (true);
@@ -230,7 +272,11 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    setSize (680, 971);
+    // Grew by 190 from the previous 971 to fit the top-N results table
+    // (header + up to bbk::parametric::topCandidateCount rows) added
+    // between the metrics readout and the coefficients/save-as-default row
+    // - see resized() for the exact layout this accounts for.
+    setSize (680, 1161);
     startTimerHz (4);
     timerCallback();
 }
@@ -293,6 +339,8 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
         maxSearchTimeHoursButton.setBounds (row.removeFromLeft (70));
         row.removeFromLeft (16);
         stopSearchButton.setBounds (row.removeFromLeft (90));
+        row.removeFromLeft (16);
+        reSearchButton.setBounds (row.removeFromLeft (100));
     }
     area.removeFromTop (6);
 
@@ -318,7 +366,23 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     // the same amount this took from the window.
     metricsReadout.setBounds (area.removeFromTop (380));
 
-    area.removeFromTop (8);
+    area.removeFromTop (10);
+    topCandidatesHeader.setBounds (area.removeFromTop (20));
+    area.removeFromTop (4);
+    for (int i = 0; i < bbk::parametric::topCandidateCount; ++i)
+    {
+        auto row = area.removeFromTop (24);
+        auto& useButton = useCandidateButtons[static_cast<std::size_t> (i)];
+        auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
+        useButton.setBounds (row.removeFromRight (60));
+        row.removeFromRight (6);
+        saveButton.setBounds (row.removeFromRight (60));
+        row.removeFromRight (10);
+        candidateRowLabels[static_cast<std::size_t> (i)].setBounds (row);
+        area.removeFromTop (4);
+    }
+
+    area.removeFromTop (6);
     auto buttonRow = area.removeFromTop (26);
     coefficientsButton.setBounds (buttonRow.removeFromLeft (200));
     saveAsDefaultButton.setBounds (buttonRow.removeFromRight (160));
@@ -435,6 +499,16 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         metricsReadout.setText ("Designing filter for " + juce::String (processor.getCurrentSampleRateForUI(), 0)
                                  + " Hz... (unfiltered pass-through meanwhile)" + searchProgressText,
                                  juce::dontSendNotification);
+
+        // Nothing has ever finished designing yet - hide every row rather
+        // than show 5 blank, still-clickable Use/Save buttons with nothing
+        // behind them.
+        for (int i = 0; i < bbk::parametric::topCandidateCount; ++i)
+        {
+            candidateRowLabels[static_cast<std::size_t> (i)].setVisible (false);
+            useCandidateButtons[static_cast<std::size_t> (i)].setVisible (false);
+            saveCandidateButtons[static_cast<std::size_t> (i)].setVisible (false);
+        }
         return;
     }
 
@@ -498,9 +572,9 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         case ResultSource::LiveSearch:
         default:
             designMethodText = "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "
-                                "thoroughly across tap counts and stopband-edge candidates for the best (lowest-"
-                                "ringing, shortest-settling as tie-break) compliant result (see the design-"
-                                "attempts count below).";
+                                "thoroughly across tap counts and stopband-edge candidates, ranked purely by "
+                                "R_peak (lowest-ringing first - see the Top Results table below for the other "
+                                "candidates it found).";
             break;
     }
 
@@ -551,6 +625,47 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     text << searchProgressText;
 
     metricsReadout.setText (text, juce::dontSendNotification);
+
+    // Top-N table: one row per entry in snap.topCandidates (see its own
+    // comment in PluginProcessor.h), best R_peak first. Metrics are
+    // recomputed here rather than stored anywhere - RankedCandidate
+    // deliberately only keeps taps/tapCount/achievedStopbandDb (see its own
+    // comment in ParametricFIR.h), everything else is a pure function of
+    // the taps, same as the main metrics text above already does via
+    // snap.temporal for the active design.
+    const int candidateCount = static_cast<int> (snap.topCandidates.size());
+    for (int i = 0; i < bbk::parametric::topCandidateCount; ++i)
+    {
+        auto& rowLabel = candidateRowLabels[static_cast<std::size_t> (i)];
+        auto& useButton = useCandidateButtons[static_cast<std::size_t> (i)];
+        auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
+
+        const bool haveRow = i < candidateCount;
+        rowLabel.setVisible (haveRow);
+        useButton.setVisible (haveRow);
+        saveButton.setVisible (haveRow);
+        if (! haveRow)
+            continue;
+
+        const auto& c = snap.topCandidates[static_cast<std::size_t> (i)];
+        const auto temporal = bbk::parametric::computeTemporalMetrics (c.taps, snap.sampleRateHz);
+        const bool active = (i == snap.selectedIndex);
+
+        juce::String rowText;
+        rowText << "#" << (i + 1) << (active ? " (ACTIVE) " : "  ")
+                << c.tapCount << " taps | R_peak " << juce::String (temporal.rPeakPercent, 2)
+                << "% | T_0.1% " << juce::String (temporal.settlingMs, 3) << " ms | stopband "
+                << juce::String (c.achievedStopbandDb, 1) << " dB";
+        rowLabel.setText (rowText, juce::dontSendNotification);
+        rowLabel.setColour (juce::Label::textColourId, active ? juce::Colour (0xffd9a34a) : juce::Colours::white);
+
+        // Using the already-active row is a harmless no-op (selectTopCandidate
+        // just re-publishes the same taps again), so there's no need to
+        // disable it - simpler than special-casing "the one row that
+        // matches snap.selectedIndex".
+        useButton.setEnabled (true);
+        saveButton.setEnabled (true);
+    }
 
     if (coefficientsVisible)
         refreshCoefficientsText (snap);

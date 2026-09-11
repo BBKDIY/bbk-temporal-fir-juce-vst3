@@ -406,7 +406,7 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
     // reopening a saved preset recalls every field it was saved with.
     //
     // Matched on sample rate alone, most-recently-saved wins (userOverrides
-    // is kept in save order - see saveCurrentAsOverride() - so the last
+    // is kept in save order - see saveTopCandidateAsOverride() - so the last
     // entry matching this rate is the one to use). Only sample rate can be
     // part of this lookup key: every other field is exactly what this
     // function is about to decide.
@@ -532,7 +532,44 @@ void BBKDetachedPoleAudioProcessor::restoreCustomPointBeforeDefault()
         decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (snap.sidelobeDecayRatio)));
 }
 
-void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
+void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
+{
+    // All of this reads straight out of the already-published uiSnapshot -
+    // every entry in topCandidates is already a fully-designed, spec-
+    // compliant filter from the same completed search (see ParametricFIR.h),
+    // so switching to a different one is just a re-publish of already-known
+    // taps, exactly as cheap as an instant cache/override/bank hit; nothing
+    // here touches the background search thread at all.
+    bbk::parametric::FilterSpec spec;
+    bbk::parametric::DesignResult result;
+    ResultSource source;
+    {
+        const juce::SpinLock::ScopedLockType sl (uiSnapshotLock);
+        if (index < 0 || index >= static_cast<int> (uiSnapshot.topCandidates.size()))
+            return; // out of range, or this design has no ranked list at all (Manual mode/bank entry)
+
+        spec.sampleRateHz = uiSnapshot.sampleRateHz;
+        spec.cutoffHz = uiSnapshot.cutoffHz;
+        spec.attenuationAtCutoffDb = uiSnapshot.attenuationAtCutoffDb;
+        spec.stopbandRejectionDb = uiSnapshot.stopbandRejectionDb;
+        spec.stopbandMode = uiSnapshot.stopbandMode;
+        spec.sidelobeDecayRatio = uiSnapshot.sidelobeDecayRatio;
+        source = uiSnapshot.source;
+
+        const auto& chosen = uiSnapshot.topCandidates[static_cast<std::size_t> (index)];
+        result.taps = chosen.taps;
+        result.tapCount = chosen.tapCount;
+        result.constraintsMet = true;
+        result.achievedStopbandDb = chosen.achievedStopbandDb;
+        result.designAttempts = uiSnapshot.designAttempts;
+        result.temporal = bbk::parametric::computeTemporalMetrics (chosen.taps, spec.sampleRateHz);
+        result.topCandidates = uiSnapshot.topCandidates; // keep the full list around for the next switch
+    }
+
+    publishResult (spec, result, source, index);
+}
+
+void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
 {
     // Whatever is currently published - a live Custom-mode result, a
     // Default-mode bank entry, or even an existing override - becomes the
@@ -554,9 +591,32 @@ void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
     entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
     entry.spec.stopbandMode = snap.stopbandMode;
     entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
-    entry.tapCount = snap.tapCount;
-    entry.achievedStopbandDb = snap.achievedStopbandDb;
-    entry.taps = snap.taps;
+
+    // Saves the WHOLE ranked list (see DesignSnapshot::topCandidates), not
+    // just the one candidate the user picked - see OverrideEntry::
+    // activeIndex's own comment for why: this is what lets the editor's
+    // top-N table still offer every alternative later, exactly as if the
+    // search had just finished again, while still instantly recalling the
+    // one the user actually chose. Manual-mode results and Default-mode
+    // bank entries have no ranked list at all (topCandidates is empty by
+    // design - see ParametricFIR.h/DesignSnapshot's own comments), so those
+    // fall back to wrapping the single currently-playing design as a one-
+    // entry list, same shape UserPresetOverrides.h's own pre-top-N file
+    // upgrade path already produces.
+    if (! snap.topCandidates.empty())
+    {
+        entry.candidates = snap.topCandidates;
+        entry.activeIndex = juce::jlimit (0, static_cast<int> (entry.candidates.size()) - 1, index);
+    }
+    else
+    {
+        bbk::parametric::RankedCandidate c;
+        c.taps = snap.taps;
+        c.tapCount = snap.tapCount;
+        c.achievedStopbandDb = snap.achievedStopbandDb;
+        entry.candidates.push_back (std::move (c));
+        entry.activeIndex = 0;
+    }
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -588,15 +648,62 @@ void BBKDetachedPoleAudioProcessor::saveCurrentAsOverride()
     // guard would otherwise no-op this and leave the "Design method:"
     // label saying Custom/Default even though a saved override now exists
     // for this exact spec.
+    const auto& active = entry.candidates[static_cast<std::size_t> (entry.activeIndex)];
     bbk::parametric::DesignResult result;
-    result.taps = entry.taps;
-    result.tapCount = entry.tapCount;
+    result.taps = active.taps;
+    result.tapCount = active.tapCount;
     result.constraintsMet = true;
-    result.achievedStopbandDb = entry.achievedStopbandDb;
+    result.achievedStopbandDb = active.achievedStopbandDb;
     result.designAttempts = 0;
     result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz);
+    result.topCandidates = entry.candidates;
 
-    publishResult (entry.spec, result, ResultSource::UserOverride);
+    publishResult (entry.spec, result, ResultSource::UserOverride, entry.activeIndex);
+}
+
+void BBKDetachedPoleAudioProcessor::requestFreshSearch()
+{
+    // Forces a genuinely new live search for the current spec, bypassing
+    // the bank/override/cache instant lookups that requestBoundaryRedesign()
+    // itself would otherwise hit - see this method's own header comment for
+    // why that's the whole point of a dedicated Re-search action rather
+    // than just calling requestBoundaryRedesign() again (which would find
+    // the very cache entry this is trying to replace and instantly no-op).
+    if (! hasPrepared.load() || currentSampleRate.load() <= 0.0)
+        return;
+
+    const auto spec = specFromParameters();
+    const bool presetModeOn = parameters.getRawParameterValue ("presetMode")->load() > 0.5f;
+    const bool manualTapCountOn = parameters.getRawParameterValue ("tapCountAuto")->load() <= 0.5f;
+    const int requestedTapCount = static_cast<int> (parameters.getRawParameterValue ("manualTapCount")->load());
+
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+
+        currentBoundarySpec = spec;
+        currentBoundaryPresetMode = presetModeOn;
+        currentBoundaryManualTapCountOn = manualTapCountOn;
+        currentBoundaryRequestedTapCount = requestedTapCount;
+        ++boundaryEpoch; // discards anything already queued/mid-flight, same as requestBoundaryRedesign()
+        taskQueue.clear();
+
+        DesignTask task;
+        task.spec = spec;
+        task.epoch = boundaryEpoch;
+        task.manualTapCount = manualTapCountOn;
+        task.requestedTapCount = requestedTapCount;
+        taskQueue.push_back (task);
+
+        searchInProgress.store (true);
+    }
+
+    stopSearchRequested.store (false);
+    {
+        const juce::SpinLock::ScopedLockType sl (searchProgressLock);
+        searchProgress = SearchProgressSnapshot {};
+    }
+
+    notify();
 }
 
 void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
@@ -640,6 +747,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     bool haveInstantResult = false;
     bbk::parametric::DesignResult instantResult;
     ResultSource instantSource = ResultSource::LiveSearch;
+    int instantSelectedIndex = 0;
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -684,7 +792,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
         // User overrides win regardless of Default/Custom mode (checked
         // even when presetEntry above is null, i.e. Custom mode or an
-        // untabled sample rate) - see saveCurrentAsOverride()'s own
+        // untabled sample rate) - see saveTopCandidateAsOverride()'s own
         // comment. userOverrides is guarded by this same specLock (see its
         // declaration in the header) since this function, like the rest of
         // the specLock-guarded block, can run on the audio thread.
@@ -719,12 +827,15 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         {
             haveInstantResult = true;
             instantSource = ResultSource::UserOverride;
-            instantResult.taps = overrideEntry->taps;
-            instantResult.tapCount = overrideEntry->tapCount;
+            instantSelectedIndex = overrideEntry->activeIndex;
+            const auto& active = overrideEntry->candidates[static_cast<std::size_t> (overrideEntry->activeIndex)];
+            instantResult.taps = active.taps;
+            instantResult.tapCount = active.tapCount;
             instantResult.constraintsMet = true;
-            instantResult.achievedStopbandDb = overrideEntry->achievedStopbandDb;
+            instantResult.achievedStopbandDb = active.achievedStopbandDb;
             instantResult.designAttempts = 0;
             instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+            instantResult.topCandidates = overrideEntry->candidates;
         }
         else if (presetEntry != nullptr)
         {
@@ -773,12 +884,15 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
             {
                 haveInstantResult = true;
                 instantSource = ResultSource::SearchCache;
-                instantResult.taps = cacheEntry->taps;
-                instantResult.tapCount = cacheEntry->tapCount;
+                instantSelectedIndex = 0; // a cache hit is never a deliberate user choice - see CacheEntry's own comment
+                const auto& top = cacheEntry->candidates[0];
+                instantResult.taps = top.taps;
+                instantResult.tapCount = top.tapCount;
                 instantResult.constraintsMet = true;
-                instantResult.achievedStopbandDb = cacheEntry->achievedStopbandDb;
+                instantResult.achievedStopbandDb = top.achievedStopbandDb;
                 instantResult.designAttempts = 0;
                 instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+                instantResult.topCandidates = cacheEntry->candidates;
             }
             else
             {
@@ -801,7 +915,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     // must be called after the block above releases it, not from inside.
     if (haveInstantResult)
     {
-        publishResult (spec, instantResult, instantSource);
+        publishResult (spec, instantResult, instantSource, instantSelectedIndex);
 
         // An instant result means there is nothing left to wait for, for
         // THIS boundary change - see isSearchInProgressForUI()'s own
@@ -823,7 +937,8 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
 void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::FilterSpec& spec,
                                                      const bbk::parametric::DesignResult& result,
-                                                     ResultSource source)
+                                                     ResultSource source,
+                                                     int selectedIndex)
 {
     int version;
     {
@@ -862,6 +977,8 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.source = source;
         uiSnapshot.taps = result.taps;
         uiSnapshot.temporal = result.temporal;
+        uiSnapshot.topCandidates = result.topCandidates;
+        uiSnapshot.selectedIndex = selectedIndex;
     }
 }
 
@@ -1055,7 +1172,30 @@ void BBKDetachedPoleAudioProcessor::run()
         bbk::parametric::SearchConcurrencyHooks concurrency;
         concurrency.pollConcurrency = [this] { return currentAllowedSearchConcurrency(); };
         concurrency.onWorkerThreadStart = [] { lowerCurrentThreadPriorityForSearchWorker(); };
-        concurrency.shouldStopEarly = [this] { return stopSearchRequested.load(); };
+
+        // Also collapses (same as an explicit Stop click) the instant a
+        // newer boundary change supersedes this task's own epoch - e.g.
+        // toggling Default on and back off while a Custom search is still
+        // running. Before this existed, a superseded task had NO way to
+        // notice: it kept running invisibly (this same hook only ever
+        // checked stopSearchRequested) all the way to completion or the
+        // safety-net deadline, then got silently discarded by the
+        // stillCurrent check below - reported directly as "pressed Default,
+        // then unchecked it, and it lost the best found while it kept
+        // searching forward". Polled at the same once-per-round cadence as
+        // pollConcurrency, so this is a cheap, brief specLock read, not a
+        // hot-path cost. Paired with the cache-write-before-staleness-check
+        // change just below: collapsing quickly here means there is less
+        // work to have wasted, and caching whatever was found so far
+        // regardless of staleness means that work is never simply thrown
+        // away either way.
+        concurrency.shouldStopEarly = [this, taskEpoch = task.epoch]
+        {
+            if (stopSearchRequested.load())
+                return true;
+            const juce::SpinLock::ScopedLockType sl (specLock);
+            return taskEpoch != boundaryEpoch;
+        };
         concurrency.onProgress = [this] (int attemptsSoFar, bool haveBest, int bestTapCount,
                                           double bestRPeakPercent, double bestAchievedStopbandDb)
         {
@@ -1079,19 +1219,6 @@ void BBKDetachedPoleAudioProcessor::run()
             result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, 60.0, concurrency);
         }
 
-        // Re-check staleness after the (possibly slow - see
-        // ParametricFIR.h for how thorough this search now is)
-        // computation - a newer boundary change may have arrived while
-        // this task was running. If so, the work is simply discarded, not
-        // published.
-        bool stillCurrent;
-        {
-            const juce::SpinLock::ScopedLockType sl (specLock);
-            stillCurrent = (task.epoch == boundaryEpoch);
-        }
-        if (! stillCurrent)
-            continue;
-
         // Remember this result so revisiting the exact same spec later -
         // this session or a future one - is instant (see LiveSearchCache.h
         // and requestBoundaryRedesign()'s own lookup). Skipped if the taps
@@ -1103,13 +1230,48 @@ void BBKDetachedPoleAudioProcessor::run()
         // requestBoundaryRedesign()'s matching guard on the lookup side for
         // why a Manual-mode result must never be written into (or served
         // from) the same cache an Auto search uses.
+        //
+        // Deliberately done BEFORE the staleness check below, not after -
+        // this is the other half of the Default-toggle fix described on
+        // concurrency.shouldStopEarly above: a task that gets superseded
+        // mid-flight (by a newer boundary change, e.g. Default toggling on
+        // then off again) used to just fall through the old post-check
+        // `continue` with nothing ever cached, forcing a full from-scratch
+        // restart the moment the original spec came back. Caching
+        // whatever was found - even the best-effort, not-fully-searched
+        // result of a search that got cut short by the epoch-aware
+        // shouldStopEarly above - means that restart is instead an instant
+        // cache hit. This is exactly as safe as caching a "properly
+        // finished" result: every cached entry already only ever means
+        // "the best this engine found for this spec, within whatever time
+        // it was given" (see run()'s own overall-deadline handling), not a
+        // promise that the search ran to full completion.
         if (! task.manualTapCount && result.tapCount > 0 && ! result.taps.empty())
         {
             bbk::detachedpole::searchcache::CacheEntry entry;
             entry.spec = task.spec;
-            entry.tapCount = result.tapCount;
-            entry.achievedStopbandDb = result.achievedStopbandDb;
-            entry.taps = result.taps;
+
+            // Auto mode already ranks its own top-N (see ParametricFIR.h's
+            // designParametricFIR and DesignResult::topCandidates) - cache
+            // exactly that list so a later exact-spec hit can offer the
+            // same alternatives the search itself found, not just the
+            // single winner. A Manual task never reaches this branch (see
+            // the guard above), so the only other way result.topCandidates
+            // could be empty here is a degenerate/never-actually-searched
+            // result, already excluded by the tapCount/taps check above -
+            // but guard it anyway rather than cache a hollow entry.
+            if (! result.topCandidates.empty())
+            {
+                entry.candidates = result.topCandidates;
+            }
+            else
+            {
+                bbk::parametric::RankedCandidate c;
+                c.taps = result.taps;
+                c.tapCount = result.tapCount;
+                c.achievedStopbandDb = result.achievedStopbandDb;
+                entry.candidates.push_back (std::move (c));
+            }
 
             std::vector<bbk::detachedpole::searchcache::CacheEntry> toSave;
             {
@@ -1127,6 +1289,21 @@ void BBKDetachedPoleAudioProcessor::run()
             }
             bbk::detachedpole::searchcache::saveAll (toSave);
         }
+
+        // Re-check staleness after the (possibly slow - see
+        // ParametricFIR.h for how thorough this search now is)
+        // computation - a newer boundary change may have arrived while
+        // this task was running. If so, the work is simply discarded, not
+        // published - it has already been cached just above, though, so
+        // "discarded" here only ever means "not shown right now", never
+        // "gone".
+        bool stillCurrent;
+        {
+            const juce::SpinLock::ScopedLockType sl (specLock);
+            stillCurrent = (task.epoch == boundaryEpoch);
+        }
+        if (! stillCurrent)
+            continue;
 
         publishResult (task.spec, result);
 

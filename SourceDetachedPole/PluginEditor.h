@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
+#include <array>
 #include "PluginProcessor.h"
 
 class BBKDetachedPoleAudioProcessorEditor final : public juce::AudioProcessorEditor,
@@ -89,11 +90,39 @@ private:
     juce::TextEditor coefficientsBox;
     bool coefficientsVisible = false;
 
-    // Persists whatever is currently published (Default, Custom, or an
-    // existing override) as a user override for its own exact spec - see
-    // BBKDetachedPoleAudioProcessor::saveCurrentAsOverride(). Always
+    // Persists whatever is CURRENTLY ACTIVE (whichever row of the top-N
+    // table below is selected, or the single result itself for a Manual/
+    // Default-mode design that has no ranked list at all) as a user
+    // override for its own exact spec - see
+    // BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride(). Always
     // enabled; saving an already-instant result is harmless, just pointless.
+    // A row's own Save button below (saveCandidateButtons) does the same
+    // thing for a SPECIFIC row regardless of which one is currently active -
+    // this one is just the "save whatever I'm listening to right now"
+    // shortcut.
     juce::TextButton saveAsDefaultButton { "Save as Default" };
+
+    // Top-N ranked-results table (see BBKDetachedPoleAudioProcessor::
+    // DesignSnapshot::topCandidates / bbk::parametric::topCandidateCount):
+    // one row per candidate the last completed Auto-mode search found,
+    // best R_peak first, each with its own metrics plus a Use (switch to
+    // it, no re-search - see selectTopCandidate()) and Save (persist it as
+    // a user override - see saveTopCandidateAsOverride()) button. Populated
+    // and shown/hidden per row in timerCallback() based on how many
+    // candidates the current design snapshot actually has - Manual-mode
+    // results and Default-mode bank entries have none, so every row stays
+    // blank/hidden for those, exactly as if this table weren't there at all.
+    juce::Label topCandidatesHeader;
+    std::array<juce::Label, static_cast<std::size_t> (bbk::parametric::topCandidateCount)> candidateRowLabels;
+    std::array<juce::TextButton, static_cast<std::size_t> (bbk::parametric::topCandidateCount)> useCandidateButtons;
+    std::array<juce::TextButton, static_cast<std::size_t> (bbk::parametric::topCandidateCount)> saveCandidateButtons;
+
+    // Forces a genuinely fresh live search for the current spec even if a
+    // saved override or a search-cache entry already exists for it - see
+    // BBKDetachedPoleAudioProcessor::requestFreshSearch()'s own comment.
+    // Answers "can I re-run a search for parameters I already have saved
+    // results for" directly: yes, on demand, via this button.
+    juce::TextButton reSearchButton { "Re-search" };
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;

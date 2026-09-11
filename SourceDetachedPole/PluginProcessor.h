@@ -167,7 +167,7 @@ public:
     {
         LiveSearch,   // Custom mode: a fresh designParametricFIR() search
         PresetBank,   // Default mode: instant lookup in the compiled-in factory bank
-        UserOverride, // instant lookup in a filter the user saved themselves (see saveCurrentAsOverride)
+        UserOverride, // instant lookup in a filter the user saved themselves (see saveTopCandidateAsOverride)
         SearchCache   // instant lookup in a Custom-mode result already searched earlier (see LiveSearchCache.h)
     };
 
@@ -196,19 +196,67 @@ public:
         // bbk::parametric::computeTemporalMetrics() - see ParametricFIR.h
         // for exact definitions and the Case C reference validation.
         bbk::parametric::TemporalMetrics temporal;
+
+        // Up to bbk::parametric::topCandidateCount ranked alternatives to
+        // the design above (see ParametricFIR.h::RankedCandidate/
+        // DesignResult::topCandidates), best R_peak first - what the
+        // editor's own top-N table shows. selectedIndex says which one of
+        // these is the design actually described by every field above
+        // (taps/tapCount/achievedStopbandDb/temporal): topCandidates[
+        // selectedIndex] always matches them exactly when topCandidates is
+        // non-empty. Both are left at their defaults (empty/0) for a Manual
+        // tap-count result or a Default-mode bank entry, neither of which
+        // has a ranked list to offer - see selectTopCandidate() and
+        // saveTopCandidateAsOverride() below for how a non-default index
+        // gets here.
+        std::vector<bbk::parametric::RankedCandidate> topCandidates;
+        int selectedIndex = 0;
     };
     DesignSnapshot getDesignSnapshotForUI() const;
 
-    // Persists the currently-published design (whatever it is - a live
-    // Custom-mode result, a Default-mode bank entry, or even an existing
-    // override) as a user override for its own exact spec (sample rate,
-    // cutoff, attenuation, stopband, decay - see UserPresetOverrides.h).
-    // From then on, ANY time that exact spec recurs - in either Default or
-    // Custom mode, this session or a future one - requestBoundaryRedesign()
-    // finds and uses it instantly, ahead of both the compiled-in factory
-    // bank and a fresh live search. A no-op if nothing has been designed
-    // yet (tapCount == 0).
-    void saveCurrentAsOverride();
+    // Switches which of the currently-published design's own topCandidates
+    // is the active (playing) one, without re-running a search - all
+    // topCandidates entries are already fully-designed, spec-compliant
+    // filters from the same completed search (see ParametricFIR.h), so
+    // picking a different one is just a re-publish of already-known taps,
+    // same cost as an instant cache/override/bank hit. A no-op if index is
+    // out of range or the current design has no ranked list at all (Manual
+    // mode, or a Default-mode bank entry). Does not touch the search cache
+    // or any saved override - see saveTopCandidateAsOverride() for making a
+    // choice persistent.
+    void selectTopCandidate (int index);
+
+    // Persists one specific candidate from the currently-published design's
+    // own topCandidates (see DesignSnapshot above) - or, if it has no ranked
+    // list at all (Manual mode, or a Default-mode bank entry), the single
+    // design currently playing - as a user override for its own exact spec
+    // (sample rate, cutoff, attenuation, stopband, decay - see
+    // UserPresetOverrides.h). The WHOLE ranked list is saved, not just the
+    // chosen candidate, tagged with which index was picked (see
+    // OverrideEntry::activeIndex) - so revisiting this exact spec later, in
+    // either Default or Custom mode, instantly recalls the user's chosen
+    // filter AND still offers every other ranked alternative in the
+    // editor's own table, exactly as if the search had just finished again.
+    // From then on, ANY time that exact spec recurs, this session or a
+    // future one, requestBoundaryRedesign() finds and uses it instantly,
+    // ahead of both the compiled-in factory bank and a fresh live search. A
+    // no-op if nothing has been designed yet (tapCount == 0) or index is out
+    // of range for whatever list is being saved.
+    void saveTopCandidateAsOverride (int index);
+
+    // Forces a genuinely fresh live search for the CURRENT spec, bypassing
+    // every instant source (compiled-in bank, a saved override, and - the
+    // whole point of this button - an existing search-cache entry for this
+    // exact spec) that would otherwise short-circuit requestBoundaryRedesign()
+    // and just replay an old result. Answers the direct question of whether
+    // a spec that already has saved/cached results can be re-searched: it
+    // can, on demand, without needing to nudge a parameter and back just to
+    // force a cache miss. The fresh result still gets written back into the
+    // search cache on completion (see run()), so it replaces whatever was
+    // cached before - a deliberate re-search is exactly as much "the new
+    // answer for this spec" as the original one was. A no-op before the
+    // very first prepareToPlay().
+    void requestFreshSearch();
 
 private:
     void run() override; // juce::Thread - background redesign worker
@@ -264,9 +312,15 @@ private:
     // version-based crossfade pickup in process() always sees the newest
     // published design. source just tags the UI snapshot (see
     // DesignSnapshot) - it doesn't change how the result is applied.
+    // selectedIndex says which entry of result.topCandidates (if any) this
+    // publish represents - see DesignSnapshot::selectedIndex's own comment -
+    // and is copied straight into uiSnapshot alongside topCandidates itself;
+    // it means nothing when topCandidates is empty and defaults to 0 (the
+    // ordinary "just-published the best/only result" case).
     void publishResult (const bbk::parametric::FilterSpec& spec,
                          const bbk::parametric::DesignResult& result,
-                         ResultSource source = ResultSource::LiveSearch);
+                         ResultSource source = ResultSource::LiveSearch,
+                         int selectedIndex = 0);
 
     // Called when the "presetMode" parameter turns on (see ParamListener
     // below): forces cutoff/attenuation/stopband/sidelobeDecay to an
@@ -275,13 +329,13 @@ private:
     // the Auto Headroom ratchet (see process()). Normally that's the fixed
     // point the preset bank was swept at (attenuation left alone, so the
     // slider still picks one of the 10 precomputed steps) - but if the
-    // user has saved an override (see saveCurrentAsOverride()) for the
+    // user has saved an override (see saveTopCandidateAsOverride()) for the
     // current sample rate, ALL FOUR are instead snapped to that override's
     // own values, attenuation included: "save as my default" means Default
     // should always recall that exact saved point, not just the same
     // cutoff/stopband/decay with whichever attenuation the slider happens
     // to be sitting on. If more than one override exists for this rate,
-    // the most recently saved one wins (see saveCurrentAsOverride()'s
+    // the most recently saved one wins (see saveTopCandidateAsOverride()'s
     // ordering). This makes the greyed-out sliders in Default mode show
     // the values that are actually in effect, rather than whatever
     // Custom-mode position they were last left at, and means
@@ -487,7 +541,7 @@ private:
     // Guarded by specLock (not message-thread-only: requestBoundaryRedesign()
     // - which searches this - can run on the audio thread too, same as
     // currentBoundarySpec above). Loaded once in the constructor and
-    // updated by saveCurrentAsOverride(); kept in memory so a lookup
+    // updated by saveTopCandidateAsOverride(); kept in memory so a lookup
     // (potentially once per parameter tick, e.g. mid slider-drag) never
     // has to hit disk - see UserPresetOverrides.h's own comment on why
     // the file itself isn't cached at that layer.
