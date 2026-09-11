@@ -137,6 +137,9 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <functional>
+#include <future>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -146,6 +149,43 @@
 
 namespace bbk::parametric
 {
+
+// Optional hooks a caller can pass into designParametricFIR()/
+// designParametricFIRFixedM() to run several attemptDesign() candidates
+// concurrently instead of one at a time - see both functions' own comments
+// for how the batching preserves their exact existing selection logic and
+// output. Both fields default to null/empty, which reproduces the original
+// fully-serial (one candidate M at a time) behaviour byte-for-byte - every
+// existing call site (Tests/DSPTest*.cpp, PresetSweep tooling, and every
+// PluginProcessor.cpp call that doesn't explicitly opt in) is therefore
+// completely unaffected by this struct's existence.
+//
+// This lives here, not in PluginProcessor.cpp, because the actual
+// concurrent dispatch (std::async) is plain standard C++ with no JUCE
+// dependency - keeping it framework-independent, like the rest of this
+// file, so Tests/DSPTest.cpp can exercise it too. What IS platform/JUCE-
+// specific - deciding how many threads are safe to use *right now* given
+// system load and the live audio callback's own headroom, and lowering
+// each worker thread's OS scheduling priority so it can never outcompete
+// the real-time audio thread for CPU time - lives in PluginProcessor.cpp
+// and is injected here purely through these two callbacks.
+struct SearchConcurrencyHooks
+{
+    // Called once per "round" (a batch of candidate M's about to be tried)
+    // to ask how many of them may run concurrently this round. Returning a
+    // smaller number than the previous round is exactly how a caller
+    // dynamically backs off mid-search if system load rises - each round
+    // re-polls, it is never decided once for the whole search. Null means
+    // "always exactly 1", i.e. the original one-at-a-time behaviour.
+    std::function<int()> pollConcurrency;
+
+    // Called as the very first statement inside each spawned worker
+    // thread's own function body, before it does any LP-solving work -
+    // e.g. to lower that specific OS thread's scheduling priority. Null
+    // means do nothing extra (the thread just runs at whatever priority
+    // std::async's implementation gives it).
+    std::function<void()> onWorkerThreadStart;
+};
 
 // See the top-of-file comment for the trade-off between these two modes.
 enum class StopbandMode
@@ -1099,6 +1139,64 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
     return best;
 }
 
+// Runs attemptDesign() for every M in candidateMs concurrently (one
+// std::async task per M) and returns their results in the SAME order as
+// candidateMs, i.e. results[i] is always the outcome for candidateMs[i] -
+// callers can therefore feed this straight into the exact same sequential,
+// order-dependent decision logic designParametricFIR()/
+// designParametricFIRFixedM() already use, unchanged, just fed from a
+// pre-computed batch instead of one live call per iteration. This is what
+// makes the parallel search a pure speed-up with zero risk of changing
+// which M gets chosen: every candidate in the batch gets computed either
+// way (concurrently instead of serially costs CPU time, never
+// correctness), and the caller still walks the results one at a time in
+// the original order, stopping exactly where the original serial loop
+// would have stopped - anything after that stopping point was simply
+// computed "for nothing", not wrongly.
+//
+// Safe because attemptDesign() (and everything it calls) is a pure
+// function of its own arguments - no static/global/shared mutable state
+// anywhere in this file - so concurrent calls on different M's can never
+// interfere with each other. onWorkerThreadStart, if set, runs as the very
+// first statement inside each worker thread, before any solving begins -
+// see SearchConcurrencyHooks' own comment for why (OS thread-priority
+// lowering lives here, injected from PluginProcessor.cpp).
+inline std::vector<AttemptResult> attemptDesignBatch (const FilterSpec& spec, const std::vector<int>& candidateMs,
+                                                        std::chrono::steady_clock::time_point overallDeadline,
+                                                        double perCandidateSeconds,
+                                                        const std::function<void()>& onWorkerThreadStart)
+{
+    // A batch of exactly one candidate is the common case (concurrency
+    // hook absent/returning 1, i.e. the original behaviour) - skip the
+    // std::async/thread-creation overhead entirely and just call it
+    // directly on the calling (already-background) thread.
+    if (candidateMs.size() <= 1)
+    {
+        std::vector<AttemptResult> results;
+        if (! candidateMs.empty())
+            results.push_back (attemptDesign (spec, candidateMs[0], overallDeadline, perCandidateSeconds));
+        return results;
+    }
+
+    std::vector<std::future<AttemptResult>> futures;
+    futures.reserve (candidateMs.size());
+    for (int m : candidateMs)
+    {
+        futures.push_back (std::async (std::launch::async, [&spec, m, overallDeadline, perCandidateSeconds, &onWorkerThreadStart] () -> AttemptResult
+        {
+            if (onWorkerThreadStart)
+                onWorkerThreadStart();
+            return attemptDesign (spec, m, overallDeadline, perCandidateSeconds);
+        }));
+    }
+
+    std::vector<AttemptResult> results;
+    results.reserve (futures.size());
+    for (auto& f : futures)
+        results.push_back (f.get()); // blocks until that candidate's solve finishes; order preserved
+    return results;
+}
+
 } // namespace detail
 
 // maxTapCount caps the FIR half-length search at (maxTapCount-1)/2. The
@@ -1123,8 +1221,28 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
 // search does, at a larger overallDeadlineSeconds too - see
 // PluginProcessor.cpp - now that Default mode gives an always-available
 // instant fallback while a longer Custom search runs in the background).
+// concurrency defaults to {} (both hooks null), which reproduces the
+// original fully-serial search - one attemptDesign() call at a time -
+// byte-for-byte: every existing call site that doesn't pass this parameter
+// is completely unaffected. When concurrency.pollConcurrency is set, the
+// M-search below runs in "rounds": each round asks it how many of the
+// upcoming candidate M's (the exact same sequence this search would have
+// visited one at a time - see the M-stepping formula at the end of the
+// loop) may be computed concurrently, runs that many attemptDesign() calls
+// in parallel via detail::attemptDesignBatch(), and then walks the batch's
+// results ONE AT A TIME IN THE ORIGINAL ORDER, applying the exact same
+// per-attempt decision logic (degenerate-avoidance, the R_peak-improvement
+// patience counters, every break condition) this function has always used
+// - unchanged, just fed from a pre-computed batch instead of a single live
+// call. This is deliberate: it guarantees parallelising this search can
+// only ever change how long it takes, never which M it settles on or why
+// - a batch candidate computed "ahead of time" that the sequential walk
+// never reaches (because an earlier candidate in the same batch already
+// triggered a break condition) is simply discarded, exactly as if it had
+// never been tried.
 inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount = 161, double overallDeadlineSeconds = 180.0,
-                                          double perCandidateSeconds = 15.0)
+                                          double perCandidateSeconds = 15.0,
+                                          const SearchConcurrencyHooks& concurrency = {})
 {
     DesignResult result;
     const int maxM = (maxTapCount - 1) / 2;
@@ -1189,7 +1307,33 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
 
     while (true)
     {
-        auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
+        // One "round": collect up to roundConcurrency upcoming candidate
+        // M's (following the exact same nextM() stepping chain the
+        // original one-at-a-time loop used), dispatch them all at once,
+        // then walk the results below in that same order.
+        const int roundConcurrency = concurrency.pollConcurrency
+            ? std::max (1, concurrency.pollConcurrency())
+            : 1;
+
+        std::vector<int> candidateMs;
+        {
+            int cursor = M;
+            while (true)
+            {
+                candidateMs.push_back (cursor);
+                if (cursor >= maxM || static_cast<int> (candidateMs.size()) >= roundConcurrency)
+                    break;
+                cursor = std::min (maxM, cursor + std::max (1, cursor / 6));
+            }
+        }
+
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, deadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+
+        bool stopSearch = false;
+        for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
+        {
+        M = candidateMs[candidateIdx];
+        auto attempt = batchResults[candidateIdx];
         ++result.designAttempts;
 
         // attemptDesign() has its own explicit all-zero-taps sentinel for
@@ -1348,12 +1492,23 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         // comment) and is never reached by the plugin, so it loses nothing
         // by keeping the original, pre-"search more thoroughly" behaviour:
         // stop at the first feasible M, exactly as before this pass.
-        if (foundFeasible && spec.stopbandMode == StopbandMode::FlatMask) break;
+        if (foundFeasible && spec.stopbandMode == StopbandMode::FlatMask) { stopSearch = true; break; }
 
-        if (M >= maxM) break;
-        if (std::chrono::steady_clock::now() > deadline) break;
-        if (foundFeasible && nonImprovingAttempts >= maxNonImprovingAttempts) break;
-        if (foundFeasible && extraAttemptsAfterFeasible >= maxExtraAttemptsAfterFeasible) break;
+        if (M >= maxM) { stopSearch = true; break; }
+        if (std::chrono::steady_clock::now() > deadline) { stopSearch = true; break; }
+        if (foundFeasible && nonImprovingAttempts >= maxNonImprovingAttempts) { stopSearch = true; break; }
+        if (foundFeasible && extraAttemptsAfterFeasible >= maxExtraAttemptsAfterFeasible) { stopSearch = true; break; }
+        } // end of per-candidate (in-batch, original order) decision walk
+
+        if (stopSearch) break;
+
+        // Every candidate in this round was processed without hitting a
+        // break condition - advance to the next M in the same sequence a
+        // fully-serial search would have tried next, exactly like the
+        // original loop's own trailing step, and start the next round
+        // from there (which may itself request a different concurrency -
+        // see pollConcurrency's own comment on why this is re-polled every
+        // round rather than decided once).
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 
@@ -1495,10 +1650,20 @@ inline int minimumFeasibleTapCount (const FilterSpec& spec, int maxTapCount = 16
 // overallDeadlineSeconds/perCandidateSeconds default to designParametricFIR's
 // own defaults for consistency, though the plugin's actual call site passes
 // its own live-search budget, same as it does for designParametricFIR.
+// concurrency defaults to {} (both hooks null), reproducing the original
+// fully-serial walk byte-for-byte - see designParametricFIR's own comment
+// on the identical pattern for the full rationale. Here specifically: each
+// round dispatches up to roundConcurrency upcoming candidate M's at once,
+// then walks them in order taking the FIRST feasible one exactly as the
+// original loop did - a later candidate in the same batch that would never
+// have been reached (because an earlier one in the same batch was already
+// feasible) is simply discarded, so this can only change how long the walk
+// takes, never which M it settles on for a "cleanly feasible" result.
 inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCount,
                                                 int maxTapCount = 161,
                                                 double overallDeadlineSeconds = 180.0,
-                                                double perCandidateSeconds = 15.0)
+                                                double perCandidateSeconds = 15.0,
+                                                const SearchConcurrencyHooks& concurrency = {})
 {
     DesignResult result;
     const int maxM = (maxTapCount - 1) / 2;
@@ -1513,7 +1678,29 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
 
     while (true)
     {
-        auto attempt = detail::attemptDesign (spec, M, deadline, perCandidateSeconds);
+        const int roundConcurrency = concurrency.pollConcurrency
+            ? std::max (1, concurrency.pollConcurrency())
+            : 1;
+
+        std::vector<int> candidateMs;
+        {
+            int cursor = M;
+            while (true)
+            {
+                candidateMs.push_back (cursor);
+                if (cursor >= maxM || static_cast<int> (candidateMs.size()) >= roundConcurrency)
+                    break;
+                cursor = std::min (maxM, cursor + std::max (1, cursor / 6));
+            }
+        }
+
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, deadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+
+        bool stopSearch = false;
+        for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
+        {
+        M = candidateMs[candidateIdx];
+        auto attempt = batchResults[candidateIdx];
         ++result.designAttempts;
 
         // Same degenerate-sentinel test as designParametricFIR's own loop -
@@ -1532,6 +1719,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
             best = attempt;
             bestM = M;
             foundFeasible = true;
+            stopSearch = true;
             break;
         }
         else if (best.a.empty()
@@ -1547,8 +1735,11 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
             bestM = M;
         }
 
-        if (M >= maxM) break;
-        if (std::chrono::steady_clock::now() > deadline) break;
+        if (M >= maxM) { stopSearch = true; break; }
+        if (std::chrono::steady_clock::now() > deadline) { stopSearch = true; break; }
+        } // end of per-candidate (in-batch, original order) decision walk
+
+        if (stopSearch) break;
         M = std::min (maxM, M + std::max (1, M / 6));
     }
 

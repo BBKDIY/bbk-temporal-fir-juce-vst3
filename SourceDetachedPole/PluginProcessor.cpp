@@ -3,7 +3,25 @@
 #include "PresetBankLookup.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
+
+// Windows-only - this plugin only ships for Windows (see README) - and
+// kept out of PluginProcessor.h so that header stays a plain,
+// always-compilable declaration. Used by pollSystemCpuBusyFraction() (raw
+// GetSystemTimes()) and by run()'s onWorkerThreadStart hook (raw
+// SetThreadPriority() on each spawned search worker, so the OS scheduler
+// always favours the real-time audio thread over these if they ever
+// genuinely contend for the same core - see currentAllowedSearchConcurrency()'s
+// own comment for why dynamic throttling alone isn't relied on as the only
+// safeguard).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -74,6 +92,47 @@ namespace
             && a.stopbandMode == b.stopbandMode
             && a.sidelobeDecayRatio == b.sidelobeDecayRatio;
     }
+
+    // Hard ceiling on how many attemptDesign() workers a single search
+    // "round" may ever use, regardless of how idle the machine looks -
+    // even a genuinely idle 64-core server has no reason to run more of
+    // these at once than this, since each one is already a full LP solve
+    // and diminishing returns from further parallel candidates arrive long
+    // before this many would ever be useful.
+    constexpr int maxSearchWorkerThreads = 20;
+
+    // Cores always left for the OS/host/audio thread, never handed to the
+    // search regardless of how many the system reports - see
+    // BBKDetachedPoleAudioProcessor::currentAllowedSearchConcurrency().
+    // Slightly more generous on very small machines (a dual-core laptop
+    // dedicating a whole core to a background search is a much bigger
+    // relative hit than an eight-plus-core desktop doing the same).
+    inline int reservedCoresFor (unsigned int hardwareConcurrency) noexcept
+    {
+        return hardwareConcurrency <= 4 ? 2 : 1;
+    }
+
+    // Lowers the CALLING thread's own OS scheduling priority - used as the
+    // onWorkerThreadStart hook passed into ParametricFIR.h's parallel
+    // search (see run()), so every spawned attemptDesign() worker thread
+    // starts by deprioritising itself before doing any LP-solving work.
+    // This is a backstop underneath the dynamic worker-count throttling in
+    // currentAllowedSearchConcurrency() (which is what keeps these threads
+    // from being greedy in the first place) - it's what keeps the OS
+    // scheduler siding with the real-time audio thread even in the moment
+    // they do end up contending for the same core, e.g. between one
+    // round's load poll and the next. THREAD_PRIORITY_LOWEST rather than
+    // _IDLE: idle-priority threads only run when NOTHING else on the
+    // system wants the CPU at all, which risks a search visibly stalling
+    // any time the user is doing anything else with the machine at
+    // all - lowest still yields to genuinely real-time/normal-priority
+    // work but keeps making steady progress otherwise.
+    inline void lowerCurrentThreadPriorityForSearchWorker() noexcept
+    {
+#ifdef _WIN32
+        SetThreadPriority (GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+    }
 }
 
 BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
@@ -97,7 +156,18 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     userOverrides = bbk::detachedpole::useroverrides::loadAll();
     searchCache = bbk::detachedpole::searchcache::loadAll();
 
-    startThread();
+    // Priority::low, not the default (normal): this thread only ever runs
+    // a background redesign, never anything the user is waiting on
+    // synchronously (see the class's own top-of-file comment on why a
+    // redesign never blocks the host), so it should always lose CPU
+    // arbitration to the real host/audio threads if they ever genuinely
+    // contend for the same core - a first line of defence underneath the
+    // dynamic worker-count throttling in currentAllowedSearchConcurrency(),
+    // not a replacement for it (that throttling is what keeps this thread
+    // and its own spawned workers from being greedy in the first place;
+    // this is what keeps the OS scheduler on the audio thread's side even
+    // if they do end up contending).
+    startThread (juce::Thread::Priority::low);
 }
 
 BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
@@ -730,6 +800,98 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
     }
 }
 
+double BBKDetachedPoleAudioProcessor::pollSystemCpuBusyFraction()
+{
+#ifdef _WIN32
+    FILETIME idleFt {}, kernelFt {}, userFt {};
+    if (! GetSystemTimes (&idleFt, &kernelFt, &userFt))
+        return 0.0; // call failed - treat as "assume idle" rather than throttle on bad data
+
+    const auto toTicks = [] (const FILETIME& ft) -> std::uint64_t
+    {
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        return u.QuadPart;
+    };
+
+    const std::uint64_t idle = toTicks (idleFt);
+    const std::uint64_t kernel = toTicks (kernelFt); // includes idle, per GetSystemTimes' own documented contract
+    const std::uint64_t user = toTicks (userFt);
+
+    if (! haveSystemCpuSample)
+    {
+        lastSystemIdleTicks = idle;
+        lastSystemKernelTicks = kernel;
+        lastSystemUserTicks = user;
+        haveSystemCpuSample = true;
+        return 0.0; // no previous sample yet to diff against
+    }
+
+    // All three counters are monotonically increasing system uptime
+    // counters, so a smaller-than-previous reading only happens if the
+    // underlying counter wrapped (not realistically reachable at 100ns
+    // resolution within a session) - guard it anyway rather than risk a
+    // huge bogus fraction from an unsigned underflow.
+    const std::uint64_t idleDelta = idle > lastSystemIdleTicks ? idle - lastSystemIdleTicks : 0;
+    const std::uint64_t kernelDelta = kernel > lastSystemKernelTicks ? kernel - lastSystemKernelTicks : 0;
+    const std::uint64_t userDelta = user > lastSystemUserTicks ? user - lastSystemUserTicks : 0;
+
+    lastSystemIdleTicks = idle;
+    lastSystemKernelTicks = kernel;
+    lastSystemUserTicks = user;
+
+    const std::uint64_t totalDelta = kernelDelta + userDelta;
+    if (totalDelta == 0)
+        return 0.0; // no measurable time elapsed between polls
+
+    const std::uint64_t busyDelta = totalDelta > idleDelta ? totalDelta - idleDelta : 0;
+    return static_cast<double> (busyDelta) / static_cast<double> (totalDelta);
+#else
+    return 0.0;
+#endif
+}
+
+int BBKDetachedPoleAudioProcessor::currentAllowedSearchConcurrency()
+{
+    const unsigned int hw = std::thread::hardware_concurrency();
+    // hardware_concurrency() is documented as "may return 0 if not
+    // computable" - fall back to a conservative single-core assumption
+    // rather than letting the reserved-cores subtraction below go negative.
+    const int hwCores = hw > 0 ? static_cast<int> (hw) : 1;
+
+    const int reserved = reservedCoresFor (hw);
+    int allowed = std::max (1, std::min (maxSearchWorkerThreads, hwCores - reserved));
+
+    // System-wide CPU headroom: tiered rather than a smooth scale, since a
+    // smooth scale would make this number jitter on every round from
+    // ordinary noise in the underlying measurement - a search round only
+    // needs a coarse "still plenty of room / getting tight / basically
+    // none left" signal, not a precise one.
+    const double systemBusy = pollSystemCpuBusyFraction();
+    if (systemBusy >= 0.90)
+        allowed = 1;
+    else if (systemBusy >= 0.75)
+        allowed = std::max (1, allowed / 4);
+    else if (systemBusy >= 0.50)
+        allowed = std::max (1, allowed / 2);
+
+    // Audio callback headroom is the harder, more directly-relevant
+    // constraint of the two (see its own comment in PluginProcessor.h) -
+    // applied as a second, independent clamp on top of the system-load
+    // result above, not blended with it, so a healthy-looking system-wide
+    // number can never mask the audio thread itself actually struggling
+    // (e.g. because something else is pinned to the same core the host's
+    // audio thread happens to be scheduled on).
+    const float audioLoad = audioCallbackLoadFraction.load();
+    if (audioLoad >= 0.50f)
+        allowed = 1;
+    else if (audioLoad >= 0.25f)
+        allowed = std::max (1, std::min (allowed, maxSearchWorkerThreads / 4));
+
+    return std::max (1, allowed);
+}
+
 void BBKDetachedPoleAudioProcessor::run()
 {
     while (! threadShouldExit())
@@ -779,16 +941,39 @@ void BBKDetachedPoleAudioProcessor::run()
         // the same generous time budget as the Auto path below so the
         // fixed-M solve gets the same convergence opportunity a search
         // candidate at that same M would have gotten.
+        //
+        // concurrency: lets both searches try several candidate tap counts
+        // at once instead of one at a time - see SearchConcurrencyHooks'
+        // own comment in ParametricFIR.h for how this is guaranteed to
+        // only ever change wall-clock time, never which M gets chosen (for
+        // any design that converges within its own per-candidate time
+        // budget - see currentAllowedSearchConcurrency()'s own comment on
+        // the one narrow, already-precedented exception: a design that's
+        // still not fully converged even at its overall deadline can, like
+        // every other timing-sensitive knife-edge already documented in
+        // this codebase - see caseBNearFlatAttenuationDb in
+        // DetachedPoleFilter.h - land a hair differently depending on
+        // exactly how much wall-clock compute each concurrent candidate
+        // happened to get). pollConcurrency is re-evaluated once per
+        // "round" (a fresh batch of candidates), so it backs off
+        // immediately if system load or the audio callback's own headroom
+        // gets tight mid-search. onWorkerThreadStart lowers each spawned
+        // worker's own OS thread priority the same way the priority
+        // passed to startThread() above does for this thread itself.
+        bbk::parametric::SearchConcurrencyHooks concurrency;
+        concurrency.pollConcurrency = [this] { return currentAllowedSearchConcurrency(); };
+        concurrency.onWorkerThreadStart = [] { lowerCurrentThreadPriorityForSearchWorker(); };
+
         bbk::parametric::DesignResult result;
         if (task.manualTapCount)
         {
             const int floor = bbk::parametric::minimumFeasibleTapCount (task.spec, bbk::detachedpole::maxTapCount, 30.0);
             const int target = juce::jmax (task.requestedTapCount, floor);
-            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, 900.0, 60.0);
+            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, 900.0, 60.0, concurrency);
         }
         else
         {
-            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0);
+            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, 900.0, 60.0, concurrency);
         }
 
         // Re-check staleness after the (possibly slow - see
@@ -947,6 +1132,15 @@ template <typename SampleType>
 void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buffer)
 {
     using namespace bbk::detachedpole;
+
+    // Feeds audioCallbackLoadFraction below - see its own comment in
+    // PluginProcessor.h for why this exists (throttling the parallel
+    // background search) and why it has to be this cheap: one steady_clock
+    // read now, one more at the very end of this function, a subtraction
+    // and a division against this block's own time budget, and one atomic
+    // store - on the order of tens of nanoseconds, immeasurably small next
+    // to the convolution work this function is about to do either way.
+    const auto blockStartTime = std::chrono::steady_clock::now();
 
     const int numChannels = buffer.getNumChannels();
     const int numSamples = buffer.getNumSamples();
@@ -1117,6 +1311,33 @@ void BBKDetachedPoleAudioProcessor::process (juce::AudioBuffer<SampleType>& buff
                 clipEnvelope = 0.0f;
                 samplesUntilNextAutoAdjust = autoAdjustCooldownSamples;
             }
+        }
+    }
+
+    // See blockStartTime's own comment above. budgetSeconds is this
+    // block's own real-time deadline - the host expects numSamples worth
+    // of audio back within that long, regardless of what else is running
+    // on the machine. Blended with a fast-attack/slow-release-ish EMA
+    // (weighted toward the newest reading) rather than a plain running
+    // average, so a genuine spike is reflected almost immediately - the
+    // whole point is to catch the audio thread actually starting to
+    // struggle before it audibly does - while a single unusually-fast or
+    // -slow block doesn't on its own yank the search's thread count
+    // around.
+    {
+        const auto sampleRate = currentSampleRate.load();
+        if (sampleRate > 0.0 && numSamples > 0)
+        {
+            const auto elapsed = std::chrono::steady_clock::now() - blockStartTime;
+            const double elapsedSeconds = std::chrono::duration<double> (elapsed).count();
+            const double budgetSeconds = static_cast<double> (numSamples) / sampleRate;
+            const float thisBlockLoad = static_cast<float> (std::min (4.0, elapsedSeconds / budgetSeconds));
+
+            const float previous = audioCallbackLoadFraction.load();
+            const float blended = thisBlockLoad > previous
+                ? thisBlockLoad                              // instant on the way up (a spike matters immediately)
+                : previous * 0.9f + thisBlockLoad * 0.1f;    // decay gradually on the way down
+            audioCallbackLoadFraction.store (blended);
         }
     }
 }

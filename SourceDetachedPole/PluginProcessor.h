@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <vector>
 #include "DetachedPoleFilter.h"
@@ -173,6 +174,37 @@ public:
 
 private:
     void run() override; // juce::Thread - background redesign worker
+
+    // How many concurrent attemptDesign() worker threads the background
+    // search (see run()) is currently allowed to use - re-evaluated once
+    // per search "round" via ParametricFIR.h's SearchConcurrencyHooks::
+    // pollConcurrency, never decided once for the whole search, so it can
+    // back off immediately if load rises mid-search and scale back up once
+    // things are calm again. Combines a fixed ceiling
+    // (maxSearchWorkerThreads in the .cpp), std::thread::
+    // hardware_concurrency() minus cores always reserved for the OS/host/
+    // audio thread, system-wide CPU load (see pollSystemCpuBusyFraction()
+    // below), and the audio callback's own measured headroom
+    // (audioCallbackLoadFraction below) - the harder, more directly-
+    // relevant constraint of the two, since it reflects actual real-time
+    // scheduling risk on the audio thread itself rather than a generic
+    // system-wide number that might not translate into audio starvation
+    // at all (or might, even when overall load looks moderate). Always
+    // returns at least 1: a fully-loaded system still makes forward
+    // progress on a redesign, just serially, exactly like this search has
+    // always been capable of.
+    int currentAllowedSearchConcurrency();
+
+    // System-wide CPU utilization since the previous call, as a 0.0-1.0
+    // fraction, via Windows' GetSystemTimes() (see the .cpp - the actual
+    // Win32 call is kept out of this header so it stays a plain, always-
+    // compilable declaration). Returns 0.0 ("assume idle") on the very
+    // first call, when there is no previous sample yet to diff against,
+    // and on any non-Windows build - this plugin only ships for Windows
+    // (see README), but keeping a defined fallback rather than a
+    // platform-specific build error costs nothing and avoids surprising
+    // anyone who compiles this file elsewhere.
+    double pollSystemCpuBusyFraction();
 
     template <typename SampleType>
     void process (juce::AudioBuffer<SampleType>& buffer);
@@ -443,6 +475,27 @@ private:
     // own instant result or left it true for its own newly-queued task -
     // see both call sites' own comments).
     std::atomic<bool> searchInProgress { false };
+
+    // A cheap, decaying measure of how much of the audio callback's own
+    // available time budget (numSamples / sampleRate) each block's actual
+    // wall-clock processing took - see process()'s own comment for where
+    // this is updated and currentAllowedSearchConcurrency() above for how
+    // it throttles the parallel search. Written from the audio thread on
+    // every block (a couple of chrono calls plus one atomic store -
+    // negligible overhead), read only from the background design thread.
+    std::atomic<float> audioCallbackLoadFraction { 0.0f };
+
+    // System-wide CPU utilization sample state for
+    // pollSystemCpuBusyFraction() above - only ever touched from the
+    // background design thread (never the audio thread), polled at most a
+    // few times per second (once per search "round", not continuously),
+    // so no locking is needed. Plain integer tick counts rather than a
+    // Windows FILETIME/ULARGE_INTEGER type so this header stays free of
+    // <windows.h>; the .cpp does the actual interpretation.
+    std::uint64_t lastSystemIdleTicks = 0;
+    std::uint64_t lastSystemKernelTicks = 0;
+    std::uint64_t lastSystemUserTicks = 0;
+    bool haveSystemCpuSample = false;
 
     // Message-thread-only snapshot of the latest completed design, kept
     // separately from the audio-thread hand-off above so the UI never has
