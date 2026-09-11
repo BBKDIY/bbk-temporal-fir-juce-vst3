@@ -250,6 +250,16 @@ private:
     // specFromParameters() never needs its own separate preset/custom
     // branch - it just always reads whatever the parameters currently
     // hold.
+    //
+    // Also forces "tapCountAuto" to Auto (on) - Manual Tap Count has no
+    // effect on Default mode's own instant lookup (see
+    // requestBoundaryRedesign(): the bank/override entry's own tap count
+    // is used regardless of what Manual Tap Count is dialed to), but
+    // leaving the selector sitting on Manual while Default is engaged was
+    // reported as confusing/misleading in practice - forcing it to Auto
+    // here, and restoring the user's own choice in
+    // restoreCustomPointBeforeDefault(), removes any ambiguity about
+    // whether Manual mode is "really" still in effect.
     void forcePresetOperatingPoint();
 
     // Called from forcePresetOperatingPoint()'s own start, the instant
@@ -407,12 +417,31 @@ private:
     // back off. havePreDefaultSnapshot distinguishes "never captured yet"
     // (Default has never been engaged this session) from a genuinely
     // all-zero snapshot.
+    //
+    // tapCountAutoOn: same idea, extended to the Manual/Auto tap-count
+    // selector. Default mode's own instant lookup (see requestBoundaryRedesign())
+    // already ignores Manual Tap Count entirely - the bank/override entry's
+    // own tap count is used regardless - but leaving the "Tap Count Auto"
+    // toggle sitting on Manual while Default is active is misleading (it
+    // looks live and editable-adjacent when it has no effect at all) and,
+    // reported directly: re-entering Custom mode later with Manual still
+    // engaged could leave a stale requestedTapCount/epoch combination from
+    // before Default was ever touched, so a fresh Custom spec silently
+    // reused an old manual tap count instead of prompting a real decision.
+    // forcePresetOperatingPoint() now forces this to Auto (on) the instant
+    // Default engages, the same way it forces cutoff/stopband/decay, and
+    // restoreCustomPointBeforeDefault() puts the user's own Manual/Auto
+    // choice back when Default is unchecked again - so choosing Manual
+    // Tap Count before entering Default isn't silently lost, it just has
+    // no effect while Default is active, exactly like the greyed-out
+    // Manual Tap Count slider itself.
     struct PreDefaultSnapshot
     {
         double cutoffHz = 0.0;
         double attenuationAtCutoffDb = 0.0;
         double stopbandRejectionDb = 0.0;
         double sidelobeDecayRatio = 0.0;
+        bool tapCountAutoOn = true;
     };
     PreDefaultSnapshot preDefaultSnapshot;
     bool havePreDefaultSnapshot = false;

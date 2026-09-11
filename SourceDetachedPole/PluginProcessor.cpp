@@ -401,6 +401,20 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
         }
     }
 
+    // Force Manual Tap Count off (Auto on) FIRST, before the four operating-
+    // point parameters below - so every nested requestBoundaryRedesign()
+    // call this function triggers (each setValueNotifyingHost re-enters the
+    // ParamListener) already sees Auto mode in effect, not just the very
+    // last one. Default mode's own instant lookup ignores Manual Tap Count
+    // either way (see requestBoundaryRedesign()'s presetEntry/overrideEntry
+    // handling), but leaving the selector on Manual while Default is active
+    // was reported as confusing - a Manual choice that quietly has no
+    // effect looks identical to a bug. The user's own Manual/Auto choice
+    // (and, if it was Manual, their dialed tap count) is restored the
+    // instant Default is unchecked again - see restoreCustomPointBeforeDefault().
+    if (auto* tapCountAutoParam = parameters.getParameter ("tapCountAuto"))
+        tapCountAutoParam->setValueNotifyingHost (1.0f);
+
     if (auto* cutoffParam = parameters.getParameter ("cutoff"))
         cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (targetCutoffHz)));
     if (auto* attenuationParam = parameters.getParameter ("attenuation"))
@@ -434,6 +448,7 @@ void BBKDetachedPoleAudioProcessor::captureCustomPointBeforeDefault()
     preDefaultSnapshot.attenuationAtCutoffDb = static_cast<double> (parameters.getRawParameterValue ("attenuation")->load());
     preDefaultSnapshot.stopbandRejectionDb = static_cast<double> (parameters.getRawParameterValue ("stopband")->load());
     preDefaultSnapshot.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
+    preDefaultSnapshot.tapCountAutoOn = parameters.getRawParameterValue ("tapCountAuto")->load() > 0.5f;
     havePreDefaultSnapshot = true;
 }
 
@@ -461,6 +476,20 @@ void BBKDetachedPoleAudioProcessor::restoreCustomPointBeforeDefault()
     // there is nothing to put back.
     if (! have)
         return;
+
+    // Put the user's own Manual/Auto tap-count choice back FIRST, before
+    // the four operating-point parameters below - same reasoning as
+    // forcePresetOperatingPoint() forcing it to Auto first on the way in:
+    // every nested requestBoundaryRedesign() call this function triggers
+    // should already see the real final Manual/Auto state, not force a
+    // couple of extra intermediate Auto-mode lookups against a still-
+    // partially-restored spec before the last one corrects it. If the user
+    // had Manual Tap Count selected before Default was engaged (and
+    // whatever value they'd dialed in - "manualTapCount" itself was never
+    // touched by Default mode, only this on/off selector was), it's back
+    // exactly as they left it.
+    if (auto* tapCountAutoParam = parameters.getParameter ("tapCountAuto"))
+        tapCountAutoParam->setValueNotifyingHost (snap.tapCountAutoOn ? 1.0f : 0.0f);
 
     if (auto* cutoffParam = parameters.getParameter ("cutoff"))
         cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (snap.cutoffHz)));
