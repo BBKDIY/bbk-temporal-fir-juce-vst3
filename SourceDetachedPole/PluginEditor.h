@@ -19,7 +19,28 @@ private:
     void toggleCoefficientsPopup();
     void refreshCoefficientsText (const BBKDetachedPoleAudioProcessor::DesignSnapshot&);
 
+    // Lays out every child within content (see its own comment) exactly
+    // once, right after construction - content's own size never changes
+    // afterward (only how much of it the viewport shows/scrolls), so unlike
+    // a normal resized() override this only ever needs to run a single
+    // time, not on every editor resize.
+    void layOutContent();
+
     BBKDetachedPoleAudioProcessor& processor;
+
+    // The window itself (see setSize() in the .cpp) is deliberately kept to
+    // a modest, screen-friendly default height - reported directly that the
+    // previous fixed-height window (grown repeatedly across several feature
+    // additions to fit everything with no scrolling at all) had become tall
+    // enough to open partly off-screen on plenty of real monitors. Every
+    // control below is instead a child of `content`, a plain Component sized
+    // to whatever the FULL layout actually needs (see layOutContent()),
+    // wrapped in `viewport` so the window can stay a reasonable, resizable
+    // size while the full content just scrolls - and so adding yet more
+    // controls in the future grows the scrollable area instead of the
+    // window's forced minimum size again.
+    juce::Viewport viewport;
+    juce::Component content;
 
     juce::Label title;
     juce::Label subtitle;

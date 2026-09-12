@@ -21,18 +21,28 @@ void prepareSlider (juce::Slider& slider)
 BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDetachedPoleAudioProcessor& p)
     : AudioProcessorEditor (&p), processor (p)
 {
+    // See the member comments on viewport/content in PluginEditor.h: every
+    // control below is added to `content`, not to this editor directly, so
+    // the actual plugin WINDOW (sized well below content's own height - see
+    // setSize() at the end of this constructor) can stay a reasonable,
+    // resizable size while content just scrolls under it. false: content is
+    // a plain member (not a heap object the viewport should own/delete).
+    addAndMakeVisible (viewport);
+    viewport.setViewedComponent (&content, false);
+    viewport.setScrollBarsShown (true, false); // vertical only - content's width always matches the viewport's own
+
     prepareLabel (title, 22.0f, true);
     title.setText ("BBK Parametric FIR", juce::dontSendNotification);
-    addAndMakeVisible (title);
+    content.addAndMakeVisible (title);
 
     prepareLabel (subtitle, 12.0f);
     subtitle.setText ("Parametric constrained-least-squares FIR lowpass - auto-detects sample rate "
                        "(44.1/48/88.2/96/176.4/192/384 kHz, or any other rate the host reports)",
                        juce::dontSendNotification);
-    addAndMakeVisible (subtitle);
+    content.addAndMakeVisible (subtitle);
 
     prepareLabel (sampleRate);
-    addAndMakeVisible (sampleRate);
+    content.addAndMakeVisible (sampleRate);
 
     // Lit whenever a background design is actually running (see
     // processor.isSearchInProgressForUI()'s own comment) - text/colour set
@@ -40,10 +50,10 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     searchIndicator.setJustificationType (juce::Justification::centred);
     searchIndicator.setColour (juce::Label::textColourId, juce::Colours::white);
     searchIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
-    addAndMakeVisible (searchIndicator);
+    content.addAndMakeVisible (searchIndicator);
 
     bypassButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (bypassButton);
+    content.addAndMakeVisible (bypassButton);
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "bypass", bypassButton);
 
@@ -52,21 +62,21 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // track the parameter live, not just this button's own clicks - e.g.
     // host automation of "presetMode").
     defaultModeButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (defaultModeButton);
+    content.addAndMakeVisible (defaultModeButton);
     defaultModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "presetMode", defaultModeButton);
 
     prepareLabel (cutoffLabel, 13.0f, false, juce::Justification::centredLeft);
     cutoffLabel.setText ("Cutoff", juce::dontSendNotification);
-    addAndMakeVisible (cutoffLabel);
+    content.addAndMakeVisible (cutoffLabel);
     prepareSlider (cutoffSlider);
-    addAndMakeVisible (cutoffSlider);
+    content.addAndMakeVisible (cutoffSlider);
     cutoffAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "cutoff", cutoffSlider);
 
     prepareLabel (attenuationLabel, 13.0f, false, juce::Justification::centredLeft);
     attenuationLabel.setText ("Attenuation at Cutoff", juce::dontSendNotification);
-    addAndMakeVisible (attenuationLabel);
+    content.addAndMakeVisible (attenuationLabel);
     prepareSlider (attenuationSlider);
     // 4 decimal places (not the default 2) and a wider text box: the
     // parameter's own step is now 0.0001 dB (see
@@ -76,7 +86,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // the stored value is exact, which is confusing to type against.
     attenuationSlider.setNumDecimalPlacesToDisplay (4);
     attenuationSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 110, 22);
-    addAndMakeVisible (attenuationSlider);
+    content.addAndMakeVisible (attenuationSlider);
     attenuationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "attenuation", attenuationSlider);
 
@@ -86,24 +96,24 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // not dependent on typing or host rounding at 0.0001 dB precision
     // (see DetachedPoleFilter.h::caseBNearFlatAttenuationDb).
     amplitudeRelaxationButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (amplitudeRelaxationButton);
+    content.addAndMakeVisible (amplitudeRelaxationButton);
     amplitudeRelaxationAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "amplitudeRelaxation", amplitudeRelaxationButton);
 
     prepareLabel (stopbandLabel, 13.0f, false, juce::Justification::centredLeft);
     stopbandLabel.setText ("Min. Stopband Rejection", juce::dontSendNotification);
-    addAndMakeVisible (stopbandLabel);
+    content.addAndMakeVisible (stopbandLabel);
     prepareSlider (stopbandSlider);
-    addAndMakeVisible (stopbandSlider);
+    content.addAndMakeVisible (stopbandSlider);
     stopbandAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "stopband", stopbandSlider);
 
     prepareLabel (sidelobeDecayLabel, 13.0f, false, juce::Justification::centredLeft);
     sidelobeDecayLabel.setText ("Sidelobe Decay", juce::dontSendNotification);
-    addAndMakeVisible (sidelobeDecayLabel);
+    content.addAndMakeVisible (sidelobeDecayLabel);
     prepareSlider (sidelobeDecaySlider);
     sidelobeDecaySlider.setNumDecimalPlacesToDisplay (3);
-    addAndMakeVisible (sidelobeDecaySlider);
+    content.addAndMakeVisible (sidelobeDecaySlider);
     sidelobeDecayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "sidelobeDecay", sidelobeDecaySlider);
 
@@ -112,15 +122,15 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // "tapCountAuto", same reasoning as defaultModeButton above).
     prepareLabel (manualTapCountLabel, 13.0f, false, juce::Justification::centredLeft);
     manualTapCountLabel.setText ("Manual Tap Count", juce::dontSendNotification);
-    addAndMakeVisible (manualTapCountLabel);
+    content.addAndMakeVisible (manualTapCountLabel);
     prepareSlider (manualTapCountSlider);
     manualTapCountSlider.setNumDecimalPlacesToDisplay (0); // always a whole (odd) tap count - see the parameter's own step
-    addAndMakeVisible (manualTapCountSlider);
+    content.addAndMakeVisible (manualTapCountSlider);
     manualTapCountAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "manualTapCount", manualTapCountSlider);
 
     tapCountAutoButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (tapCountAutoButton);
+    content.addAndMakeVisible (tapCountAutoButton);
     tapCountAutoAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "tapCountAuto", tapCountAutoButton);
 
@@ -129,17 +139,17 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // below (click the number to edit directly, or use the +/- arrows).
     prepareLabel (maxSearchTimeLabel, 13.0f, false, juce::Justification::centredLeft);
     maxSearchTimeLabel.setText ("Max Search Time", juce::dontSendNotification);
-    addAndMakeVisible (maxSearchTimeLabel);
+    content.addAndMakeVisible (maxSearchTimeLabel);
     maxSearchTimeSlider.setSliderStyle (juce::Slider::IncDecButtons);
     maxSearchTimeSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
     maxSearchTimeSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
     maxSearchTimeSlider.setNumDecimalPlacesToDisplay (1);
-    addAndMakeVisible (maxSearchTimeSlider);
+    content.addAndMakeVisible (maxSearchTimeSlider);
     maxSearchTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "maxSearchTimeValue", maxSearchTimeSlider);
 
     maxSearchTimeHoursButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (maxSearchTimeHoursButton);
+    content.addAndMakeVisible (maxSearchTimeHoursButton);
     maxSearchTimeHoursAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "maxSearchTimeIsHours", maxSearchTimeHoursButton);
 
@@ -149,12 +159,12 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // IncDecButtons style as Max Search Time above.
     prepareLabel (perCandidateSearchTimeLabel, 13.0f, false, juce::Justification::centredLeft);
     perCandidateSearchTimeLabel.setText ("Per-Candidate Time (s)", juce::dontSendNotification);
-    addAndMakeVisible (perCandidateSearchTimeLabel);
+    content.addAndMakeVisible (perCandidateSearchTimeLabel);
     perCandidateSearchTimeSlider.setSliderStyle (juce::Slider::IncDecButtons);
     perCandidateSearchTimeSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
     perCandidateSearchTimeSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
     perCandidateSearchTimeSlider.setNumDecimalPlacesToDisplay (0);
-    addAndMakeVisible (perCandidateSearchTimeSlider);
+    content.addAndMakeVisible (perCandidateSearchTimeSlider);
     perCandidateSearchTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "perCandidateSearchTimeSeconds", perCandidateSearchTimeSlider);
 
@@ -163,18 +173,18 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // processor.isSearchInProgressForUI() live in timerCallback(), same
     // pattern as the greyed-out sliders above.
     stopSearchButton.onClick = [this] { processor.requestStopSearch(); };
-    addAndMakeVisible (stopSearchButton);
+    content.addAndMakeVisible (stopSearchButton);
 
     prepareLabel (headroomCaption, 13.0f, false, juce::Justification::centredLeft);
     headroomCaption.setText ("Headroom (dB)", juce::dontSendNotification);
-    addAndMakeVisible (headroomCaption);
+    content.addAndMakeVisible (headroomCaption);
 
     // IncDecButtons: a typeable numeric box (click the number to edit
     // directly, or use the +/- arrows), not a drag knob.
     headroomSlider.setSliderStyle (juce::Slider::IncDecButtons);
     headroomSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
     headroomSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
-    addAndMakeVisible (headroomSlider);
+    content.addAndMakeVisible (headroomSlider);
     headroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "headroom", headroomSlider);
 
@@ -202,7 +212,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     };
 
     autoHeadroomButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    addAndMakeVisible (autoHeadroomButton);
+    content.addAndMakeVisible (autoHeadroomButton);
     autoHeadroomAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "autoHeadroom", autoHeadroomButton);
 
@@ -216,7 +226,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     clipIndicator.setColour (juce::Label::textColourId, juce::Colours::white);
     clipIndicator.setColour (juce::Label::backgroundColourId, juce::Colour (0xff3a3a3a));
     clipIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
-    addAndMakeVisible (clipIndicator);
+    content.addAndMakeVisible (clipIndicator);
 
     // topLeft, not centredLeft: a Label vertically CENTRES its text within
     // its own bounds, so when the (wrapped, multi-line) metrics text is
@@ -227,10 +237,10 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // which is far less confusing, and pairs with generously sizing that
     // area in resized() below so clipping shouldn't normally happen at all.
     prepareLabel (metricsReadout, 13.0f, false, juce::Justification::topLeft);
-    addAndMakeVisible (metricsReadout);
+    content.addAndMakeVisible (metricsReadout);
 
     coefficientsButton.onClick = [this] { toggleCoefficientsPopup(); };
-    addAndMakeVisible (coefficientsButton);
+    content.addAndMakeVisible (coefficientsButton);
 
     // Saves whichever row is CURRENTLY ACTIVE (snap.selectedIndex) - see
     // this button's own header comment. Re-reads the snapshot at click
@@ -242,17 +252,17 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
         const auto snap = processor.getDesignSnapshotForUI();
         processor.saveTopCandidateAsOverride (snap.selectedIndex, true);
     };
-    addAndMakeVisible (saveAsDefaultButton);
+    content.addAndMakeVisible (saveAsDefaultButton);
 
     // Forces a genuinely fresh search regardless of any existing cache/
     // override entry for the current spec - see requestFreshSearch()'s own
     // comment.
     reSearchButton.onClick = [this] { processor.requestFreshSearch(); };
-    addAndMakeVisible (reSearchButton);
+    content.addAndMakeVisible (reSearchButton);
 
     prepareLabel (topCandidatesHeader, 13.0f, true, juce::Justification::centredLeft);
     topCandidatesHeader.setText ("Top Results (best R_peak first) - Custom/Auto only", juce::dontSendNotification);
-    addAndMakeVisible (topCandidatesHeader);
+    content.addAndMakeVisible (topCandidatesHeader);
 
     // One row per possible ranked candidate (see DesignSnapshot::
     // topCandidates) - text and visibility for each are filled in per-tick
@@ -264,12 +274,12 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     {
         auto& rowLabel = candidateRowLabels[static_cast<std::size_t> (i)];
         prepareLabel (rowLabel, 12.0f, false, juce::Justification::centredLeft);
-        addAndMakeVisible (rowLabel);
+        content.addAndMakeVisible (rowLabel);
 
         auto& useButton = useCandidateButtons[static_cast<std::size_t> (i)];
         useButton.setButtonText ("Use");
         useButton.onClick = [this, i] { processor.selectTopCandidate (i); };
-        addAndMakeVisible (useButton);
+        content.addAndMakeVisible (useButton);
 
         // false (not the "Save as Default" button's true - see
         // saveTopCandidateAsOverride()'s own comment): persists this row's
@@ -282,7 +292,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
         auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
         saveButton.setButtonText ("Save");
         saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i, false); };
-        addAndMakeVisible (saveButton);
+        content.addAndMakeVisible (saveButton);
     }
 
     coefficientsBox.setMultiLine (true);
@@ -293,14 +303,39 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff0d0d0d));
     coefficientsBox.setColour (juce::TextEditor::textColourId, juce::Colours::lightgreen);
     coefficientsBox.setVisible (false);
-    addChildComponent (coefficientsBox);
+    content.addChildComponent (coefficientsBox);
 
-    // Grew by 190 from 971 to 1161 to fit the top-N results table (header
-    // + up to bbk::parametric::topCandidateCount rows) added between the
-    // metrics readout and the coefficients/save-as-default row, then by a
-    // further 32 to fit the new Per-Candidate Time row added just below Max
-    // Search Time - see resized() for the exact layout this accounts for.
-    setSize (680, 1193);
+    // contentHeight is the sum of every fixed row/gap laid out in
+    // layOutContent() below (currently ~978, including the 20px top/bottom
+    // margins baked into that method's own area.reduced(20)) plus a fixed
+    // allowance for the coefficients box - it has its own internal
+    // scrollbar (see setScrollbarsShown() above), so it doesn't need much
+    // outer space to still be fully usable. This is content's own,
+    // possibly-tall size; it is NOT the window size - see viewport's own
+    // comment in PluginEditor.h and setSize() just below for why those are
+    // now deliberately different.
+    constexpr int contentWidth = 680;
+    constexpr int coefficientsBoxHeight = 260;
+    constexpr int contentHeight = 978 + 40 + coefficientsBoxHeight;
+    content.setSize (contentWidth, contentHeight);
+    layOutContent();
+
+    // The window itself, unlike content above, is kept to a modest,
+    // screen-friendly default - reported directly that the previous fixed-
+    // height window (grown repeatedly, in step with content, to show
+    // everything with no scrolling at all) had become tall enough to open
+    // partly off-screen on plenty of real monitors. 700 wide leaves slack
+    // beyond content's own 680 for the vertical scrollbar; 820 tall is a
+    // conservative default that should comfortably fit even a modest
+    // laptop screen alongside the host's own window chrome. Resizable
+    // (both directions - a wider window doesn't need scrolling, just shows
+    // more blank margin, which is harmless) so anyone with more screen room
+    // can drag it taller and see more of content at once, up to content's
+    // own full size, beyond which there is nothing more to reveal.
+    setResizable (true, true);
+    setResizeLimits (420, 400, contentWidth + 40, contentHeight);
+    setSize (700, 820);
+
     startTimerHz (4);
     timerCallback();
 }
@@ -314,7 +349,17 @@ void BBKDetachedPoleAudioProcessorEditor::paint (juce::Graphics& g)
 
 void BBKDetachedPoleAudioProcessorEditor::resized()
 {
-    auto area = getLocalBounds().reduced (20);
+    // content's own size is fixed once, in the constructor (see
+    // layOutContent()'s own call site there) - all this needs to do on
+    // every actual window resize is let the viewport fill whatever space
+    // the window now has; it handles showing/hiding its own scrollbar and
+    // scrolling content within that space entirely on its own.
+    viewport.setBounds (getLocalBounds());
+}
+
+void BBKDetachedPoleAudioProcessorEditor::layOutContent()
+{
+    auto area = content.getLocalBounds().reduced (20);
 
     title.setBounds (area.removeFromTop (30));
     subtitle.setBounds (area.removeFromTop (18));
@@ -393,8 +438,8 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
     // live search-progress addendum (see timerCallback()) adds up to 2
     // more while a search is running - undersizing this clipped real
     // content, reported directly ("the central part with the text is not
-    // big enough to show full text"). See setSize() below, which grew by
-    // the same amount this took from the window.
+    // big enough to show full text"). Content (not the window itself - see
+    // the constructor's own contentHeight comment) is sized to fit this.
     metricsReadout.setBounds (area.removeFromTop (380));
 
     area.removeFromTop (10);
