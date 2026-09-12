@@ -1,24 +1,45 @@
 #pragma once
 
-// Persistence for user-saved filter overrides ("Save as Default" in the
-// editor - see PluginEditor.cpp/PluginProcessor.cpp::saveTopCandidateAsOverride).
-// This header only does I/O and serialisation; matching an override against
-// the current spec (specsEqual) is the processor's own job, using the same
-// exact-comparison helper it already uses for the redesign-memory dedup.
+// Persistence for user-saved filter overrides - both the plain, per-exact-
+// spec kind (a top-N table row's own "Save" button - see PluginEditor.cpp/
+// PluginProcessor.cpp::saveTopCandidateAsOverride) and the numbered preset
+// slots (savePresetSlot()/loadPresetSlot()) that replaced the old single
+// "Default" toggle. This header only does I/O and serialisation; matching
+// an override against the current spec (specsEqual), and deciding which
+// entry (if any) currently occupies a given preset slot, is the processor's
+// own job.
 //
 // One shared, per-install file (not per-project/per-DAW-session): the whole
 // point of a saved override is "whenever I'm back at this exact operating
 // point, use my filter" - that should hold regardless of which project or
 // host you're in, the same as the compiled-in factory bank already does.
+// loadAll()/saveAll() below both take an optional file argument for exactly
+// this reason: BBKDetachedPoleAudioProcessor::exportPresets()/importPresets()
+// reuse this same file format, and this same parsing/writing code, to let a
+// preset bank travel between installs as one ordinary file a user can email,
+// message, or drop in a shared folder.
 
 #include "ParametricFIR.h"
 
 #include <juce_core/juce_core.h>
 
+#include <array>
 #include <vector>
 
 namespace bbk::detachedpole::useroverrides
 {
+
+// How many general-purpose preset slots the editor offers (see
+// PluginEditor.h's presetLoadButtons/presetSaveButtons and
+// BBKDetachedPoleAudioProcessor::loadPresetSlot()/savePresetSlot()). This
+// replaced the old single "Default" toggle entirely: rather than one
+// instant operating point per sample rate (picked automatically as
+// "whichever override was saved most recently"), the user gets 5
+// independently addressable bookmarks - "save whatever I'm listening to
+// right now as Preset 3", recalled later without needing to remember which
+// combination of cutoff/attenuation/stopband/decay produced it in the
+// first place.
+constexpr int numPresetSlots = 5;
 
 // An override now remembers up to bbk::parametric::topCandidateCount ranked
 // candidates for its spec (see ParametricFIR.h::RankedCandidate and
@@ -35,26 +56,21 @@ struct OverrideEntry
     std::vector<bbk::parametric::RankedCandidate> candidates; // best-R_peak-first, up to topCandidateCount
     int activeIndex = 0;
 
-    // True only for an override saved via the dedicated "Save as Default"
-    // button; false for one saved via a top-N table row's own per-candidate
-    // "Save" button (see PluginProcessor.cpp::saveTopCandidateAsOverride()'s
-    // own comment on the setAsDefaultChoice parameter). Every override,
-    // regardless of this flag, is still recalled instantly for its own
-    // EXACT spec (see requestBoundaryRedesign()'s overrideEntry lookup) -
-    // this flag only gates forcePresetOperatingPoint()'s much broader
-    // "most recently saved override for this SAMPLE RATE, any spec" scan,
-    // which is what Default mode actually recalls. Without this
-    // distinction, bookmarking an alternative candidate from the top-N
-    // table - a deliberate act of saving, but not of "make this my
-    // Default" - silently became the new Default for that sample rate the
-    // instant it was saved, reported directly as "I saved one of the top 5
-    // and it now shows up when I click Default, even though I never
-    // touched Save as Default." Defaults to true so every override
-    // written to disk BEFORE this flag existed (which could only ever
-    // have come from the single old Save-as-Default action) keeps
-    // counting as a Default choice exactly as before - see loadAll()'s
-    // matching default on the missing-attribute case.
-    bool isDefaultChoice = true;
+    // -1 for a plain override, saved via a top-N table row's own per-
+    // candidate "Save" button - recalled only when its own EXACT spec
+    // recurs (see requestBoundaryRedesign()'s overrideEntry lookup), same
+    // as always. 0..numPresetSlots-1 means this override is ALSO the
+    // current occupant of that numbered preset slot - see
+    // BBKDetachedPoleAudioProcessor::loadPresetSlot()/savePresetSlot(),
+    // which is what replaced the old "Default" toggle: loading a preset
+    // slot forces cutoff/attenuation/stopband/decay to THIS entry's own
+    // spec (recalling it exactly, whatever it was searched with) rather
+    // than requiring the spec to already match what's currently dialed in.
+    // At most one entry may claim a given slot at a time - saving a new
+    // preset into an occupied slot clears this field on whatever entry
+    // held it before (that entry isn't deleted, it just stops being a
+    // preset - it's still a plain override for its own exact spec).
+    int presetSlot = -1;
 };
 
 inline juce::File getOverrideFile()
@@ -66,16 +82,22 @@ inline juce::File getOverrideFile()
 
 // Reads every saved override from disk. Returns an empty vector (not an
 // error) if the file doesn't exist yet - the normal state before the user
-// has ever clicked "Save as Default". Also transparently upgrades the older
+// has ever saved anything. Also transparently upgrades the older
 // one-candidate-per-override file format (a single <Override> with its own
 // tapCount/achievedStopbandDb/taps attributes, no nested <Candidate>
 // children) into a one-candidate candidates list, so overrides saved before
 // this top-N change keep working exactly as before rather than silently
 // vanishing.
-inline std::vector<OverrideEntry> loadAll()
+//
+// file defaults to the shared per-install override file (getOverrideFile())
+// but can be pointed at any other file - this is what
+// BBKDetachedPoleAudioProcessor::importPresets() uses to read a bank a
+// friend exported (see saveAll()'s own comment on the matching export
+// path), without needing a second, parallel implementation of this same
+// parsing logic.
+inline std::vector<OverrideEntry> loadAll (const juce::File& file = getOverrideFile())
 {
     std::vector<OverrideEntry> result;
-    auto file = getOverrideFile();
     if (! file.existsAsFile())
         return result;
 
@@ -143,14 +165,41 @@ inline std::vector<OverrideEntry> loadAll()
         if (e.activeIndex < 0 || e.activeIndex >= static_cast<int> (e.candidates.size()))
             e.activeIndex = 0; // guards a corrupted/out-of-range index the same way the size check above guards taps
 
-        // Missing attribute (every file written before this flag existed)
-        // defaults to true - see OverrideEntry::isDefaultChoice's own
-        // comment for why that's the correct upgrade behaviour, not just a
-        // convenient one.
-        e.isDefaultChoice = child->getBoolAttribute ("isDefaultChoice", true);
+        // Missing attribute (every file written before preset slots existed,
+        // including ones tagged isDefaultChoice="true" under the old
+        // now-removed Default toggle) defaults to -1: a plain, non-preset
+        // override, still fully recallable for its own exact spec exactly
+        // as before - it just doesn't automatically claim a numbered preset
+        // slot on upgrade. See OverrideEntry::presetSlot's own comment.
+        e.presetSlot = child->getIntAttribute ("presetSlot", -1);
+        if (e.presetSlot < -1 || e.presetSlot >= numPresetSlots)
+            e.presetSlot = -1; // guard a corrupted/out-of-range slot the same way activeIndex is guarded above
 
         result.push_back (std::move (e));
     }
+
+    // Guard against two entries claiming the same preset slot - shouldn't
+    // happen from this file's own writer (saveTopCandidateAsOverride()/
+    // savePresetSlot() always clear the previous occupant first), but a
+    // hand-edited file, a corrupted write, or an imported file merged in
+    // some unexpected way could still produce one. First entry in file
+    // order wins; every later duplicate claimant is demoted to a plain
+    // (non-preset) override rather than silently leaving two "Preset 3"
+    // buttons disagreeing about what they'd load.
+    {
+        std::array<bool, static_cast<std::size_t> (numPresetSlots)> slotClaimed {};
+        for (auto& e : result)
+        {
+            if (e.presetSlot < 0)
+                continue;
+            auto idx = static_cast<std::size_t> (e.presetSlot);
+            if (slotClaimed[idx])
+                e.presetSlot = -1;
+            else
+                slotClaimed[idx] = true;
+        }
+    }
+
     return result;
 }
 
@@ -158,7 +207,11 @@ inline std::vector<OverrideEntry> loadAll()
 // saveTopCandidateAsOverride() - already merged/replaced in-memory before
 // calling this, since "update this one entry" isn't naturally expressible
 // against a flat file without reading it back first anyway).
-inline bool saveAll (const std::vector<OverrideEntry>& entries)
+//
+// file defaults to the shared per-install override file, same as loadAll()
+// above - see its own comment on why a caller would ever pass a different
+// one (exportPresets()).
+inline bool saveAll (const std::vector<OverrideEntry>& entries, const juce::File& file = getOverrideFile())
 {
     juce::XmlElement root ("BBKDetachedPoleUserOverrides");
     for (auto& e : entries)
@@ -171,7 +224,7 @@ inline bool saveAll (const std::vector<OverrideEntry>& entries)
         child->setAttribute ("stopbandMode", static_cast<int> (e.spec.stopbandMode));
         child->setAttribute ("sidelobeDecayRatio", e.spec.sidelobeDecayRatio);
         child->setAttribute ("activeIndex", e.activeIndex);
-        child->setAttribute ("isDefaultChoice", e.isDefaultChoice);
+        child->setAttribute ("presetSlot", e.presetSlot);
 
         for (auto& c : e.candidates)
         {
@@ -190,7 +243,6 @@ inline bool saveAll (const std::vector<OverrideEntry>& entries)
         }
     }
 
-    auto file = getOverrideFile();
     file.getParentDirectory().createDirectory();
     return root.writeTo (file);
 }

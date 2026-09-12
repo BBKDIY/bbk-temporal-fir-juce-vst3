@@ -57,15 +57,6 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "bypass", bypassButton);
 
-    // Default vs Custom: see the member comment on defaultModeButton. Grey-
-    // out of the affected sliders happens in timerCallback() (they need to
-    // track the parameter live, not just this button's own clicks - e.g.
-    // host automation of "presetMode").
-    defaultModeButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
-    content.addAndMakeVisible (defaultModeButton);
-    defaultModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-        processor.getAPVTS(), "presetMode", defaultModeButton);
-
     prepareLabel (cutoffLabel, 13.0f, false, juce::Justification::centredLeft);
     cutoffLabel.setText ("Cutoff", juce::dontSendNotification);
     content.addAndMakeVisible (cutoffLabel);
@@ -119,7 +110,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
 
     // Manual/Auto tap-count selector - greying handled in timerCallback()
     // (needs to track the parameter live, e.g. host automation of
-    // "tapCountAuto", same reasoning as defaultModeButton above).
+    // "tapCountAuto").
     prepareLabel (manualTapCountLabel, 13.0f, false, juce::Justification::centredLeft);
     manualTapCountLabel.setText ("Manual Tap Count", juce::dontSendNotification);
     content.addAndMakeVisible (manualTapCountLabel);
@@ -242,18 +233,6 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsButton.onClick = [this] { toggleCoefficientsPopup(); };
     content.addAndMakeVisible (coefficientsButton);
 
-    // Saves whichever row is CURRENTLY ACTIVE (snap.selectedIndex) - see
-    // this button's own header comment. Re-reads the snapshot at click
-    // time rather than capturing anything, so it always reflects whatever
-    // is actually playing right now, including a switch made moments ago
-    // via a row's own Use button below.
-    saveAsDefaultButton.onClick = [this]
-    {
-        const auto snap = processor.getDesignSnapshotForUI();
-        processor.saveTopCandidateAsOverride (snap.selectedIndex, true);
-    };
-    content.addAndMakeVisible (saveAsDefaultButton);
-
     // Forces a genuinely fresh search regardless of any existing cache/
     // override entry for the current spec - see requestFreshSearch()'s own
     // comment.
@@ -268,7 +247,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // topCandidates) - text and visibility for each are filled in per-tick
     // by timerCallback() based on how many candidates the current snapshot
     // actually has; a row with nothing to show is simply hidden rather than
-    // left blank, so Manual-mode/Default-mode results (which have none)
+    // left blank, so Manual-mode/preset-bank results (which have none)
     // don't leave 5 empty rows sitting on screen.
     for (int i = 0; i < bbk::parametric::topCandidateCount; ++i)
     {
@@ -281,19 +260,82 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
         useButton.onClick = [this, i] { processor.selectTopCandidate (i); };
         content.addAndMakeVisible (useButton);
 
-        // false (not the "Save as Default" button's true - see
-        // saveTopCandidateAsOverride()'s own comment): persists this row's
-        // candidate for instant exact-spec recall later, same as any other
-        // override, but does NOT make it what Default mode recalls for this
-        // sample rate. Bookmarking an alternative from this table should
-        // never silently hijack Default just because it happened to be the
-        // most recently saved override - only the dedicated button above
-        // does that.
+        // Persists this row's candidate for instant exact-spec recall
+        // later, same as any other override - see
+        // saveTopCandidateAsOverride()'s own comment. If you'd rather
+        // bookmark it into one of the numbered preset slots below instead
+        // (so you can get back to it without needing to recreate this
+        // exact spec), use Save on one of the Preset rows once this row is
+        // active (Use it first, or it already is the active one).
         auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
         saveButton.setButtonText ("Save");
-        saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i, false); };
+        saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i); };
         content.addAndMakeVisible (saveButton);
     }
+
+    // Numbered preset slots - see the member comment in PluginEditor.h and
+    // BBKDetachedPoleAudioProcessor::loadPresetSlot()/savePresetSlot()'s own
+    // comments. Label text is filled in per-tick by timerCallback() (it
+    // needs to reflect whatever's actually saved on disk, which can change
+    // from any of these five Save buttons, so it's refreshed the same way
+    // the top-N table's own row text is).
+    prepareLabel (presetSlotHeader, 13.0f, true, juce::Justification::centredLeft);
+    presetSlotHeader.setText ("Presets - bookmark a good find, recall it without redoing the search", juce::dontSendNotification);
+    content.addAndMakeVisible (presetSlotHeader);
+
+    for (int i = 0; i < bbk::detachedpole::useroverrides::numPresetSlots; ++i)
+    {
+        auto& slotLabel = presetSlotLabels[static_cast<std::size_t> (i)];
+        prepareLabel (slotLabel, 12.0f, false, juce::Justification::centredLeft);
+        content.addAndMakeVisible (slotLabel);
+
+        auto& loadButton = presetLoadButtons[static_cast<std::size_t> (i)];
+        loadButton.setButtonText ("Load");
+        loadButton.onClick = [this, i] { processor.loadPresetSlot (i); };
+        content.addAndMakeVisible (loadButton);
+
+        auto& saveButton = presetSaveButtons[static_cast<std::size_t> (i)];
+        saveButton.setButtonText ("Save");
+        saveButton.onClick = [this, i] { processor.savePresetSlot (i); };
+        content.addAndMakeVisible (saveButton);
+    }
+
+    // Whole-bank sharing - see the member comment in PluginEditor.h.
+    // launchAsync (never a blocking/modal file dialog) so the native file
+    // picker never stalls the message thread; activeFileChooser is kept
+    // alive as a member for the async callback's duration (see its own
+    // comment) and reset once the callback runs, whether or not the user
+    // actually picked a file.
+    exportPresetsButton.onClick = [this]
+    {
+        activeFileChooser = std::make_unique<juce::FileChooser> (
+            "Export presets to...", juce::File(), "*.xml");
+        activeFileChooser->launchAsync (juce::FileBrowserComponent::saveMode
+                                         | juce::FileBrowserComponent::warnAboutOverwriting,
+            [this] (const juce::FileChooser& fc)
+            {
+                auto file = fc.getResult();
+                if (file != juce::File())
+                    processor.exportPresets (file);
+                activeFileChooser.reset();
+            });
+    };
+    content.addAndMakeVisible (exportPresetsButton);
+
+    importPresetsButton.onClick = [this]
+    {
+        activeFileChooser = std::make_unique<juce::FileChooser> (
+            "Import presets from...", juce::File(), "*.xml");
+        activeFileChooser->launchAsync (juce::FileBrowserComponent::openMode,
+            [this] (const juce::FileChooser& fc)
+            {
+                auto file = fc.getResult();
+                if (file != juce::File())
+                    processor.importPresets (file);
+                activeFileChooser.reset();
+            });
+    };
+    content.addAndMakeVisible (importPresetsButton);
 
     coefficientsBox.setMultiLine (true);
     coefficientsBox.setReadOnly (true);
@@ -306,17 +348,18 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     content.addChildComponent (coefficientsBox);
 
     // contentHeight is the sum of every fixed row/gap laid out in
-    // layOutContent() below (currently ~978, including the 20px top/bottom
-    // margins baked into that method's own area.reduced(20)) plus a fixed
-    // allowance for the coefficients box - it has its own internal
-    // scrollbar (see setScrollbarsShown() above), so it doesn't need much
-    // outer space to still be fully usable. This is content's own,
-    // possibly-tall size; it is NOT the window size - see viewport's own
-    // comment in PluginEditor.h and setSize() just below for why those are
-    // now deliberately different.
+    // layOutContent() below (currently ~1184, including the 20px top/bottom
+    // margins baked into that method's own area.reduced(20) and the 5
+    // preset-slot rows plus the Export/Import row added below the top-N
+    // table) plus a fixed allowance for the coefficients box - it has its
+    // own internal scrollbar (see setScrollbarsShown() above), so it
+    // doesn't need much outer space to still be fully usable. This is
+    // content's own, possibly-tall size; it is NOT the window size - see
+    // viewport's own comment in PluginEditor.h and setSize() just below
+    // for why those are now deliberately different.
     constexpr int contentWidth = 680;
     constexpr int coefficientsBoxHeight = 260;
-    constexpr int contentHeight = 978 + 40 + coefficientsBoxHeight;
+    constexpr int contentHeight = 1184 + 40 + coefficientsBoxHeight;
     content.setSize (contentWidth, contentHeight);
     layOutContent();
 
@@ -368,7 +411,6 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     {
         auto row = area.removeFromTop (24);
         bypassButton.setBounds (row.removeFromRight (100));
-        defaultModeButton.setBounds (row.removeFromRight (220));
         searchIndicator.setBounds (row.removeFromRight (130));
         sampleRate.setBounds (row);
     }
@@ -461,7 +503,30 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     area.removeFromTop (6);
     auto buttonRow = area.removeFromTop (26);
     coefficientsButton.setBounds (buttonRow.removeFromLeft (200));
-    saveAsDefaultButton.setBounds (buttonRow.removeFromRight (160));
+
+    area.removeFromTop (10);
+    presetSlotHeader.setBounds (area.removeFromTop (20));
+    area.removeFromTop (4);
+    for (int i = 0; i < bbk::detachedpole::useroverrides::numPresetSlots; ++i)
+    {
+        auto row = area.removeFromTop (24);
+        auto& loadButton = presetLoadButtons[static_cast<std::size_t> (i)];
+        auto& saveButton = presetSaveButtons[static_cast<std::size_t> (i)];
+        loadButton.setBounds (row.removeFromRight (60));
+        row.removeFromRight (6);
+        saveButton.setBounds (row.removeFromRight (60));
+        row.removeFromRight (10);
+        presetSlotLabels[static_cast<std::size_t> (i)].setBounds (row);
+        area.removeFromTop (4);
+    }
+
+    area.removeFromTop (6);
+    {
+        auto row = area.removeFromTop (26);
+        exportPresetsButton.setBounds (row.removeFromLeft (160));
+        row.removeFromLeft (10);
+        importPresetsButton.setBounds (row.removeFromLeft (160));
+    }
 
     area.removeFromTop (8);
     coefficientsBox.setBounds (area);
@@ -573,17 +638,43 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         searchProgressText << " - click Stop to load it immediately, or let it keep looking.\n";
     }
 
+    // Preset slot labels - refreshed unconditionally (unlike the metrics/
+    // top-N table below) since they reflect whatever's saved on disk, not
+    // the currently-playing design, and should show correctly even before
+    // the very first design has ever completed.
+    for (int i = 0; i < bbk::detachedpole::useroverrides::numPresetSlots; ++i)
+    {
+        const auto info = processor.getPresetSlotInfoForUI (i);
+        juce::String labelText;
+        labelText << "P" << (i + 1) << ": ";
+        if (info.occupied)
+        {
+            labelText << juce::String (info.spec.cutoffHz, 0) << " Hz / "
+                      << juce::String (info.spec.attenuationAtCutoffDb, 4) << " dB / "
+                      << juce::String (info.spec.stopbandRejectionDb, 1) << " dB stopband";
+        }
+        else if (i == 0)
+        {
+            labelText << "(empty - Load falls back to the factory bank)";
+        }
+        else
+        {
+            labelText << "(empty)";
+        }
+        presetSlotLabels[static_cast<std::size_t> (i)].setText (labelText, juce::dontSendNotification);
+    }
+
     if (snap.tapCount == 0)
     {
         // Shown at cold start and again on every sample-rate change - the
         // redesign for the new rate runs entirely in the background and
         // never blocks playback; audio passes through unfiltered (delay-
-        // matched, no clicks) until it completes and crossfades in. In
-        // Default mode this resolves near-instantly (an instant bank
-        // lookup, not a search) unless the rate isn't one of the 7 the
-        // bank covers; in Custom mode the live search can now run
-        // indefinitely (see requestBoundaryRedesign()'s own comment and
-        // the Max Search Time safety net) rather than blocking playback.
+        // matched, no clicks) until it completes and crossfades in. A
+        // spec that lands an instant hit (the factory bank, a saved
+        // override/preset, or the search cache) resolves near-instantly;
+        // otherwise the live search can now run indefinitely (see
+        // requestBoundaryRedesign()'s own comment and the Max Search Time
+        // safety net) rather than blocking playback.
         metricsReadout.setText ("Designing filter for " + juce::String (processor.getCurrentSampleRateForUI(), 0)
                                  + " Hz... (unfiltered pass-through meanwhile)" + searchProgressText,
                                  juce::dontSendNotification);
@@ -608,32 +699,15 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // live and misleading.
     attenuationSlider.setEnabled (snap.amplitudeRelaxationOn);
 
-    // Default mode: cutoff/stopband/sidelobeDecay are forced to an
-    // operating point the instant Default turns on (the factory bank's
-    // fixed point, or a saved override's own point if one exists for this
-    // sample rate - see forcePresetOperatingPoint()) and ignored by the
-    // design itself, so grey them out - per the chosen UI, they stay
-    // visible and keep showing the forced values (the sliders themselves
-    // already reflect those values via their own attachments, since
-    // forcePresetOperatingPoint() writes through the real parameters).
-    // Attenuation stays enabled in both modes too - forcePresetOperatingPoint()
-    // snaps it once at the moment Default turns on (to the override's own
-    // attenuation if one exists, otherwise left as-is so it still picks
-    // among the 10 factory steps), but afterwards it's still live: you can
-    // drag it to browse the other factory steps even with Default checked.
-    const bool presetModeOn = processor.getAPVTS().getRawParameterValue ("presetMode")->load() > 0.5f;
-    cutoffSlider.setEnabled (! presetModeOn);
-    stopbandSlider.setEnabled (! presetModeOn);
-    sidelobeDecaySlider.setEnabled (! presetModeOn);
-
     // Manual Tap Count is a no-op while Auto is on (the engine's own
     // M-search picks the tap count instead - see run() in
-    // PluginProcessor.cpp) and, same reasoning as the three sliders just
-    // above, while Default mode is on (an instant bank/override lookup,
-    // not a fresh design at all) - grey it out in either case so it never
-    // looks live and editable when it wouldn't actually do anything.
+    // PluginProcessor.cpp) - grey it out so it never looks live and
+    // editable when it wouldn't actually do anything. Loading a preset
+    // slot (see loadPresetSlot()) forces Auto back on the same way the old
+    // Default toggle used to, so this slider greys out then too, exactly
+    // as it always did.
     const bool tapCountAutoOn = processor.getAPVTS().getRawParameterValue ("tapCountAuto")->load() > 0.5f;
-    manualTapCountSlider.setEnabled (! presetModeOn && ! tapCountAutoOn);
+    manualTapCountSlider.setEnabled (! tapCountAutoOn);
 
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
@@ -645,21 +719,22 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     {
         using ResultSource = BBKDetachedPoleAudioProcessor::ResultSource;
         case ResultSource::PresetBank:
-            designMethodText = "Default - instant lookup in a precomputed filter bank (18.5 kHz cutoff, 95 dB "
+            designMethodText = "Factory bank - instant lookup in a precomputed filter (18.5 kHz cutoff, 95 dB "
                                 "stopband, sidelobe decay 1.0, one of 10 attenuation steps chosen by the slider "
-                                "above); no background search.";
+                                "above); no background search. This is what an unassigned Preset 1 falls back to.";
             break;
         case ResultSource::UserOverride:
             designMethodText = "User Override - instant lookup of a filter you saved yourself for this exact "
-                                "operating point (see Save as Default); no background search.";
+                                "operating point (see the Presets section, or a top-N row's own Save button); "
+                                "no background search.";
             break;
         case ResultSource::SearchCache:
-            designMethodText = "Custom - already searched for this exact operating point earlier (this session "
+            designMethodText = "Already searched for this exact operating point earlier (this session "
                                 "or a previous one); instant recall, no fresh search.";
             break;
         case ResultSource::LiveSearch:
         default:
-            designMethodText = "Custom - Minimax, the article's own minimum-peak-sidelobe method, searched "
+            designMethodText = "Minimax, the article's own minimum-peak-sidelobe method, searched "
                                 "thoroughly across tap counts and stopband-edge candidates, ranked purely by "
                                 "R_peak (lowest-ringing first - see the Top Results table below for the other "
                                 "candidates it found).";

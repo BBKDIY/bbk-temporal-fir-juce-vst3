@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <array>
 #include "PluginProcessor.h"
+#include "UserPresetOverrides.h" // for bbk::detachedpole::useroverrides::numPresetSlots
 
 class BBKDetachedPoleAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                                    private juce::Timer
@@ -55,15 +56,6 @@ private:
     juce::ToggleButton bypassButton { "Bypass" };
     juce::ToggleButton amplitudeRelaxationButton { "Amplitude Relaxation" };
 
-    // On: cutoff/stopband/sidelobeDecay are forced to the precomputed
-    // preset-bank operating point (18.5 kHz / 95 dB / decay 1.0) and the
-    // matching filter for the current sample rate + attenuation step loads
-    // instantly, no background search. Those three sliders are greyed out
-    // (still showing the forced values, per the chosen UI - see
-    // timerCallback()) while this is on; Attenuation stays live since it's
-    // what selects which of the 10 precomputed steps is used.
-    juce::ToggleButton defaultModeButton { "Default (instant, prebuilt)" };
-
     juce::Label cutoffLabel;
     juce::Slider cutoffSlider;
     juce::Label attenuationLabel;
@@ -76,8 +68,7 @@ private:
     // Manual/Auto tap-count selector - see "tapCountAuto"/"manualTapCount"
     // in PluginProcessor.cpp::createParameterLayout(). manualTapCountSlider
     // is greyed out (see timerCallback()) whenever tapCountAutoButton is
-    // checked (Auto mode ignores it entirely) or Default mode is on (same
-    // reasoning as cutoffSlider/stopbandSlider/sidelobeDecaySlider above).
+    // checked - Auto mode ignores it entirely.
     juce::Label manualTapCountLabel;
     juce::Slider manualTapCountSlider;
     juce::ToggleButton tapCountAutoButton { "Auto" };
@@ -127,28 +118,17 @@ private:
     juce::TextEditor coefficientsBox;
     bool coefficientsVisible = false;
 
-    // Persists whatever is CURRENTLY ACTIVE (whichever row of the top-N
-    // table below is selected, or the single result itself for a Manual/
-    // Default-mode design that has no ranked list at all) as a user
-    // override for its own exact spec - see
-    // BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride(). Always
-    // enabled; saving an already-instant result is harmless, just pointless.
-    // A row's own Save button below (saveCandidateButtons) does the same
-    // thing for a SPECIFIC row regardless of which one is currently active -
-    // this one is just the "save whatever I'm listening to right now"
-    // shortcut.
-    juce::TextButton saveAsDefaultButton { "Save as Default" };
-
     // Top-N ranked-results table (see BBKDetachedPoleAudioProcessor::
     // DesignSnapshot::topCandidates / bbk::parametric::topCandidateCount):
     // one row per candidate the last completed Auto-mode search found,
     // best R_peak first, each with its own metrics plus a Use (switch to
     // it, no re-search - see selectTopCandidate()) and Save (persist it as
-    // a user override - see saveTopCandidateAsOverride()) button. Populated
-    // and shown/hidden per row in timerCallback() based on how many
-    // candidates the current design snapshot actually has - Manual-mode
-    // results and Default-mode bank entries have none, so every row stays
-    // blank/hidden for those, exactly as if this table weren't there at all.
+    // a plain, exact-spec-recall override - see saveTopCandidateAsOverride())
+    // button. Populated and shown/hidden per row in timerCallback() based
+    // on how many candidates the current design snapshot actually has -
+    // Manual-mode results and preset/bank entries have none, so every row
+    // stays blank/hidden for those, exactly as if this table weren't there
+    // at all.
     juce::Label topCandidatesHeader;
     std::array<juce::Label, static_cast<std::size_t> (bbk::parametric::topCandidateCount)> candidateRowLabels;
     std::array<juce::TextButton, static_cast<std::size_t> (bbk::parametric::topCandidateCount)> useCandidateButtons;
@@ -161,6 +141,41 @@ private:
     // results for" directly: yes, on demand, via this button.
     juce::TextButton reSearchButton { "Re-search" };
 
+    // Numbered preset slots - what replaced the plugin's old single
+    // "Default" toggle (see BBKDetachedPoleAudioProcessor::loadPresetSlot()/
+    // savePresetSlot()'s own comments for the full rationale). Each slot's
+    // Label shows a short auto-generated summary of whatever currently
+    // occupies it ("P1: 18500 Hz / 0.5000 dB" or similar), refreshed every
+    // timerCallback() tick same as everything else here; Load recalls that
+    // exact operating point outright, Save bookmarks whatever is CURRENTLY
+    // PLAYING into that slot, unconditionally overwriting whatever was
+    // there. Directly answers "I don't remember which of the near-infinite
+    // parameter combinations gave me a result I liked" - bookmark it the
+    // moment you hear it, without needing to reconstruct or even remember
+    // the search that produced it.
+    juce::Label presetSlotHeader;
+    std::array<juce::Label, static_cast<std::size_t> (bbk::detachedpole::useroverrides::numPresetSlots)> presetSlotLabels;
+    std::array<juce::TextButton, static_cast<std::size_t> (bbk::detachedpole::useroverrides::numPresetSlots)> presetLoadButtons;
+    std::array<juce::TextButton, static_cast<std::size_t> (bbk::detachedpole::useroverrides::numPresetSlots)> presetSaveButtons;
+
+    // Whole-bank sharing: writes every occupied preset slot to a single
+    // file (Export), or reads one back and merges it slot-by-slot into
+    // this install's own bank (Import) - see
+    // BBKDetachedPoleAudioProcessor::exportPresets()/importPresets()'s own
+    // comments. That file is just an ordinary XML file - email it, message
+    // it, drop it in a shared folder, however you'd share any other file -
+    // so a good find can travel to someone else's install of this plugin
+    // without them needing to reconstruct the search that produced it
+    // either.
+    juce::TextButton exportPresetsButton { "Export Presets..." };
+    juce::TextButton importPresetsButton { "Import Presets..." };
+
+    // Must outlive the async FileChooser callback (see its own use in the
+    // .cpp) - a local variable going out of scope before the user finishes
+    // interacting with the native file dialog would leave the callback
+    // pointing at a destroyed object.
+    std::unique_ptr<juce::FileChooser> activeFileChooser;
+
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
@@ -172,7 +187,6 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> perCandidateSearchTimeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> defaultModeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> headroomAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> autoHeadroomAttachment;
 

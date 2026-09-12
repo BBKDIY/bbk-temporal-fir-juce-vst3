@@ -105,19 +105,19 @@ public:
     // gives an objective signal instead of relying on hearing it.
     juce::uint32 getLastClipTimeMsForUI() const noexcept { return lastClipTimeMs.load(); }
 
-    // True whenever a live background design - a Custom-mode search, or
-    // Default mode's own fallback to one when the host's sample rate isn't
-    // one of the compiled-in bank's 7 swept rates - is currently queued or
-    // running for the boundary spec presently in effect, i.e. whatever the
-    // UI is showing right now (see DesignSnapshot) is not yet the freshest
-    // result being computed. Deliberately distinct from DesignSnapshot::
-    // tapCount == 0, which means "no completed design AT ALL yet" (the
-    // cold-start/sample-rate-change case, already shown via its own
-    // "Designing filter for..." message in the editor) - this instead
-    // covers the steady-state case where a PREVIOUS result is already
-    // playing but a newer one is being computed because a boundary
-    // parameter (cutoff, attenuation, stopband, sidelobe decay, Default
-    // on/off, or the Manual/Auto tap-count selector) just changed. See
+    // True whenever a live background design - a fresh search, or a
+    // fallback to one when a spec doesn't land an instant hit in the
+    // compiled-in bank/a saved override/preset/the search cache - is
+    // currently queued or running for the boundary spec presently in
+    // effect, i.e. whatever the UI is showing right now (see DesignSnapshot)
+    // is not yet the freshest result being computed. Deliberately distinct
+    // from DesignSnapshot::tapCount == 0, which means "no completed design
+    // AT ALL yet" (the cold-start/sample-rate-change case, already shown via
+    // its own "Designing filter for..." message in the editor) - this
+    // instead covers the steady-state case where a PREVIOUS result is
+    // already playing but a newer one is being computed because a boundary
+    // parameter (cutoff, attenuation, stopband, sidelobe decay, or the
+    // Manual/Auto tap-count selector) just changed. See
     // requestBoundaryRedesign() and run() for where this is set/cleared.
     bool isSearchInProgressForUI() const noexcept { return searchInProgress.load(); }
 
@@ -168,15 +168,14 @@ public:
     void requestStopSearch() noexcept { stopSearchRequested.store (true); }
 
     // Where a published design actually came from - shown in the editor's
-    // metrics readout and used to decide whether "Save as Default" is
-    // meaningful (saving an already-instant result just re-saves the same
-    // taps under the same spec, which is harmless but pointless).
+    // metrics readout.
     enum class ResultSource
     {
-        LiveSearch,   // Custom mode: a fresh designParametricFIR() search
-        PresetBank,   // Default mode: instant lookup in the compiled-in factory bank
-        UserOverride, // instant lookup in a filter the user saved themselves (see saveTopCandidateAsOverride)
-        SearchCache   // instant lookup in a Custom-mode result already searched earlier (see LiveSearchCache.h)
+        LiveSearch,   // a fresh designParametricFIR() search
+        PresetBank,   // instant lookup in the compiled-in factory bank (see requestBoundaryRedesign()) - also
+                      // what an unassigned Preset 1 falls back to, see loadPresetSlot()
+        UserOverride, // instant lookup in a filter the user saved themselves (see saveTopCandidateAsOverride/savePresetSlot)
+        SearchCache   // instant lookup in a result already searched earlier (see LiveSearchCache.h)
     };
 
     // A snapshot of the most recently completed design, safe to read from
@@ -213,7 +212,7 @@ public:
         // (taps/tapCount/achievedStopbandDb/temporal): topCandidates[
         // selectedIndex] always matches them exactly when topCandidates is
         // non-empty. Both are left at their defaults (empty/0) for a Manual
-        // tap-count result or a Default-mode bank entry, neither of which
+        // tap-count result or a factory-bank entry, neither of which
         // has a ranked list to offer - see selectTopCandidate() and
         // saveTopCandidateAsOverride() below for how a non-default index
         // gets here.
@@ -229,40 +228,109 @@ public:
     // picking a different one is just a re-publish of already-known taps,
     // same cost as an instant cache/override/bank hit. A no-op if index is
     // out of range or the current design has no ranked list at all (Manual
-    // mode, or a Default-mode bank entry). Does not touch the search cache
+    // mode, or a factory-bank entry). Does not touch the search cache
     // or any saved override - see saveTopCandidateAsOverride() for making a
     // choice persistent.
     void selectTopCandidate (int index);
 
     // Persists one specific candidate from the currently-published design's
     // own topCandidates (see DesignSnapshot above) - or, if it has no ranked
-    // list at all (Manual mode, or a Default-mode bank entry), the single
+    // list at all (Manual mode, or a Preset-slot/bank entry), the single
     // design currently playing - as a user override for its own exact spec
     // (sample rate, cutoff, attenuation, stopband, decay - see
     // UserPresetOverrides.h). The WHOLE ranked list is saved, not just the
     // chosen candidate, tagged with which index was picked (see
-    // OverrideEntry::activeIndex) - so revisiting this exact spec later, in
-    // either Default or Custom mode, instantly recalls the user's chosen
-    // filter AND still offers every other ranked alternative in the
-    // editor's own table, exactly as if the search had just finished again.
-    // From then on, ANY time that exact spec recurs, this session or a
-    // future one, requestBoundaryRedesign() finds and uses it instantly,
-    // ahead of both the compiled-in factory bank and a fresh live search. A
-    // no-op if nothing has been designed yet (tapCount == 0) or index is out
-    // of range for whatever list is being saved.
-    //
-    // setAsDefaultChoice distinguishes the two different buttons that both
-    // call this same method (see PluginEditor.cpp): true only for the
-    // dedicated "Save as Default" button, false for a top-N table row's own
-    // per-candidate "Save" button. It is stored as OverrideEntry::
-    // isDefaultChoice and gates ONLY forcePresetOperatingPoint()'s broader
-    // "most recently saved override for this sample rate, any spec" scan -
-    // exact-spec recall in requestBoundaryRedesign() still finds an override
-    // regardless of this flag. Without it, bookmarking an alternative
-    // candidate from the top-N table silently became the new thing Default
-    // mode recalls for that sample rate, even though the user never touched
-    // Save as Default - reported directly.
-    void saveTopCandidateAsOverride (int index, bool setAsDefaultChoice);
+    // OverrideEntry::activeIndex) - so revisiting this exact spec later
+    // instantly recalls the user's chosen filter AND still offers every
+    // other ranked alternative in the editor's own table, exactly as if the
+    // search had just finished again. From then on, ANY time that exact
+    // spec recurs, this session or a future one, requestBoundaryRedesign()
+    // finds and uses it instantly, ahead of both the compiled-in factory
+    // bank and a fresh live search. A no-op if nothing has been designed
+    // yet (tapCount == 0) or index is out of range for whatever list is
+    // being saved. Called from a top-N table row's own per-candidate "Save"
+    // button (see PluginEditor.cpp) - if this exact spec already occupies a
+    // preset slot (see savePresetSlot() below), that slot assignment is
+    // preserved rather than cleared, so re-saving the same find through
+    // this button can never silently un-assign a preset.
+    void saveTopCandidateAsOverride (int index);
+
+    // Numbered preset slots (0..bbk::detachedpole::useroverrides::
+    // numPresetSlots-1) - what replaced the plugin's old single "Default"
+    // toggle. Each slot independently remembers one whole operating point
+    // (cutoff, attenuation, stopband, decay, and its own ranked candidate
+    // list - stored as an OverrideEntry tagged with this slot number, see
+    // UserPresetOverrides.h), addressed directly by slot rather than by
+    // matching the spec currently dialed in. This is the direct answer to
+    // "I don't remember which of the near-infinite parameter combinations
+    // gave me a result I liked" - bookmark a good find into a slot the
+    // moment you hear it, then come back to that slot later without having
+    // to reconstruct or even remember the search that produced it.
+    struct PresetSlotInfo
+    {
+        bool occupied = false;
+        bbk::parametric::FilterSpec spec; // meaningful only when occupied is true
+    };
+    // For the editor's own slot labels (see PluginEditor.cpp::timerCallback()).
+    // slot must be in range [0, numPresetSlots); out of range returns an
+    // unoccupied result rather than asserting, same defensive posture as
+    // selectTopCandidate()'s own range check.
+    PresetSlotInfo getPresetSlotInfoForUI (int slot) const;
+
+    // Recalls slot's own exact operating point: forces cutoff/attenuation/
+    // stopband/decay (and Tap Count Auto, back on) to match it via
+    // setValueNotifyingHost, the same "processor drives another parameter's
+    // value directly" pattern forcePresetOperatingPoint used to use for the
+    // old Default toggle - each of those parameter changes re-enters
+    // requestBoundaryRedesign() via the ParamListener, which (since this
+    // exact spec is already sitting in userOverrides, tagged with this slot
+    // - see savePresetSlot()) finds and republishes it instantly once every
+    // parameter has caught up, no background search needed. If slot is
+    // unoccupied: a no-op for slots 1-4 (nothing has ever been saved there
+    // yet); slot 0 instead falls back to the compiled-in factory bank's
+    // fixed operating point (cutoff/stopband/decay only - Attenuation is
+    // left exactly where it already is, so it still picks among the bank's
+    // 10 precomputed steps) - the same starting point the old Default
+    // toggle always forced, so there's always something useful in Preset 1
+    // even before you've saved anything of your own.
+    void loadPresetSlot (int slot);
+
+    // Saves whatever is CURRENTLY PLAYING (same source as
+    // saveTopCandidateAsOverride(), re-read fresh at call time via
+    // getDesignSnapshotForUI() so it always reflects the very latest Use/
+    // Load) directly into the given slot, unconditionally overwriting
+    // whatever was there before. A no-op if nothing has been designed yet.
+    // If some other override already exists for this exact spec (e.g. it
+    // was already saved via a top-N row's plain "Save" button), that entry
+    // is replaced rather than duplicated, same dedup rule
+    // saveTopCandidateAsOverride() already uses.
+    void savePresetSlot (int slot);
+
+    // Writes every currently-occupied preset slot (and nothing else - a
+    // plain, non-preset override saved via a top-N row's "Save" button is
+    // NOT included) to destFile, in the same XML shape UserPresetOverrides.h
+    // already uses for its own persistence - see UserPresetOverrides.h::
+    // saveAll()'s own comment on why loadAll()/saveAll() both take a file
+    // argument. This is the whole "share with a friend" feature: destFile
+    // is just an ordinary file the user can email, message, or drop
+    // anywhere, and importPresets() below reads it back on the other end.
+    void exportPresets (const juce::File& destFile);
+
+    // Reads srcFile (expected to be a file exportPresets() produced, though
+    // any valid UserPresetOverrides-shaped XML works) and merges every
+    // preset it contains into this install's own bank, slot by slot: for
+    // each occupied slot the file defines, whatever currently occupies that
+    // same slot locally is displaced (demoted to a plain, non-preset
+    // override, same as savePresetSlot()'s own overwrite rule) and replaced
+    // with the imported one. Slots the file doesn't define are left
+    // completely untouched - importing a friend's 2-preset export never
+    // disturbs the other 3 slots you've already built up yourself. Returns
+    // false if srcFile couldn't be read or contained no presets at all (a
+    // plain override-only export, or an unrelated/corrupt file); true
+    // otherwise, including if fewer presets were merged than the file
+    // nominally listed (only entries actually tagged with a valid slot are
+    // merged - see UserPresetOverrides.h::loadAll()'s own dedup guard).
+    bool importPresets (const juce::File& srcFile);
 
     // Forces a genuinely fresh live search for the CURRENT spec, bypassing
     // every instant source (compiled-in bank, a saved override, and - the
@@ -342,93 +410,14 @@ private:
                          ResultSource source = ResultSource::LiveSearch,
                          int selectedIndex = 0);
 
-    // Called when the "presetMode" parameter turns on (see ParamListener
-    // below): forces cutoff/attenuation/stopband/sidelobeDecay to an
-    // operating point, via setValueNotifyingHost - the same "processor
-    // drives another parameter's value directly" pattern already used for
-    // the Auto Headroom ratchet (see process()). Normally that's the fixed
-    // point the preset bank was swept at (attenuation left alone, so the
-    // slider still picks one of the 10 precomputed steps) - but if the
-    // user has saved an override (see saveTopCandidateAsOverride()) for the
-    // current sample rate, ALL FOUR are instead snapped to that override's
-    // own values, attenuation included: "save as my default" means Default
-    // should always recall that exact saved point, not just the same
-    // cutoff/stopband/decay with whichever attenuation the slider happens
-    // to be sitting on. If more than one override exists for this rate,
-    // the most recently saved one wins (see saveTopCandidateAsOverride()'s
-    // ordering). This makes the greyed-out sliders in Default mode show
-    // the values that are actually in effect, rather than whatever
-    // Custom-mode position they were last left at, and means
-    // specFromParameters() never needs its own separate preset/custom
-    // branch - it just always reads whatever the parameters currently
-    // hold.
-    //
-    // Also forces "tapCountAuto" to Auto (on) - Manual Tap Count has no
-    // effect on Default mode's own instant lookup (see
-    // requestBoundaryRedesign(): the bank/override entry's own tap count
-    // is used regardless of what Manual Tap Count is dialed to), but
-    // leaving the selector sitting on Manual while Default is engaged was
-    // reported as confusing/misleading in practice - forcing it to Auto
-    // here, and restoring the user's own choice in
-    // restoreCustomPointBeforeDefault(), removes any ambiguity about
-    // whether Manual mode is "really" still in effect.
-    void forcePresetOperatingPoint();
-
-    // Called from forcePresetOperatingPoint()'s own start, the instant
-    // Default mode turns on: snapshots cutoff/attenuation/stopband/decay
-    // AS THEY WERE just before forcePresetOperatingPoint() overwrites them,
-    // so restoreCustomPointBeforeDefault() below can put the user's actual
-    // Custom-mode point back once Default is unchecked again. Without this,
-    // those four parameters simply stayed at whatever Default forced them
-    // to forever - so "unchecking Default" looked like it did nothing
-    // (still the Default spec, just now unlabelled as one), and any
-    // redesign that DID fire was for that same Default spec, not the
-    // user's own last Custom entry - which also meant it was never a
-    // search-cache hit (see LiveSearchCache.h), so it silently re-ran a
-    // full live search from scratch instead of recalling anything,
-    // breaking A/B comparison between a Custom find and Default entirely.
-    // Guarded against re-capturing on a resent "on" event (e.g. some hosts
-    // resend automation at the playhead on transport start - see
-    // requestBoundaryRedesign()'s own comment on the same pattern): only
-    // captures when currentBoundaryPresetMode is still false, i.e. this is
-    // a genuine off->on transition, not a repeat of the same state.
-    void captureCustomPointBeforeDefault();
-
-    // Restores whatever captureCustomPointBeforeDefault() saved. Called
-    // when "presetMode" turns back off (see ParamListener below), BEFORE
-    // requestBoundaryRedesign() - so the very next redesign already targets
-    // the user's real last Custom-mode spec (which, if it was searched
-    // before turning Default on, is now instantly recalled from
-    // LiveSearchCache.h rather than re-searched). A no-op if Default was
-    // never actually engaged this session (nothing was ever overwritten),
-    // or if this is a resent "off" event while already off.
-    void restoreCustomPointBeforeDefault();
-
     juce::AudioProcessorValueTreeState parameters;
 
     struct ParamListener final : juce::AudioProcessorValueTreeState::Listener
     {
         BBKDetachedPoleAudioProcessor& owner;
         explicit ParamListener (BBKDetachedPoleAudioProcessor& o) : owner (o) {}
-        void parameterChanged (const juce::String& parameterID, float newValue) override
+        void parameterChanged (const juce::String&, float) override
         {
-            // Order matters: force cutoff/stopband/decay to the preset
-            // operating point (or restore the pre-Default Custom point,
-            // going the other way) BEFORE requesting a redesign below, so
-            // that redesign already sees the corrected spec instead of one
-            // that's about to be superseded a moment later by the
-            // parameter changes forcePresetOperatingPoint() itself
-            // triggers (each of which re-enters this same listener and
-            // requests its own redesign in turn - harmless, see that
-            // method's own comment, just a couple of extra superseded
-            // requests exactly like a fast slider drag already causes).
-            if (parameterID == "presetMode")
-            {
-                if (newValue > 0.5f)
-                    owner.forcePresetOperatingPoint(); // captures the pre-Default point itself first - see its own comment
-                else
-                    owner.restoreCustomPointBeforeDefault();
-            }
             owner.requestBoundaryRedesign();
         }
     } paramListener { *this };
@@ -471,7 +460,9 @@ private:
     // below is only ever held for a very short copy (a FilterSpec/
     // DesignResult/DesignTask, at most maxTapCount doubles), so a
     // best-effort tryEnter() from the audio thread is safe in practice.
-    juce::SpinLock specLock;
+    // mutable: getPresetSlotInfoForUI() needs to lock this from a const
+    // method, same reasoning as uiSnapshotLock/searchProgressLock below.
+    mutable juce::SpinLock specLock;
 
     // One background-design task: the boundary spec it applies to, and the
     // boundaryEpoch it was queued for (checked again before, and after,
@@ -499,64 +490,18 @@ private:
     int boundaryEpoch = 0;                     // guarded by specLock
     bbk::parametric::FilterSpec currentBoundarySpec; // guarded by specLock
 
-    // Also guarded by specLock, alongside currentBoundarySpec: the
-    // specsEqual() dedup below only compares FilterSpec fields, which say
-    // nothing about presetMode - toggling Default on/off changes where the
-    // result comes from (instant bank lookup vs. live search) even when
-    // every FilterSpec field is unchanged (e.g. the user never touched
-    // cutoff/attenuation/stopband/decay), so the dedup must also notice
-    // that transition or it silently keeps showing whichever result was
-    // already published.
-    bool currentBoundaryPresetMode = false;
-
-    // Also guarded by specLock, same reasoning and same purpose as
-    // currentBoundaryPresetMode immediately above: the specsEqual() dedup
-    // says nothing about Manual/Auto tap-count mode either, so a user who
-    // only flips "tapCountAuto" or drags "manualTapCount" - touching no
-    // other parameter - must still force a fresh redesign, not be silently
-    // absorbed by the "nothing really changed" early return. requestedTapCount
-    // only matters while currentBoundaryManualTapCountOn is true (comparing
-    // it while Auto is on would force a spurious redesign every time the
-    // manual slider is nudged with the mouse even though Auto mode ignores
-    // it entirely - see requestBoundaryRedesign()).
+    // Also guarded by specLock, same reasoning as currentBoundarySpec: the
+    // specsEqual() dedup below says nothing about Manual/Auto tap-count
+    // mode, so a user who only flips "tapCountAuto" or drags
+    // "manualTapCount" - touching no other parameter - must still force a
+    // fresh redesign, not be silently absorbed by the "nothing really
+    // changed" early return. requestedTapCount only matters while
+    // currentBoundaryManualTapCountOn is true (comparing it while Auto is
+    // on would force a spurious redesign every time the manual slider is
+    // nudged with the mouse even though Auto mode ignores it entirely -
+    // see requestBoundaryRedesign()).
     bool currentBoundaryManualTapCountOn = false;
     int currentBoundaryRequestedTapCount = 0;
-
-    // Guarded by specLock. See captureCustomPointBeforeDefault()/
-    // restoreCustomPointBeforeDefault() above for the full story: this is
-    // the user's own cutoff/attenuation/stopband/decay from the instant
-    // before Default was last turned on, put back the instant it's turned
-    // back off. havePreDefaultSnapshot distinguishes "never captured yet"
-    // (Default has never been engaged this session) from a genuinely
-    // all-zero snapshot.
-    //
-    // tapCountAutoOn: same idea, extended to the Manual/Auto tap-count
-    // selector. Default mode's own instant lookup (see requestBoundaryRedesign())
-    // already ignores Manual Tap Count entirely - the bank/override entry's
-    // own tap count is used regardless - but leaving the "Tap Count Auto"
-    // toggle sitting on Manual while Default is active is misleading (it
-    // looks live and editable-adjacent when it has no effect at all) and,
-    // reported directly: re-entering Custom mode later with Manual still
-    // engaged could leave a stale requestedTapCount/epoch combination from
-    // before Default was ever touched, so a fresh Custom spec silently
-    // reused an old manual tap count instead of prompting a real decision.
-    // forcePresetOperatingPoint() now forces this to Auto (on) the instant
-    // Default engages, the same way it forces cutoff/stopband/decay, and
-    // restoreCustomPointBeforeDefault() puts the user's own Manual/Auto
-    // choice back when Default is unchecked again - so choosing Manual
-    // Tap Count before entering Default isn't silently lost, it just has
-    // no effect while Default is active, exactly like the greyed-out
-    // Manual Tap Count slider itself.
-    struct PreDefaultSnapshot
-    {
-        double cutoffHz = 0.0;
-        double attenuationAtCutoffDb = 0.0;
-        double stopbandRejectionDb = 0.0;
-        double sidelobeDecayRatio = 0.0;
-        bool tapCountAutoOn = true;
-    };
-    PreDefaultSnapshot preDefaultSnapshot;
-    bool havePreDefaultSnapshot = false;
 
     // Guarded by specLock (not message-thread-only: requestBoundaryRedesign()
     // - which searches this - can run on the audio thread too, same as

@@ -185,7 +185,6 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
-    parameters.addParameterListener ("presetMode", &paramListener);
     parameters.addParameterListener ("tapCountAuto", &paramListener);
     parameters.addParameterListener ("manualTapCount", &paramListener);
 
@@ -220,7 +219,6 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
-    parameters.removeParameterListener ("presetMode", &paramListener);
     parameters.removeParameterListener ("tapCountAuto", &paramListener);
     parameters.removeParameterListener ("manualTapCount", &paramListener);
 
@@ -259,20 +257,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
 
     layout.add (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID { "bypass", 1 }, "Bypass", false));
-
-    // Off by default (so every existing session/preset keeps behaving
-    // exactly as before): when on, Cutoff/Min. Stopband Rejection/
-    // Sidelobe Decay are forced to the exact operating point a large
-    // offline sweep found to work well across every supported sample
-    // rate (18.5kHz/95dB/no decay - see SourceDetachedPole/PresetSweep/),
-    // and the design comes from an instant table lookup keyed on sample
-    // rate + Attenuation instead of a live search - no multi-second (or,
-    // for a demanding spec, multi-minute) wait after a slider move. Falls
-    // back to a live Custom-mode design if the host's sample rate isn't
-    // one of the 7 the bank was swept for (see requestBoundaryRedesign
-    // and PresetBankLookup.h::findEntry).
-    layout.add (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID { "presetMode", 1 }, "Default", false));
 
     // On (default): the attenuation slider above is used as-is (a Case
     // C-style spectrally relaxed design). Off: the attenuation slider is
@@ -452,161 +436,6 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     return spec;
 }
 
-void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
-{
-    using namespace bbk::detachedpole::presetbank;
-
-    // Must happen before anything below overwrites the very values it's
-    // trying to save - see its own comment.
-    captureCustomPointBeforeDefault();
-
-    // If the user has saved an override for this sample rate, Default mode
-    // should recall THAT entire operating point - cutoff, attenuation,
-    // stopband AND decay - rather than just snapping cutoff/stopband/decay
-    // to the factory bank's fixed point and leaving attenuation wherever
-    // the slider happens to be. Earlier behaviour only recalled the
-    // override when the slider was already sitting on the exact
-    // attenuation it was saved at, which meant wandering the Attenuation
-    // slider away and then re-enabling Default silently fell back to the
-    // factory entry for whatever attenuation was currently dialed in -
-    // technically consistent with the exact-spec-match design, but not
-    // what "save as MY default" means to a user: it should mean "this is
-    // now the one thing Default recalls," full stop, the same way
-    // reopening a saved preset recalls every field it was saved with.
-    //
-    // Matched on sample rate alone, most-recently-saved wins (userOverrides
-    // is kept in save order - see saveTopCandidateAsOverride() - so the last
-    // entry matching this rate is the one to use). Only sample rate can be
-    // part of this lookup key: every other field is exactly what this
-    // function is about to decide. Also filtered to isDefaultChoice - an
-    // override saved via a top-N table row's own "Save" button (rather than
-    // the dedicated "Save as Default" button) is NOT eligible here, even if
-    // it's the most recent save for this rate - see OverrideEntry::
-    // isDefaultChoice's own comment. Exact-spec recall in
-    // requestBoundaryRedesign() is unaffected by this filter; only this
-    // broader by-sample-rate scan is.
-    const auto spec = specFromParameters();
-
-    double targetCutoffHz = presetCutoffHz;
-    double targetAttenuationDb = spec.attenuationAtCutoffDb;
-    double targetStopbandRejectionDb = presetStopbandRejectionDb;
-    double targetSidelobeDecayRatio = presetSidelobeDecayRatio;
-
-    {
-        const juce::SpinLock::ScopedLockType sl (specLock);
-        for (auto it = userOverrides.rbegin(); it != userOverrides.rend(); ++it)
-        {
-            if (it->spec.sampleRateHz == spec.sampleRateHz && it->isDefaultChoice)
-            {
-                targetCutoffHz = it->spec.cutoffHz;
-                targetAttenuationDb = it->spec.attenuationAtCutoffDb;
-                targetStopbandRejectionDb = it->spec.stopbandRejectionDb;
-                targetSidelobeDecayRatio = it->spec.sidelobeDecayRatio;
-                break;
-            }
-        }
-    }
-
-    // Force Manual Tap Count off (Auto on) FIRST, before the four operating-
-    // point parameters below - so every nested requestBoundaryRedesign()
-    // call this function triggers (each setValueNotifyingHost re-enters the
-    // ParamListener) already sees Auto mode in effect, not just the very
-    // last one. Default mode's own instant lookup ignores Manual Tap Count
-    // either way (see requestBoundaryRedesign()'s presetEntry/overrideEntry
-    // handling), but leaving the selector on Manual while Default is active
-    // was reported as confusing - a Manual choice that quietly has no
-    // effect looks identical to a bug. The user's own Manual/Auto choice
-    // (and, if it was Manual, their dialed tap count) is restored the
-    // instant Default is unchecked again - see restoreCustomPointBeforeDefault().
-    if (auto* tapCountAutoParam = parameters.getParameter ("tapCountAuto"))
-        tapCountAutoParam->setValueNotifyingHost (1.0f);
-
-    if (auto* cutoffParam = parameters.getParameter ("cutoff"))
-        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (targetCutoffHz)));
-    if (auto* attenuationParam = parameters.getParameter ("attenuation"))
-        attenuationParam->setValueNotifyingHost (attenuationParam->convertTo0to1 (static_cast<float> (targetAttenuationDb)));
-    if (auto* stopbandParam = parameters.getParameter ("stopband"))
-        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetStopbandRejectionDb)));
-    if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
-        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSidelobeDecayRatio)));
-}
-
-void BBKDetachedPoleAudioProcessor::captureCustomPointBeforeDefault()
-{
-    const juce::SpinLock::ScopedLockType sl (specLock);
-
-    // currentBoundaryPresetMode still reflects the state BEFORE this
-    // transition (requestBoundaryRedesign(), which updates it, hasn't run
-    // yet for this event - see ParamListener's ordering) - so "already
-    // true" here means this is a resent "on" event for a mode we're
-    // already in (some hosts resend automation at the playhead on
-    // transport start/stop), not a genuine off->on transition. Skipping
-    // the capture in that case is essential: the values visible right now
-    // are already the FORCED Default/override ones, not the user's real
-    // Custom point, so capturing here would silently overwrite the
-    // genuine snapshot taken at the real transition with a copy of
-    // Default's own operating point - exactly the bug this exists to fix,
-    // just moved one step later.
-    if (currentBoundaryPresetMode)
-        return;
-
-    preDefaultSnapshot.cutoffHz = static_cast<double> (parameters.getRawParameterValue ("cutoff")->load());
-    preDefaultSnapshot.attenuationAtCutoffDb = static_cast<double> (parameters.getRawParameterValue ("attenuation")->load());
-    preDefaultSnapshot.stopbandRejectionDb = static_cast<double> (parameters.getRawParameterValue ("stopband")->load());
-    preDefaultSnapshot.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
-    preDefaultSnapshot.tapCountAutoOn = parameters.getRawParameterValue ("tapCountAuto")->load() > 0.5f;
-    havePreDefaultSnapshot = true;
-}
-
-void BBKDetachedPoleAudioProcessor::restoreCustomPointBeforeDefault()
-{
-    PreDefaultSnapshot snap;
-    bool have;
-    {
-        const juce::SpinLock::ScopedLockType sl (specLock);
-
-        // Same resend guard as captureCustomPointBeforeDefault(), mirrored:
-        // currentBoundaryPresetMode still reflects the state before THIS
-        // transition, so "already false" means a resent "off" event while
-        // already off - nothing to restore, and restoring again would be
-        // harmless but pointless.
-        if (! currentBoundaryPresetMode)
-            return;
-
-        snap = preDefaultSnapshot;
-        have = havePreDefaultSnapshot;
-    }
-
-    // Default was never actually engaged this session (e.g. a stray "off"
-    // notification with no prior "on") - nothing was ever overwritten, so
-    // there is nothing to put back.
-    if (! have)
-        return;
-
-    // Put the user's own Manual/Auto tap-count choice back FIRST, before
-    // the four operating-point parameters below - same reasoning as
-    // forcePresetOperatingPoint() forcing it to Auto first on the way in:
-    // every nested requestBoundaryRedesign() call this function triggers
-    // should already see the real final Manual/Auto state, not force a
-    // couple of extra intermediate Auto-mode lookups against a still-
-    // partially-restored spec before the last one corrects it. If the user
-    // had Manual Tap Count selected before Default was engaged (and
-    // whatever value they'd dialed in - "manualTapCount" itself was never
-    // touched by Default mode, only this on/off selector was), it's back
-    // exactly as they left it.
-    if (auto* tapCountAutoParam = parameters.getParameter ("tapCountAuto"))
-        tapCountAutoParam->setValueNotifyingHost (snap.tapCountAutoOn ? 1.0f : 0.0f);
-
-    if (auto* cutoffParam = parameters.getParameter ("cutoff"))
-        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (snap.cutoffHz)));
-    if (auto* attenuationParam = parameters.getParameter ("attenuation"))
-        attenuationParam->setValueNotifyingHost (attenuationParam->convertTo0to1 (static_cast<float> (snap.attenuationAtCutoffDb)));
-    if (auto* stopbandParam = parameters.getParameter ("stopband"))
-        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (snap.stopbandRejectionDb)));
-    if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
-        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (snap.sidelobeDecayRatio)));
-}
-
 void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
 {
     // All of this reads straight out of the already-published uiSnapshot -
@@ -644,74 +473,89 @@ void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
     publishResult (spec, result, source, index);
 }
 
-void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index, bool setAsDefaultChoice)
+namespace
 {
-    // Whatever is currently published - a live Custom-mode result, a
-    // Default-mode bank entry, or even an existing override - becomes the
-    // new override for its own exact spec. Reads the UI snapshot rather
-    // than latestResult/latestSpec directly since that's already the
-    // single point that's guaranteed consistent (spec and result written
-    // together under uiSnapshotLock in publishResult()).
+    // Shared by saveTopCandidateAsOverride()/savePresetSlot() below: builds
+    // the OverrideEntry that whatever is currently published (a live
+    // search result, a preset/bank entry, or an existing override) becomes
+    // when saved. Reads the UI snapshot rather than latestResult/latestSpec
+    // directly since that's already the single point guaranteed consistent
+    // (spec and result written together under uiSnapshotLock in
+    // publishResult()). Returns an empty candidates list if nothing has
+    // been designed yet (snap.tapCount <= 0) - callers check that and no-op.
+    bbk::detachedpole::useroverrides::OverrideEntry buildOverrideEntryFromSnapshot (
+        const BBKDetachedPoleAudioProcessor::DesignSnapshot& snap, int chosenIndex)
+    {
+        bbk::detachedpole::useroverrides::OverrideEntry entry;
+        if (snap.tapCount <= 0 || snap.taps.empty())
+            return entry;
+
+        entry.spec.sampleRateHz = snap.sampleRateHz;
+        entry.spec.cutoffHz = snap.cutoffHz;
+        entry.spec.attenuationAtCutoffDb = snap.attenuationAtCutoffDb;
+        entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
+        entry.spec.stopbandMode = snap.stopbandMode;
+        entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
+
+        // Saves the WHOLE ranked list (see DesignSnapshot::topCandidates),
+        // not just the one candidate the user picked - see OverrideEntry::
+        // activeIndex's own comment for why: this is what lets the
+        // editor's top-N table still offer every alternative later,
+        // exactly as if the search had just finished again, while still
+        // instantly recalling the one the user actually chose. Manual-mode
+        // results and preset/bank entries have no ranked list at all
+        // (topCandidates is empty by design - see ParametricFIR.h/
+        // DesignSnapshot's own comments), so those fall back to wrapping
+        // the single currently-playing design as a one-entry list, same
+        // shape UserPresetOverrides.h's own pre-top-N file upgrade path
+        // already produces.
+        if (! snap.topCandidates.empty())
+        {
+            entry.candidates = snap.topCandidates;
+            entry.activeIndex = juce::jlimit (0, static_cast<int> (entry.candidates.size()) - 1, chosenIndex);
+        }
+        else
+        {
+            bbk::parametric::RankedCandidate c;
+            c.taps = snap.taps;
+            c.tapCount = snap.tapCount;
+            c.achievedStopbandDb = snap.achievedStopbandDb;
+            entry.candidates.push_back (std::move (c));
+            entry.activeIndex = 0;
+        }
+        return entry;
+    }
+}
+
+void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
+{
     const auto snap = getDesignSnapshotForUI();
-
-    // Nothing designed yet (e.g. called before the very first design
-    // completes) - silently do nothing rather than persist a hollow entry.
-    if (snap.tapCount <= 0 || snap.taps.empty())
-        return;
-
-    bbk::detachedpole::useroverrides::OverrideEntry entry;
-    entry.spec.sampleRateHz = snap.sampleRateHz;
-    entry.spec.cutoffHz = snap.cutoffHz;
-    entry.spec.attenuationAtCutoffDb = snap.attenuationAtCutoffDb;
-    entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
-    entry.spec.stopbandMode = snap.stopbandMode;
-    entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
-    entry.isDefaultChoice = setAsDefaultChoice;
-
-    // Saves the WHOLE ranked list (see DesignSnapshot::topCandidates), not
-    // just the one candidate the user picked - see OverrideEntry::
-    // activeIndex's own comment for why: this is what lets the editor's
-    // top-N table still offer every alternative later, exactly as if the
-    // search had just finished again, while still instantly recalling the
-    // one the user actually chose. Manual-mode results and Default-mode
-    // bank entries have no ranked list at all (topCandidates is empty by
-    // design - see ParametricFIR.h/DesignSnapshot's own comments), so those
-    // fall back to wrapping the single currently-playing design as a one-
-    // entry list, same shape UserPresetOverrides.h's own pre-top-N file
-    // upgrade path already produces.
-    if (! snap.topCandidates.empty())
-    {
-        entry.candidates = snap.topCandidates;
-        entry.activeIndex = juce::jlimit (0, static_cast<int> (entry.candidates.size()) - 1, index);
-    }
-    else
-    {
-        bbk::parametric::RankedCandidate c;
-        c.taps = snap.taps;
-        c.tapCount = snap.tapCount;
-        c.achievedStopbandDb = snap.achievedStopbandDb;
-        entry.candidates.push_back (std::move (c));
-        entry.activeIndex = 0;
-    }
+    auto entry = buildOverrideEntryFromSnapshot (snap, index);
+    if (entry.candidates.empty())
+        return; // nothing designed yet - see buildOverrideEntryFromSnapshot()'s own comment
 
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
 
-        // Erase-then-push_back (not update-in-place) so the just-saved
-        // entry always ends up last - forcePresetOperatingPoint() relies
-        // on vector order to find the MOST RECENTLY saved override for a
-        // sample rate (scanning from the back), since there's no separate
-        // timestamp field.
+        // If an override already exists for this exact spec - most likely
+        // because it currently occupies a preset slot (see savePresetSlot())
+        // - keep that slot assignment rather than clearing it: this button
+        // is a plain "bookmark this exact spec" action, not a deliberate
+        // decision about preset slots one way or the other, so it should
+        // never silently un-assign a preset just because the same find
+        // happened to be re-saved through it.
+        auto it = std::find_if (userOverrides.begin(), userOverrides.end(),
+                                 [&] (const auto& e) { return specsEqual (e.spec, entry.spec); });
+        entry.presetSlot = (it != userOverrides.end()) ? it->presetSlot : -1;
+
+        // Erase-then-push_back (not update-in-place) - same pattern as
+        // savePresetSlot() below.
         userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
                                               [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
                               userOverrides.end());
         userOverrides.push_back (entry);
     }
 
-    // Persist to disk. userOverrides is only ever appended/replaced-in-
-    // place above, so copying it out here (rather than holding specLock
-    // across the file write) is safe - saveAll() takes a snapshot by
-    // value anyway.
     std::vector<bbk::detachedpole::useroverrides::OverrideEntry> toSave;
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
@@ -722,8 +566,8 @@ void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index, bool 
     // Reflect the save immediately in the UI as a UserOverride result -
     // the spec hasn't changed, so requestBoundaryRedesign()'s own dedup
     // guard would otherwise no-op this and leave the "Design method:"
-    // label saying Custom/Default even though a saved override now exists
-    // for this exact spec.
+    // label saying Custom even though a saved override now exists for this
+    // exact spec.
     const auto& active = entry.candidates[static_cast<std::size_t> (entry.activeIndex)];
     bbk::parametric::DesignResult result;
     result.taps = active.taps;
@@ -735,6 +579,181 @@ void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index, bool 
     result.topCandidates = entry.candidates;
 
     publishResult (entry.spec, result, ResultSource::UserOverride, entry.activeIndex);
+}
+
+BBKDetachedPoleAudioProcessor::PresetSlotInfo BBKDetachedPoleAudioProcessor::getPresetSlotInfoForUI (int slot) const
+{
+    PresetSlotInfo info;
+    if (slot < 0 || slot >= bbk::detachedpole::useroverrides::numPresetSlots)
+        return info;
+
+    const juce::SpinLock::ScopedLockType sl (specLock);
+    for (auto& e : userOverrides)
+    {
+        if (e.presetSlot == slot)
+        {
+            info.occupied = true;
+            info.spec = e.spec;
+            break;
+        }
+    }
+    return info;
+}
+
+void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
+{
+    using namespace bbk::detachedpole::presetbank;
+
+    if (slot < 0 || slot >= bbk::detachedpole::useroverrides::numPresetSlots)
+        return;
+
+    bbk::parametric::FilterSpec targetSpec;
+    bool found = false;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        for (auto& e : userOverrides)
+        {
+            if (e.presetSlot == slot)
+            {
+                targetSpec = e.spec;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (! found)
+    {
+        // Only slot 0 (Preset 1) has a built-in fallback - see this
+        // method's own header comment. Every other empty slot is simply
+        // nothing to load yet.
+        if (slot != 0)
+            return;
+
+        targetSpec = specFromParameters();
+        targetSpec.cutoffHz = presetCutoffHz;
+        targetSpec.stopbandRejectionDb = presetStopbandRejectionDb;
+        targetSpec.sidelobeDecayRatio = presetSidelobeDecayRatio;
+        // Attenuation deliberately left as whatever specFromParameters()
+        // already read - see this method's own header comment.
+    }
+
+    // Force Manual Tap Count off (Auto on) FIRST, before the four
+    // operating-point parameters below - so every nested
+    // requestBoundaryRedesign() call this triggers (each
+    // setValueNotifyingHost re-enters the ParamListener) already sees Auto
+    // mode in effect, not just the very last one.
+    if (auto* tapCountAutoParam = parameters.getParameter ("tapCountAuto"))
+        tapCountAutoParam->setValueNotifyingHost (1.0f);
+
+    if (auto* cutoffParam = parameters.getParameter ("cutoff"))
+        cutoffParam->setValueNotifyingHost (cutoffParam->convertTo0to1 (static_cast<float> (targetSpec.cutoffHz)));
+    if (auto* attenuationParam = parameters.getParameter ("attenuation"))
+        attenuationParam->setValueNotifyingHost (attenuationParam->convertTo0to1 (static_cast<float> (targetSpec.attenuationAtCutoffDb)));
+    if (auto* stopbandParam = parameters.getParameter ("stopband"))
+        stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetSpec.stopbandRejectionDb)));
+    if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
+        decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSpec.sidelobeDecayRatio)));
+}
+
+void BBKDetachedPoleAudioProcessor::savePresetSlot (int slot)
+{
+    if (slot < 0 || slot >= bbk::detachedpole::useroverrides::numPresetSlots)
+        return;
+
+    const auto snap = getDesignSnapshotForUI();
+    auto entry = buildOverrideEntryFromSnapshot (snap, snap.selectedIndex);
+    if (entry.candidates.empty())
+        return; // nothing designed yet
+
+    entry.presetSlot = slot;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+
+        // Free whichever existing entry currently occupies this slot (if
+        // any) - it stays around as a plain, exact-spec-recall override,
+        // it just stops being a preset (see OverrideEntry::presetSlot's
+        // own comment) - then drop any entry that already exists for this
+        // EXACT spec (same dedup rule saveTopCandidateAsOverride() uses)
+        // before inserting the new one.
+        for (auto& e : userOverrides)
+            if (e.presetSlot == slot)
+                e.presetSlot = -1;
+
+        userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
+                                              [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
+                              userOverrides.end());
+        userOverrides.push_back (entry);
+    }
+
+    std::vector<bbk::detachedpole::useroverrides::OverrideEntry> toSave;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        toSave = userOverrides;
+    }
+    bbk::detachedpole::useroverrides::saveAll (toSave);
+
+    // Reflect the save immediately in the UI, same reasoning as
+    // saveTopCandidateAsOverride().
+    const auto& active = entry.candidates[static_cast<std::size_t> (entry.activeIndex)];
+    bbk::parametric::DesignResult result;
+    result.taps = active.taps;
+    result.tapCount = active.tapCount;
+    result.constraintsMet = true;
+    result.achievedStopbandDb = active.achievedStopbandDb;
+    result.designAttempts = 0;
+    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz);
+    result.topCandidates = entry.candidates;
+
+    publishResult (entry.spec, result, ResultSource::UserOverride, entry.activeIndex);
+}
+
+void BBKDetachedPoleAudioProcessor::exportPresets (const juce::File& destFile)
+{
+    std::vector<bbk::detachedpole::useroverrides::OverrideEntry> toExport;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        for (auto& e : userOverrides)
+            if (e.presetSlot >= 0)
+                toExport.push_back (e);
+    }
+    bbk::detachedpole::useroverrides::saveAll (toExport, destFile);
+}
+
+bool BBKDetachedPoleAudioProcessor::importPresets (const juce::File& srcFile)
+{
+    auto imported = bbk::detachedpole::useroverrides::loadAll (srcFile);
+
+    bool mergedAny = false;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        for (auto& incoming : imported)
+        {
+            if (incoming.presetSlot < 0)
+                continue; // a plain override in the imported file, not tagged as a preset - nothing to merge
+
+            for (auto& e : userOverrides)
+                if (e.presetSlot == incoming.presetSlot)
+                    e.presetSlot = -1; // this slot is about to be replaced - see savePresetSlot()'s own comment
+
+            userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
+                                                  [&] (const auto& e) { return specsEqual (e.spec, incoming.spec); }),
+                                  userOverrides.end());
+            userOverrides.push_back (incoming);
+            mergedAny = true;
+        }
+    }
+
+    if (! mergedAny)
+        return false;
+
+    std::vector<bbk::detachedpole::useroverrides::OverrideEntry> toSave;
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        toSave = userOverrides;
+    }
+    return bbk::detachedpole::useroverrides::saveAll (toSave);
 }
 
 void BBKDetachedPoleAudioProcessor::requestFreshSearch()
@@ -749,7 +768,6 @@ void BBKDetachedPoleAudioProcessor::requestFreshSearch()
         return;
 
     const auto spec = specFromParameters();
-    const bool presetModeOn = parameters.getRawParameterValue ("presetMode")->load() > 0.5f;
     const bool manualTapCountOn = parameters.getRawParameterValue ("tapCountAuto")->load() <= 0.5f;
     const int requestedTapCount = static_cast<int> (parameters.getRawParameterValue ("manualTapCount")->load());
 
@@ -757,7 +775,6 @@ void BBKDetachedPoleAudioProcessor::requestFreshSearch()
         const juce::SpinLock::ScopedLockType sl (specLock);
 
         currentBoundarySpec = spec;
-        currentBoundaryPresetMode = presetModeOn;
         currentBoundaryManualTapCountOn = manualTapCountOn;
         currentBoundaryRequestedTapCount = requestedTapCount;
         ++boundaryEpoch; // discards anything already queued/mid-flight, same as requestBoundaryRedesign()
@@ -798,27 +815,43 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
 
     const auto spec = specFromParameters();
 
-    // Default mode: an instant lookup instead of a live design, IF the
-    // host's current sample rate is one of the 7 the bank was swept for.
-    // Looked up here (before the lock below) since it only reads static
-    // table data - no need to hold specLock for it. The bank always
-    // matches spec.attenuationAtCutoffDb, not the raw slider value:
-    // amplitudeRelaxation off substitutes caseBNearFlatAttenuationDb
-    // (well outside the swept 0.05-0.50dB grid), so relaxation-off specs
-    // correctly find no entry and fall back to a live design below,
-    // rather than silently returning some unrelated preset.
-    const bool presetModeOn = parameters.getRawParameterValue ("presetMode")->load() > 0.5f;
-    const auto* presetEntry = presetModeOn
-        ? bbk::detachedpole::presetbank::findEntry (spec.sampleRateHz, spec.attenuationAtCutoffDb)
-        : nullptr;
-
-    // Also read early, same reasoning as presetModeOn above: needed both
-    // for the "did anything actually change" dedup check below and for
-    // the else branch further down (search-cache gating and the queued
-    // DesignTask itself) - see requestedTapCount's own comment on why it
-    // only matters while manualTapCountOn is true.
+    // Read early: needed both for the "did anything actually change" dedup
+    // check below and for the factory-bank lookup and the else branch
+    // further down (search-cache gating and the queued DesignTask itself) -
+    // see requestedTapCount's own comment on why it only matters while
+    // manualTapCountOn is true.
     const bool manualTapCountOn = parameters.getRawParameterValue ("tapCountAuto")->load() <= 0.5f;
     const int requestedTapCount = static_cast<int> (parameters.getRawParameterValue ("manualTapCount")->load());
+
+    // Factory bank: an always-available instant lookup, exactly like
+    // userOverrides/searchCache below - no "Default mode" toggle needed to
+    // gate it, since the bank is itself just a compiled cache of designs at
+    // ONE fixed (cutoff, stopband, decay) operating point across many
+    // (sample rate, attenuation) combinations. It's only a valid hit when
+    // cutoff/stopband/decay are already sitting exactly AT that fixed
+    // point - findEntry() itself only varies sample rate and attenuation,
+    // so checking it without this guard would wrongly serve the bank's
+    // 18.5 kHz filter for, say, a 12 kHz Custom-mode request that happens
+    // to land on one of the swept attenuation steps. Also skipped entirely
+    // while Manual tap-count mode is on - same reasoning as the
+    // userOverrides/searchCache guards further down: an instant bank hit
+    // carries whatever tap count the bank's own sweep landed on, which
+    // must never silently override a tap count the user explicitly dialed
+    // in here. Looked up here (before the lock below) since it only reads
+    // static table data - no need to hold specLock for it. The bank always
+    // matches spec.attenuationAtCutoffDb, not the raw slider value:
+    // amplitude relaxation off substitutes caseBNearFlatAttenuationDb (well
+    // outside the swept 0.05-0.50 dB grid), so relaxation-off specs
+    // correctly find no entry and fall back to a live design below, rather
+    // than silently returning some unrelated preset. This is also what
+    // backs an unassigned Preset 1's fallback - see loadPresetSlot().
+    const bool atPresetOperatingPoint = ! manualTapCountOn
+        && spec.cutoffHz == bbk::detachedpole::presetbank::presetCutoffHz
+        && spec.stopbandRejectionDb == bbk::detachedpole::presetbank::presetStopbandRejectionDb
+        && spec.sidelobeDecayRatio == bbk::detachedpole::presetbank::presetSidelobeDecayRatio;
+    const auto* presetEntry = atPresetOperatingPoint
+        ? bbk::detachedpole::presetbank::findEntry (spec.sampleRateHz, spec.attenuationAtCutoffDb)
+        : nullptr;
 
     bool haveInstantResult = false;
     bbk::parametric::DesignResult instantResult;
@@ -840,12 +873,10 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // exact same filter that was already computed. A real spec change
         // never takes this early-return path (specsEqual is exact, not
         // fuzzy - see its own comment) and proceeds exactly as before.
-        // presetModeOn is compared alongside the spec itself (see
-        // currentBoundaryPresetMode's own comment) - toggling Default
-        // on/off must always force at least one fresh lookup/design even
-        // when every FilterSpec field is unchanged, since the two modes
-        // pull the result from different places (instant bank lookup vs.
-        // live search).
+        // There's no longer a separate "mode" to compare here (the factory
+        // bank lookup above is now purely a function of spec itself - see
+        // atPresetOperatingPoint's own comment), so specsEqual alone fully
+        // determines whether the outcome would differ.
         // manualTapCountOn is compared unconditionally (Auto->Manual or
         // Manual->Auto must always force a fresh redesign), but
         // requestedTapCount only when manualTapCountOn is true - comparing
@@ -853,25 +884,27 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // nudge of the manual slider even while Auto mode is on and
         // ignoring it entirely.
         if (specsEqual (spec, currentBoundarySpec)
-            && presetModeOn == currentBoundaryPresetMode
             && manualTapCountOn == currentBoundaryManualTapCountOn
             && (! manualTapCountOn || requestedTapCount == currentBoundaryRequestedTapCount)
             && boundaryEpoch != 0)
             return;
 
         currentBoundarySpec = spec;
-        currentBoundaryPresetMode = presetModeOn;
         currentBoundaryManualTapCountOn = manualTapCountOn;
         currentBoundaryRequestedTapCount = requestedTapCount;
         ++boundaryEpoch;
         taskQueue.clear(); // also discards any now-stale in-flight live design
 
-        // User overrides win regardless of Default/Custom mode (checked
-        // even when presetEntry above is null, i.e. Custom mode or an
-        // untabled sample rate) - see saveTopCandidateAsOverride()'s own
-        // comment. userOverrides is guarded by this same specLock (see its
-        // declaration in the header) since this function, like the rest of
-        // the specLock-guarded block, can run on the audio thread.
+        // User overrides win ahead of the factory bank (checked even when
+        // presetEntry above is null, i.e. not at the bank's fixed operating
+        // point, or an untabled sample rate) - see saveTopCandidateAsOverride()/
+        // savePresetSlot()'s own comments. This is also exactly how
+        // loadPresetSlot() recalls a saved preset: it forces cutoff/
+        // attenuation/stopband/decay to match this same entry's own spec,
+        // and once every parameter has caught up, THIS lookup is what finds
+        // and republishes it. userOverrides is guarded by this same specLock
+        // (see its declaration in the header) since this function, like the
+        // rest of the specLock-guarded block, can run on the audio thread.
         //
         // Skipped while Manual tap-count mode is on - same reasoning as the
         // search-cache guard further down (see its own comment): a saved
@@ -883,9 +916,10 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // spec with Manual Tap Count set to 19 still instantly loaded an
         // existing 29-tap override for that spec instead of running a
         // fresh fixed-19-tap search - this guard is the fix. Saving a NEW
-        // override (via the "Save as Default" button) is unaffected - that
-        // stays a deliberate, explicit action regardless of Manual/Auto
-        // mode; only this automatic lookup is gated.
+        // override (via a top-N row's "Save" button, or savePresetSlot())
+        // is unaffected - that stays a deliberate, explicit action
+        // regardless of Manual/Auto mode; only this automatic lookup is
+        // gated.
         const bbk::detachedpole::useroverrides::OverrideEntry* overrideEntry = nullptr;
         if (! manualTapCountOn)
         {
@@ -928,10 +962,10 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         {
             // Below both curated sources above: an exact spec we've
             // already paid to search before, this session or an earlier
-            // one - see LiveSearchCache.h. Checked in every mode (not just
-            // Custom), same reasoning as userOverrides: costs nothing to
-            // check, and covers an untabled sample rate in Default mode
-            // too.
+            // one - see LiveSearchCache.h. Checked unconditionally, same
+            // reasoning as userOverrides: costs nothing to check, and
+            // covers a spec at the bank's own fixed operating point but on
+            // an untabled sample rate too.
             //
             // Skipped entirely while Manual tap-count mode is on, in both
             // directions: an existing cache entry may have been produced by
@@ -1213,9 +1247,10 @@ void BBKDetachedPoleAudioProcessor::run()
         // createParameterLayout() for what it actually controls (how many
         // of a demanding candidate's own grid-refinement rounds get to
         // finish before ITS deadline cuts it off, not the overall sweep) -
-        // safe to be this patient now that Default mode (see
-        // requestBoundaryRedesign()) gives an always-available instant
-        // result while this runs in the background.
+        // safe to be this patient now that the factory bank and any saved
+        // override/preset (see requestBoundaryRedesign()) give an
+        // always-available instant result while this runs in the
+        // background.
         //
         // Manual tap-count mode: skip the auto M-search entirely and design
         // fixed at exactly task.requestedTapCount, after silently raising it
@@ -1257,14 +1292,14 @@ void BBKDetachedPoleAudioProcessor::run()
 
         // Also collapses (same as an explicit Stop click) the instant a
         // newer boundary change supersedes this task's own epoch - e.g.
-        // toggling Default on and back off while a Custom search is still
-        // running. Before this existed, a superseded task had NO way to
-        // notice: it kept running invisibly (this same hook only ever
+        // loading a preset while a live search is still running for the
+        // previous spec. Before this existed, a superseded task had NO way
+        // to notice: it kept running invisibly (this same hook only ever
         // checked stopSearchRequested) all the way to completion or the
         // safety-net deadline, then got silently discarded by the
-        // stillCurrent check below - reported directly as "pressed Default,
-        // then unchecked it, and it lost the best found while it kept
-        // searching forward". Polled at the same once-per-round cadence as
+        // stillCurrent check below - reported directly as a boundary change
+        // that lost the best found while an older search kept running
+        // forward underneath it. Polled at the same once-per-round cadence as
         // pollConcurrency, so this is a cheap, brief specLock read, not a
         // hot-path cost. Paired with the cache-write-before-staleness-check
         // change just below: collapsing quickly here means there is less
@@ -1316,10 +1351,11 @@ void BBKDetachedPoleAudioProcessor::run()
         // from) the same cache an Auto search uses.
         //
         // Deliberately done BEFORE the staleness check below, not after -
-        // this is the other half of the Default-toggle fix described on
+        // this is the other half of the epoch-supersession fix described on
         // concurrency.shouldStopEarly above: a task that gets superseded
-        // mid-flight (by a newer boundary change, e.g. Default toggling on
-        // then off again) used to just fall through the old post-check
+        // mid-flight (by a newer boundary change, e.g. loading a preset and
+        // then dialing back to the original spec) used to just fall through
+        // the old post-check
         // `continue` with nothing ever cached, forcing a full from-scratch
         // restart the moment the original spec came back. Caching
         // whatever was found - even the best-effort, not-fully-searched
