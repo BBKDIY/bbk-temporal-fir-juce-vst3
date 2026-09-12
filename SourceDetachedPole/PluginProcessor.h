@@ -270,8 +270,24 @@ public:
     {
         bool occupied = false;
         bbk::parametric::FilterSpec spec; // meaningful only when occupied is true
+
+        // The slot's own active candidate's actual filter, not just the spec
+        // it was searched for - meaningful only when occupied is true. Mirrors
+        // RankedCandidate's own "don't persist derived metrics, recompute them
+        // from taps" convention (see its comment in ParametricFIR.h): the
+        // editor calls bbk::parametric::computeTemporalMetrics (taps,
+        // spec.sampleRateHz) to get R_peak/T_0.1%/etc, exactly like the top-N
+        // table already does per row, so this struct only needs to carry
+        // what that function itself needs plus achievedStopbandDb (which
+        // isn't derivable from taps alone).
+        int tapCount = 0;
+        double achievedStopbandDb = 0.0;
+        std::vector<double> taps;
     };
-    // For the editor's own slot labels (see PluginEditor.cpp::timerCallback()).
+    // For the editor's own slot labels (see PluginEditor.cpp::timerCallback()),
+    // which show this alongside spec so a preset reads the same "N taps |
+    // R_peak X% | stopband Y dB" summary the top-N table already shows for
+    // live search candidates - not just the input spec that was searched for.
     // slot must be in range [0, numPresetSlots); out of range returns an
     // unoccupied result rather than asserting, same defensive posture as
     // selectTopCandidate()'s own range check.

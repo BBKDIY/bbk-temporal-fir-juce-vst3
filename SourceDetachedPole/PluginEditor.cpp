@@ -348,18 +348,21 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     content.addChildComponent (coefficientsBox);
 
     // contentHeight is the sum of every fixed row/gap laid out in
-    // layOutContent() below (currently ~1184, including the 20px top/bottom
-    // margins baked into that method's own area.reduced(20) and the 5
-    // preset-slot rows plus the Export/Import row added below the top-N
-    // table) plus a fixed allowance for the coefficients box - it has its
-    // own internal scrollbar (see setScrollbarsShown() above), so it
-    // doesn't need much outer space to still be fully usable. This is
-    // content's own, possibly-tall size; it is NOT the window size - see
-    // viewport's own comment in PluginEditor.h and setSize() just below
-    // for why those are now deliberately different.
+    // layOutContent() below (currently ~1264, including the 20px top/bottom
+    // margins baked into that method's own area.reduced(20), the 5
+    // preset-slot rows - each 40px tall rather than a plain single-line 24px
+    // row, since an occupied slot's label now shows a second line of the
+    // FIR's own metrics below its spec summary, see timerCallback() - plus
+    // the Export/Import row added below the top-N table) plus a fixed
+    // allowance for the coefficients box - it has its own internal
+    // scrollbar (see setScrollbarsShown() above), so it doesn't need much
+    // outer space to still be fully usable. This is content's own,
+    // possibly-tall size; it is NOT the window size - see viewport's own
+    // comment in PluginEditor.h and setSize() just below for why those are
+    // now deliberately different.
     constexpr int contentWidth = 680;
     constexpr int coefficientsBoxHeight = 260;
-    constexpr int contentHeight = 1184 + 40 + coefficientsBoxHeight;
+    constexpr int contentHeight = 1264 + 40 + coefficientsBoxHeight;
     content.setSize (contentWidth, contentHeight);
     layOutContent();
 
@@ -509,12 +512,18 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     area.removeFromTop (4);
     for (int i = 0; i < bbk::detachedpole::useroverrides::numPresetSlots; ++i)
     {
-        auto row = area.removeFromTop (24);
+        // Taller than a plain single-line row (see the equivalent top-N
+        // table loop above) - an occupied slot's label now shows a second
+        // line of the FIR's own metrics below its spec summary (see
+        // timerCallback()), so it needs the extra height; Load/Save stay
+        // their original 24px tall, top-aligned within the row, rather than
+        // stretching to fill it.
+        auto row = area.removeFromTop (40);
         auto& loadButton = presetLoadButtons[static_cast<std::size_t> (i)];
         auto& saveButton = presetSaveButtons[static_cast<std::size_t> (i)];
-        loadButton.setBounds (row.removeFromRight (60));
+        loadButton.setBounds (row.removeFromRight (60).withHeight (24));
         row.removeFromRight (6);
-        saveButton.setBounds (row.removeFromRight (60));
+        saveButton.setBounds (row.removeFromRight (60).withHeight (24));
         row.removeFromRight (10);
         presetSlotLabels[static_cast<std::size_t> (i)].setBounds (row);
         area.removeFromTop (4);
@@ -652,6 +661,17 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             labelText << juce::String (info.spec.cutoffHz, 0) << " Hz / "
                       << juce::String (info.spec.attenuationAtCutoffDb, 4) << " dB / "
                       << juce::String (info.spec.stopbandRejectionDb, 1) << " dB stopband";
+
+            // The actual filter's own metrics, not just the spec it was
+            // searched for - recomputed from taps on demand, same as the
+            // top-N table's own rows (see the "Top Results" loop below) -
+            // this is what the user asked for when they said the presets
+            // showed only the parameters, not the FIR's own metrics.
+            const auto temporal = bbk::parametric::computeTemporalMetrics (info.taps, info.spec.sampleRateHz);
+            labelText << "\n      " << info.tapCount << " taps | R_peak "
+                      << juce::String (temporal.rPeakPercent, 2) << "% | T_0.1% "
+                      << juce::String (temporal.settlingMs, 3) << " ms | stopband "
+                      << juce::String (info.achievedStopbandDb, 1) << " dB";
         }
         else if (i == 0)
         {

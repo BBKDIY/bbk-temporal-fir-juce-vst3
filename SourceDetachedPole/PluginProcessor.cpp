@@ -594,6 +594,18 @@ BBKDetachedPoleAudioProcessor::PresetSlotInfo BBKDetachedPoleAudioProcessor::get
         {
             info.occupied = true;
             info.spec = e.spec;
+
+            // e.activeIndex is guarded on load (see UserPresetOverrides.h::
+            // loadAll()), but re-check here too rather than trust that
+            // every construction path did - same defensive posture as the
+            // range check on slot itself just above.
+            if (e.activeIndex >= 0 && e.activeIndex < static_cast<int> (e.candidates.size()))
+            {
+                const auto& active = e.candidates[static_cast<std::size_t> (e.activeIndex)];
+                info.tapCount = active.tapCount;
+                info.achievedStopbandDb = active.achievedStopbandDb;
+                info.taps = active.taps;
+            }
             break;
         }
     }
