@@ -537,21 +537,42 @@ void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
 
-        // If an override already exists for this exact spec - most likely
-        // because it currently occupies a preset slot (see savePresetSlot())
-        // - keep that slot assignment rather than clearing it: this button
-        // is a plain "bookmark this exact spec" action, not a deliberate
-        // decision about preset slots one way or the other, so it should
-        // never silently un-assign a preset just because the same find
-        // happened to be re-saved through it.
-        auto it = std::find_if (userOverrides.begin(), userOverrides.end(),
-                                 [&] (const auto& e) { return specsEqual (e.spec, entry.spec); });
-        entry.presetSlot = (it != userOverrides.end()) ? it->presetSlot : -1;
+        // Multiple entries CAN legitimately share the same exact spec now -
+        // two different top-N candidates from the very same Auto-mode
+        // search (same cutoff/attenuation/stopband/decay, different
+        // tap-count/R_peak) saved into two different preset slots is
+        // exactly that case (see savePresetSlot()'s own comment on why).
+        // This plain top-N-row "Save" button isn't a deliberate decision
+        // about preset slots either way, so its own effect on presetSlot
+        // stays conservative:
+        //   - exactly one existing entry for this spec, and it's already a
+        //     numbered preset - the old, unambiguous single-preset-per-spec
+        //     case (e.g. re-saving the same find that already occupies a
+        //     slot) - preserve that slot assignment, same as before.
+        //   - anything else (no entries yet, or this spec already has
+        //     MULTIPLE presets saved against it) - this becomes a plain
+        //     (-1), non-preset bookmark, and every numbered-slot entry for
+        //     this spec is left completely untouched: this button must
+        //     never silently destroy someone else's preset just because it
+        //     happens to share a spec.
+        std::vector<std::size_t> matchIdx;
+        for (std::size_t i = 0; i < userOverrides.size(); ++i)
+            if (specsEqual (userOverrides[i].spec, entry.spec))
+                matchIdx.push_back (i);
 
-        // Erase-then-push_back (not update-in-place) - same pattern as
-        // savePresetSlot() below.
+        entry.presetSlot = (matchIdx.size() == 1) ? userOverrides[matchIdx[0]].presetSlot : -1;
+
+        // Erase only what this save actually supersedes: the lone prior
+        // match in the unambiguous case above, or (when multiple entries
+        // share this spec) only a plain entry among them - any numbered
+        // preset survives even when it shares this spec.
         userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
-                                              [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
+                                              [&] (const auto& e)
+                                              {
+                                                  if (! specsEqual (e.spec, entry.spec))
+                                                      return false;
+                                                  return matchIdx.size() == 1 || e.presetSlot == -1;
+                                              }),
                               userOverrides.end());
         userOverrides.push_back (entry);
     }
@@ -621,6 +642,7 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
 
     bbk::parametric::FilterSpec targetSpec;
     bool found = false;
+    bbk::detachedpole::useroverrides::OverrideEntry targetEntry;
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
         for (auto& e : userOverrides)
@@ -628,6 +650,7 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
             if (e.presetSlot == slot)
             {
                 targetSpec = e.spec;
+                targetEntry = e;
                 found = true;
                 break;
             }
@@ -666,6 +689,38 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
         stopbandParam->setValueNotifyingHost (stopbandParam->convertTo0to1 (static_cast<float> (targetSpec.stopbandRejectionDb)));
     if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
         decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSpec.sidelobeDecayRatio)));
+
+    // The four setValueNotifyingHost calls above each re-enter
+    // requestBoundaryRedesign() via the ParamListener, which finds an
+    // instant result for targetSpec by matching userOverrides on SPEC
+    // ALONE (see its own comment there) - ambiguous whenever more than one
+    // preset slot shares this exact spec, which is now an expected,
+    // supported case (two different top-N candidates from the same Auto
+    // search saved into two different slots - see savePresetSlot()'s own
+    // comment on why that's allowed). So publish THIS slot's own entry
+    // explicitly, as the final authoritative step, rather than trusting
+    // whichever entry that generic spec-based lookup last happened to
+    // settle on - the same "explicitly publish, don't rely on the generic
+    // redesign path" pattern savePresetSlot()/saveTopCandidateAsOverride()
+    // already use for their own immediate-UI-feedback publish. A harmless
+    // republish of the same taps when this spec is unambiguous (the common
+    // case); a no-op for slot 0's factory-bank fallback (found is false
+    // there, nothing of our own to republish over the bank's own result).
+    if (found && targetEntry.activeIndex >= 0
+        && targetEntry.activeIndex < static_cast<int> (targetEntry.candidates.size()))
+    {
+        const auto& active = targetEntry.candidates[static_cast<std::size_t> (targetEntry.activeIndex)];
+        bbk::parametric::DesignResult result;
+        result.taps = active.taps;
+        result.tapCount = active.tapCount;
+        result.constraintsMet = true;
+        result.achievedStopbandDb = active.achievedStopbandDb;
+        result.designAttempts = 0;
+        result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, targetEntry.spec.sampleRateHz);
+        result.topCandidates = targetEntry.candidates;
+
+        publishResult (targetEntry.spec, result, ResultSource::UserOverride, targetEntry.activeIndex);
+    }
 }
 
 void BBKDetachedPoleAudioProcessor::savePresetSlot (int slot)
@@ -683,18 +738,33 @@ void BBKDetachedPoleAudioProcessor::savePresetSlot (int slot)
     {
         const juce::SpinLock::ScopedLockType sl (specLock);
 
-        // Free whichever existing entry currently occupies this slot (if
-        // any) - it stays around as a plain, exact-spec-recall override,
-        // it just stops being a preset (see OverrideEntry::presetSlot's
-        // own comment) - then drop any entry that already exists for this
-        // EXACT spec (same dedup rule saveTopCandidateAsOverride() uses)
-        // before inserting the new one.
+        // Two different top-N candidates from the very same Auto-mode
+        // search share the identical FilterSpec (only their chosen
+        // candidate/activeIndex differs, see RankedCandidate's own comment
+        // in ParametricFIR.h) - saving both into two different preset slots
+        // is exactly what this method is for, so multiple entries ARE
+        // allowed to share one spec now, as long as each belongs to a
+        // different slot. Reported directly: saving a second find into
+        // Preset 2 right after saving a first into Preset 1 from the same
+        // search silently emptied Preset 1 again, because the old dedup
+        // rule erased EVERY entry matching this spec regardless of which
+        // slot (if any) it belonged to. What must still never happen is
+        // two entries claiming the SAME slot, or a stray duplicate plain
+        // (non-preset) entry for a spec a preset already covers - so only
+        // THOSE are cleared here:
         for (auto& e : userOverrides)
             if (e.presetSlot == slot)
-                e.presetSlot = -1;
+                e.presetSlot = -1; // free whichever entry currently occupies THIS slot (if any) - it stays around as a plain, exact-spec-recall override, it just stops being a preset, same as before
 
         userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
-                                              [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
+                                              [&] (const auto& e)
+                                              {
+                                                  // The just-freed former occupant of this slot (now
+                                                  // plain), or any OTHER pre-existing plain entry for
+                                                  // this exact spec - never an entry still tagged to a
+                                                  // DIFFERENT preset slot, even one sharing this spec.
+                                                  return e.presetSlot == -1 && specsEqual (e.spec, entry.spec);
+                                              }),
                               userOverrides.end());
         userOverrides.push_back (entry);
     }
@@ -910,13 +980,28 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
         // User overrides win ahead of the factory bank (checked even when
         // presetEntry above is null, i.e. not at the bank's fixed operating
         // point, or an untabled sample rate) - see saveTopCandidateAsOverride()/
-        // savePresetSlot()'s own comments. This is also exactly how
-        // loadPresetSlot() recalls a saved preset: it forces cutoff/
-        // attenuation/stopband/decay to match this same entry's own spec,
-        // and once every parameter has caught up, THIS lookup is what finds
-        // and republishes it. userOverrides is guarded by this same specLock
-        // (see its declaration in the header) since this function, like the
-        // rest of the specLock-guarded block, can run on the audio thread.
+        // savePresetSlot()'s own comments. loadPresetSlot() forces cutoff/
+        // attenuation/stopband/decay to match a saved preset's own spec,
+        // which re-enters here as an ordinary boundary change - this lookup
+        // is what serves an instant hit for it, same as for a manually
+        // dialled-in spec that happens to match a saved override.
+        //
+        // This lookup matches on SPEC ALONE, so it's ambiguous whenever more
+        // than one entry shares this exact spec - an expected, supported
+        // case now (two different top-N candidates from the same Auto
+        // search, saved into two different preset slots - see
+        // savePresetSlot()'s own comment on why). The first match found
+        // (typically the lowest-numbered preset slot, or a plain override if
+        // one exists) is what a manually dialled-in spec recalls; that's an
+        // acceptable ambiguity for that path, but loadPresetSlot() itself
+        // does NOT rely on this lookup picking the right one - it captures
+        // its own slot's entry directly and republishes it explicitly as
+        // the authoritative last step (see its own comment), so pressing a
+        // specific numbered Load button always recalls that exact slot
+        // regardless of what this lookup alone would have found.
+        // userOverrides is guarded by this same specLock (see its
+        // declaration in the header) since this function, like the rest of
+        // the specLock-guarded block, can run on the audio thread.
         //
         // Skipped while Manual tap-count mode is on - same reasoning as the
         // search-cache guard further down (see its own comment): a saved

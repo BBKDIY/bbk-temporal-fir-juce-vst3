@@ -70,6 +70,22 @@ struct OverrideEntry
     // preset into an occupied slot clears this field on whatever entry
     // held it before (that entry isn't deleted, it just stops being a
     // preset - it's still a plain override for its own exact spec).
+    //
+    // Multiple entries CAN share the exact same spec now, each tagged with
+    // a different slot (or one left untagged, -1): two different top-N
+    // candidates from the very same Auto-mode search share an identical
+    // spec (only their chosen candidate/activeIndex differs - see
+    // RankedCandidate's own comment in ParametricFIR.h), and saving both
+    // into two different presets is an expected, supported use of this
+    // field, not a conflict. See BBKDetachedPoleAudioProcessor::
+    // savePresetSlot()/saveTopCandidateAsOverride()'s own comments for how
+    // their save-time dedup logic accounts for this (only ever replacing a
+    // plain, non-preset entry or this exact slot's own prior occupant -
+    // never a different slot's entry, even one sharing this spec), and
+    // loadPresetSlot()'s own comment for why recalling a specific slot
+    // republishes that slot's own captured entry directly rather than
+    // trusting a spec-only lookup that would otherwise be ambiguous
+    // whenever duplicates like this exist.
     int presetSlot = -1;
 };
 
