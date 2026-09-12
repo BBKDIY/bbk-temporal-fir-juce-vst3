@@ -143,6 +143,14 @@ public:
         int bestTapCount = 0;
         double bestRPeakPercent = 0.0;
         double bestAchievedStopbandDb = 0.0;
+
+        // True only once "best" above is a fully spec-compliant design, not
+        // merely the closest non-degenerate attempt seen so far - see
+        // ParametricFIR.h's SearchConcurrencyHooks::onProgress comment. Lets
+        // the editor tell "best so far" (compliant) apart from "closest so
+        // far, still searching for a compliant tap count" (not compliant
+        // yet) instead of showing nothing at all until compliance is found.
+        bool bestIsFeasible = false;
     };
     SearchProgressSnapshot getSearchProgressForUI() const;
 

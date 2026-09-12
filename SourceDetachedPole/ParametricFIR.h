@@ -208,8 +208,25 @@ struct SearchConcurrencyHooks
     // level. Purely informational (e.g. to show "trial N, current best: M
     // taps, X% R_peak" while the search keeps running) - it never affects
     // which candidate the search itself picks. Null means do nothing extra.
+    //
+    // haveBest is true as soon as ANY non-degenerate candidate has been
+    // seen, whether or not it's actually spec-compliant yet - bestTapCount/
+    // bestRPeakPercent/bestAchievedStopbandDb describe THAT candidate.
+    // bestIsFeasible says whether it's the genuine, fully-compliant article
+    // (safe to treat as a real result) or just the closest attempt seen so
+    // far while still hunting for a compliant one (worth showing as
+    // progress, but not something to treat as a usable design). Splitting
+    // these two apart - rather than the previous single "haveBest" that was
+    // actually gated on feasibility - is what lets a caller show real
+    // progress (e.g. "closest so far: 121 taps, missed stopband by 2.3 dB")
+    // during a long climb through infeasible tap counts, instead of nothing
+    // at all until the first fully compliant one turns up: reported
+    // directly as the UI's progress counter visibly advancing attempt by
+    // attempt while showing no best-so-far detail whatsoever the entire
+    // time none of them were compliant yet.
     std::function<void (int attemptsSoFar, bool haveBest, int bestTapCount,
-                         double bestRPeakPercent, double bestAchievedStopbandDb)> onProgress;
+                         double bestRPeakPercent, double bestAchievedStopbandDb,
+                         bool bestIsFeasible)> onProgress;
 };
 
 // See the top-of-file comment for the trade-off between these two modes.
@@ -1498,8 +1515,9 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         }
 
         if (concurrency.onProgress)
-            concurrency.onProgress (result.designAttempts, foundFeasible, foundFeasible ? (2 * bestM + 1) : 0,
-                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb);
+            concurrency.onProgress (result.designAttempts, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
+                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb,
+                                     foundFeasible);
 
         // FlatMask-only safety valve: the "keep searching past the first
         // feasible M, prefer whichever has the lower R_peak" logic above
@@ -1835,8 +1853,9 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
         }
 
         if (concurrency.onProgress)
-            concurrency.onProgress (result.designAttempts, foundFeasible, foundFeasible ? (2 * bestM + 1) : 0,
-                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb);
+            concurrency.onProgress (result.designAttempts, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
+                                     best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb,
+                                     foundFeasible);
 
         if (foundFeasibleThisAttempt) { stopSearch = true; break; }
 

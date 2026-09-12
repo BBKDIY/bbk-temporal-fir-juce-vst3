@@ -548,15 +548,27 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
         const auto progress = processor.getSearchProgressForUI();
         searchProgressText << "\nSearching for a better result in the background ("
                             << progress.attemptsSoFar << " candidate(s) tried so far";
-        if (progress.haveBest)
+        if (progress.haveBest && progress.bestIsFeasible)
         {
             searchProgressText << ", best so far " << progress.bestTapCount << " taps, R_peak "
                                 << juce::String (progress.bestRPeakPercent, 2) << "%, achieved "
                                 << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
         }
+        else if (progress.haveBest)
+        {
+            // Not yet compliant at any tap count tried so far, but not
+            // nothing either - show the closest attempt's own numbers
+            // (R_peak here is informational only, not a compliance claim)
+            // so a long climb through infeasible tap counts still shows
+            // real, moving progress instead of going silent until the
+            // first fully compliant candidate finally turns up.
+            searchProgressText << ", closest so far (not yet compliant) " << progress.bestTapCount
+                                << " taps, R_peak " << juce::String (progress.bestRPeakPercent, 2)
+                                << "%, achieved " << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
+        }
         else
         {
-            searchProgressText << ", no feasible candidate yet)";
+            searchProgressText << ", no candidate yet)";
         }
         searchProgressText << " - click Stop to load it immediately, or let it keep looking.\n";
     }

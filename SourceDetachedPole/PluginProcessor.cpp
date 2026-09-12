@@ -1279,7 +1279,8 @@ void BBKDetachedPoleAudioProcessor::run()
             return taskEpoch != boundaryEpoch;
         };
         concurrency.onProgress = [this] (int attemptsSoFar, bool haveBest, int bestTapCount,
-                                          double bestRPeakPercent, double bestAchievedStopbandDb)
+                                          double bestRPeakPercent, double bestAchievedStopbandDb,
+                                          bool bestIsFeasible)
         {
             const juce::SpinLock::ScopedLockType sl (searchProgressLock);
             searchProgress.attemptsSoFar = attemptsSoFar;
@@ -1287,6 +1288,7 @@ void BBKDetachedPoleAudioProcessor::run()
             searchProgress.bestTapCount = bestTapCount;
             searchProgress.bestRPeakPercent = bestRPeakPercent;
             searchProgress.bestAchievedStopbandDb = bestAchievedStopbandDb;
+            searchProgress.bestIsFeasible = bestIsFeasible;
         };
 
         bbk::parametric::DesignResult result;
