@@ -34,6 +34,27 @@ struct OverrideEntry
     bbk::parametric::FilterSpec spec;
     std::vector<bbk::parametric::RankedCandidate> candidates; // best-R_peak-first, up to topCandidateCount
     int activeIndex = 0;
+
+    // True only for an override saved via the dedicated "Save as Default"
+    // button; false for one saved via a top-N table row's own per-candidate
+    // "Save" button (see PluginProcessor.cpp::saveTopCandidateAsOverride()'s
+    // own comment on the setAsDefaultChoice parameter). Every override,
+    // regardless of this flag, is still recalled instantly for its own
+    // EXACT spec (see requestBoundaryRedesign()'s overrideEntry lookup) -
+    // this flag only gates forcePresetOperatingPoint()'s much broader
+    // "most recently saved override for this SAMPLE RATE, any spec" scan,
+    // which is what Default mode actually recalls. Without this
+    // distinction, bookmarking an alternative candidate from the top-N
+    // table - a deliberate act of saving, but not of "make this my
+    // Default" - silently became the new Default for that sample rate the
+    // instant it was saved, reported directly as "I saved one of the top 5
+    // and it now shows up when I click Default, even though I never
+    // touched Save as Default." Defaults to true so every override
+    // written to disk BEFORE this flag existed (which could only ever
+    // have come from the single old Save-as-Default action) keeps
+    // counting as a Default choice exactly as before - see loadAll()'s
+    // matching default on the missing-attribute case.
+    bool isDefaultChoice = true;
 };
 
 inline juce::File getOverrideFile()
@@ -122,6 +143,12 @@ inline std::vector<OverrideEntry> loadAll()
         if (e.activeIndex < 0 || e.activeIndex >= static_cast<int> (e.candidates.size()))
             e.activeIndex = 0; // guards a corrupted/out-of-range index the same way the size check above guards taps
 
+        // Missing attribute (every file written before this flag existed)
+        // defaults to true - see OverrideEntry::isDefaultChoice's own
+        // comment for why that's the correct upgrade behaviour, not just a
+        // convenient one.
+        e.isDefaultChoice = child->getBoolAttribute ("isDefaultChoice", true);
+
         result.push_back (std::move (e));
     }
     return result;
@@ -144,6 +171,7 @@ inline bool saveAll (const std::vector<OverrideEntry>& entries)
         child->setAttribute ("stopbandMode", static_cast<int> (e.spec.stopbandMode));
         child->setAttribute ("sidelobeDecayRatio", e.spec.sidelobeDecayRatio);
         child->setAttribute ("activeIndex", e.activeIndex);
+        child->setAttribute ("isDefaultChoice", e.isDefaultChoice);
 
         for (auto& c : e.candidates)
         {

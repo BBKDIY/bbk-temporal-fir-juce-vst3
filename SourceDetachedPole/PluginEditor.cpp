@@ -225,7 +225,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     saveAsDefaultButton.onClick = [this]
     {
         const auto snap = processor.getDesignSnapshotForUI();
-        processor.saveTopCandidateAsOverride (snap.selectedIndex);
+        processor.saveTopCandidateAsOverride (snap.selectedIndex, true);
     };
     addAndMakeVisible (saveAsDefaultButton);
 
@@ -256,9 +256,17 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
         useButton.onClick = [this, i] { processor.selectTopCandidate (i); };
         addAndMakeVisible (useButton);
 
+        // false (not the "Save as Default" button's true - see
+        // saveTopCandidateAsOverride()'s own comment): persists this row's
+        // candidate for instant exact-spec recall later, same as any other
+        // override, but does NOT make it what Default mode recalls for this
+        // sample rate. Bookmarking an alternative from this table should
+        // never silently hijack Default just because it happened to be the
+        // most recently saved override - only the dedicated button above
+        // does that.
         auto& saveButton = saveCandidateButtons[static_cast<std::size_t> (i)];
         saveButton.setButtonText ("Save");
-        saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i); };
+        saveButton.onClick = [this, i] { processor.saveTopCandidateAsOverride (i, false); };
         addAndMakeVisible (saveButton);
     }
 

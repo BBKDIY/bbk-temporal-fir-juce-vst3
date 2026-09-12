@@ -242,7 +242,19 @@ public:
     // ahead of both the compiled-in factory bank and a fresh live search. A
     // no-op if nothing has been designed yet (tapCount == 0) or index is out
     // of range for whatever list is being saved.
-    void saveTopCandidateAsOverride (int index);
+    //
+    // setAsDefaultChoice distinguishes the two different buttons that both
+    // call this same method (see PluginEditor.cpp): true only for the
+    // dedicated "Save as Default" button, false for a top-N table row's own
+    // per-candidate "Save" button. It is stored as OverrideEntry::
+    // isDefaultChoice and gates ONLY forcePresetOperatingPoint()'s broader
+    // "most recently saved override for this sample rate, any spec" scan -
+    // exact-spec recall in requestBoundaryRedesign() still finds an override
+    // regardless of this flag. Without it, bookmarking an alternative
+    // candidate from the top-N table silently became the new thing Default
+    // mode recalls for that sample rate, even though the user never touched
+    // Save as Default - reported directly.
+    void saveTopCandidateAsOverride (int index, bool setAsDefaultChoice);
 
     // Forces a genuinely fresh live search for the CURRENT spec, bypassing
     // every instant source (compiled-in bank, a saved override, and - the

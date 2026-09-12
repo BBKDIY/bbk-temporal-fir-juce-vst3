@@ -93,6 +93,44 @@ namespace
             && a.sidelobeDecayRatio == b.sidelobeDecayRatio;
     }
 
+    // Combines a just-finished search's own top-N candidates with whatever
+    // was already cached for this exact spec (if anything), re-ranks the
+    // union purely by R_peak, and keeps only the best
+    // bbk::parametric::topCandidateCount - see run()'s own comment on why
+    // this replaces a plain overwrite. R_peak is recomputed here rather
+    // than read off either list, since RankedCandidate deliberately doesn't
+    // store it (see its own comment in ParametricFIR.h) - computeTemporalMetrics
+    // is a pure function of taps + sample rate, so this is cheap and exact,
+    // not an approximation. Deduplicated by tap count: if both lists happen
+    // to already have an entry at the same M, the existing (already-cached,
+    // already-shown-to-the-user) one wins rather than being swapped for a
+    // numerically different solution at the same M that offers nothing new.
+    inline std::vector<bbk::parametric::RankedCandidate> mergeRankedCandidates (
+        const std::vector<bbk::parametric::RankedCandidate>& existing,
+        const std::vector<bbk::parametric::RankedCandidate>& fresh,
+        double sampleRateHz)
+    {
+        std::vector<bbk::parametric::RankedCandidate> merged = existing;
+        for (auto& c : fresh)
+        {
+            const bool haveThisTapCountAlready = std::any_of (merged.begin(), merged.end(),
+                [&] (const auto& e) { return e.tapCount == c.tapCount; });
+            if (! haveThisTapCountAlready)
+                merged.push_back (c);
+        }
+
+        std::sort (merged.begin(), merged.end(), [sampleRateHz] (const auto& a, const auto& b)
+        {
+            return bbk::parametric::computeTemporalMetrics (a.taps, sampleRateHz).rPeakPercent
+                 < bbk::parametric::computeTemporalMetrics (b.taps, sampleRateHz).rPeakPercent;
+        });
+
+        if (merged.size() > static_cast<std::size_t> (bbk::parametric::topCandidateCount))
+            merged.resize (static_cast<std::size_t> (bbk::parametric::topCandidateCount));
+
+        return merged;
+    }
+
     // Hard ceiling on how many attemptDesign() workers a single search
     // "round" may ever use, regardless of how idle the machine looks -
     // even a genuinely idle 64-core server has no reason to run more of
@@ -409,7 +447,13 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
     // is kept in save order - see saveTopCandidateAsOverride() - so the last
     // entry matching this rate is the one to use). Only sample rate can be
     // part of this lookup key: every other field is exactly what this
-    // function is about to decide.
+    // function is about to decide. Also filtered to isDefaultChoice - an
+    // override saved via a top-N table row's own "Save" button (rather than
+    // the dedicated "Save as Default" button) is NOT eligible here, even if
+    // it's the most recent save for this rate - see OverrideEntry::
+    // isDefaultChoice's own comment. Exact-spec recall in
+    // requestBoundaryRedesign() is unaffected by this filter; only this
+    // broader by-sample-rate scan is.
     const auto spec = specFromParameters();
 
     double targetCutoffHz = presetCutoffHz;
@@ -421,7 +465,7 @@ void BBKDetachedPoleAudioProcessor::forcePresetOperatingPoint()
         const juce::SpinLock::ScopedLockType sl (specLock);
         for (auto it = userOverrides.rbegin(); it != userOverrides.rend(); ++it)
         {
-            if (it->spec.sampleRateHz == spec.sampleRateHz)
+            if (it->spec.sampleRateHz == spec.sampleRateHz && it->isDefaultChoice)
             {
                 targetCutoffHz = it->spec.cutoffHz;
                 targetAttenuationDb = it->spec.attenuationAtCutoffDb;
@@ -569,7 +613,7 @@ void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
     publishResult (spec, result, source, index);
 }
 
-void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
+void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index, bool setAsDefaultChoice)
 {
     // Whatever is currently published - a live Custom-mode result, a
     // Default-mode bank entry, or even an existing override - becomes the
@@ -591,6 +635,7 @@ void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
     entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
     entry.spec.stopbandMode = snap.stopbandMode;
     entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
+    entry.isDefaultChoice = setAsDefaultChoice;
 
     // Saves the WHOLE ranked list (see DesignSnapshot::topCandidates), not
     // just the one candidate the user picked - see OverrideEntry::
@@ -1260,9 +1305,10 @@ void BBKDetachedPoleAudioProcessor::run()
             // could be empty here is a degenerate/never-actually-searched
             // result, already excluded by the tapCount/taps check above -
             // but guard it anyway rather than cache a hollow entry.
+            std::vector<bbk::parametric::RankedCandidate> freshCandidates;
             if (! result.topCandidates.empty())
             {
-                entry.candidates = result.topCandidates;
+                freshCandidates = result.topCandidates;
             }
             else
             {
@@ -1270,12 +1316,34 @@ void BBKDetachedPoleAudioProcessor::run()
                 c.taps = result.taps;
                 c.tapCount = result.tapCount;
                 c.achievedStopbandDb = result.achievedStopbandDb;
-                entry.candidates.push_back (std::move (c));
+                freshCandidates.push_back (std::move (c));
             }
 
             std::vector<bbk::detachedpole::searchcache::CacheEntry> toSave;
             {
                 const juce::SpinLock::ScopedLockType sl (specLock);
+
+                // Merge with whatever is already cached for this exact
+                // spec rather than blindly replacing it - see
+                // mergeRankedCandidates()'s own comment above process().
+                // This is what keeps requestFreshSearch() ("Re-search")
+                // from being a strictly risky action: its own fresh sweep
+                // can, for a demanding spec, genuinely not reach/converge
+                // as far this run as an earlier, luckier one did (system
+                // load changes how much of the tap-count range gets
+                // covered before the deadline - see designParametricFIR's
+                // own comment on concurrency timing sensitivity), and
+                // without this merge that worse result would silently
+                // overwrite a genuinely better filter already on file with
+                // no way back to it - reported directly. A brand-new spec
+                // with nothing cached yet is unaffected: merging against an
+                // empty existing list is just the fresh list, unchanged.
+                const auto existingIt = std::find_if (searchCache.begin(), searchCache.end(),
+                                                       [&] (const auto& e) { return specsEqual (e.spec, entry.spec); });
+                const std::vector<bbk::parametric::RankedCandidate> existingCandidates =
+                    existingIt != searchCache.end() ? existingIt->candidates
+                                                     : std::vector<bbk::parametric::RankedCandidate> {};
+                entry.candidates = mergeRankedCandidates (existingCandidates, freshCandidates, entry.spec.sampleRateHz);
 
                 searchCache.erase (std::remove_if (searchCache.begin(), searchCache.end(),
                                                     [&] (const auto& e) { return specsEqual (e.spec, entry.spec); }),
@@ -1288,6 +1356,25 @@ void BBKDetachedPoleAudioProcessor::run()
                 toSave = searchCache;
             }
             bbk::detachedpole::searchcache::saveAll (toSave);
+
+            // Publish the MERGED list, not just this run's own - otherwise
+            // a Re-search that landed on something worse than what was
+            // already cached would still show the worse result on screen
+            // right now, even though the better one is (correctly, as of
+            // the merge above) still what's cached for next time. If the
+            // merge's own best (index 0) differs from what this run itself
+            // found, adopt it here too, so what's shown immediately after
+            // a search finishes always matches the best known answer for
+            // this spec, not just the best THIS run happened to find.
+            result.topCandidates = entry.candidates;
+            if (! entry.candidates.empty())
+            {
+                const auto& winner = entry.candidates.front();
+                result.taps = winner.taps;
+                result.tapCount = winner.tapCount;
+                result.achievedStopbandDb = winner.achievedStopbandDb;
+                result.temporal = bbk::parametric::computeTemporalMetrics (winner.taps, entry.spec.sampleRateHz);
+            }
         }
 
         // Re-check staleness after the (possibly slow - see
