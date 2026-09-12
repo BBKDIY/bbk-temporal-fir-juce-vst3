@@ -74,6 +74,22 @@ private:
     juce::Slider maxSearchTimeSlider;
     juce::ToggleButton maxSearchTimeHoursButton { "Hours" };
 
+    // Per-tap-count-candidate search deadline (see
+    // "perCandidateSearchTimeSeconds" in
+    // PluginProcessor.cpp::createParameterLayout() and run()'s own comment)
+    // - distinct from Max Search Time above, which bounds the WHOLE sweep
+    // across every tap count tried: this instead bounds how long a SINGLE
+    // candidate's own grid-refinement loop may run before being cut off and
+    // the search moves on to the next tap count. That loop's own stopping
+    // condition is wall-clock time, not a fixed round count, so this is
+    // what actually determines how well-converged (and therefore how good)
+    // a demanding candidate's result is once the search settles on it -
+    // raising it trades covering fewer distinct tap counts (within the same
+    // overall Max Search Time budget) for more room to fully converge on
+    // each one it does try.
+    juce::Label perCandidateSearchTimeLabel;
+    juce::Slider perCandidateSearchTimeSlider;
+
     // Calls processor.requestStopSearch() - immediately loads whatever the
     // best result found so far is, exactly as if the search had hit its own
     // deadline (see PluginProcessor.h). Enabled only while
@@ -132,6 +148,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tapCountAutoAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxSearchTimeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> maxSearchTimeHoursAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> perCandidateSearchTimeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> amplitudeRelaxationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> defaultModeAttachment;

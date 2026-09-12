@@ -143,6 +143,21 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     maxSearchTimeHoursAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         processor.getAPVTS(), "maxSearchTimeIsHours", maxSearchTimeHoursButton);
 
+    // Per-candidate search deadline - see the member comment in
+    // PluginEditor.h and "perCandidateSearchTimeSeconds" in
+    // PluginProcessor.cpp::createParameterLayout(). Same typeable
+    // IncDecButtons style as Max Search Time above.
+    prepareLabel (perCandidateSearchTimeLabel, 13.0f, false, juce::Justification::centredLeft);
+    perCandidateSearchTimeLabel.setText ("Per-Candidate Time (s)", juce::dontSendNotification);
+    addAndMakeVisible (perCandidateSearchTimeLabel);
+    perCandidateSearchTimeSlider.setSliderStyle (juce::Slider::IncDecButtons);
+    perCandidateSearchTimeSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 60, 22);
+    perCandidateSearchTimeSlider.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
+    perCandidateSearchTimeSlider.setNumDecimalPlacesToDisplay (0);
+    addAndMakeVisible (perCandidateSearchTimeSlider);
+    perCandidateSearchTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "perCandidateSearchTimeSeconds", perCandidateSearchTimeSlider);
+
     // Loads whatever the best result found so far is, right away - see
     // processor.requestStopSearch()'s own comment. Enabled state tracks
     // processor.isSearchInProgressForUI() live in timerCallback(), same
@@ -280,11 +295,12 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     coefficientsBox.setVisible (false);
     addChildComponent (coefficientsBox);
 
-    // Grew by 190 from the previous 971 to fit the top-N results table
-    // (header + up to bbk::parametric::topCandidateCount rows) added
-    // between the metrics readout and the coefficients/save-as-default row
-    // - see resized() for the exact layout this accounts for.
-    setSize (680, 1161);
+    // Grew by 190 from 971 to 1161 to fit the top-N results table (header
+    // + up to bbk::parametric::topCandidateCount rows) added between the
+    // metrics readout and the coefficients/save-as-default row, then by a
+    // further 32 to fit the new Per-Candidate Time row added just below Max
+    // Search Time - see resized() for the exact layout this accounts for.
+    setSize (680, 1193);
     startTimerHz (4);
     timerCallback();
 }
@@ -349,6 +365,13 @@ void BBKDetachedPoleAudioProcessorEditor::resized()
         stopSearchButton.setBounds (row.removeFromLeft (90));
         row.removeFromLeft (16);
         reSearchButton.setBounds (row.removeFromLeft (100));
+    }
+    area.removeFromTop (6);
+
+    {
+        auto row = area.removeFromTop (26);
+        perCandidateSearchTimeLabel.setBounds (row.removeFromLeft (170));
+        perCandidateSearchTimeSlider.setBounds (row.removeFromLeft (100));
     }
     area.removeFromTop (6);
 

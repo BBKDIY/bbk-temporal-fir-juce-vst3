@@ -383,6 +383,37 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         "Max Search Time (Hours)",
         false));
 
+    // Per-candidate search deadline (see run(): passed straight through as
+    // designParametricFIR()/designParametricFIRFixedM()'s perCandidateSeconds).
+    // Distinct from Max Search Time above, which bounds the WHOLE sweep
+    // across every tap count tried - this instead bounds how long a SINGLE
+    // tap count's own grid-refinement loop may run before being cut off,
+    // win or lose, and moving on to the next candidate. That loop's own
+    // stopping condition is wall-clock time, not a fixed round count (see
+    // attemptDesign()'s own comment in ParametricFIR.h), so how well a
+    // demanding candidate actually converges - and therefore which tap
+    // count the search ultimately settles on as "best" - can vary run to
+    // run purely from how much real CPU throughput that candidate's window
+    // happened to get (contention from other concurrently-solving
+    // candidates, or anything else busy on the machine at that moment).
+    // Raising this gives every candidate more real room to fully converge
+    // before being cut off, at the cost of covering fewer distinct tap
+    // counts within the same overall Max Search Time budget if several
+    // candidates in a row are all demanding - reported and requested
+    // directly, after exactly this run-to-run variance was traced to this
+    // cap. 5s floor keeps a pathologically low value from making every
+    // candidate look infeasible; 300s (5 minutes) ceiling is generous for
+    // even a very demanding single candidate without letting one candidate
+    // alone consume an entire default-length Max Search Time budget by
+    // itself. Default 120 (raised from a prior fixed, non-adjustable 60s
+    // constant) - still comfortably below the 300s default overall budget.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "perCandidateSearchTimeSeconds", 1 },
+        "Per-Candidate Search Time",
+        juce::NormalisableRange<float> (5.0f, 300.0f, 1.0f),
+        120.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("s")));
+
     return layout;
 }
 
@@ -1175,8 +1206,13 @@ void BBKDetachedPoleAudioProcessor::run()
         // an unattended search, not a target, read live from the
         // "maxSearchTimeValue"/"maxSearchTimeIsHours" parameters (editor-
         // adjustable, 5 minutes by default) rather than a fixed constant,
-        // per direct request. 60s per candidate is unchanged and still well
-        // above ParametricFIR.h's own real-time-appropriate default (15s) -
+        // per direct request. perCandidateDeadlineSeconds below (also
+        // editor-adjustable now, default 120s, raised from a prior fixed
+        // 60s constant) is the other half of that budget - see
+        // "perCandidateSearchTimeSeconds"'s own comment in
+        // createParameterLayout() for what it actually controls (how many
+        // of a demanding candidate's own grid-refinement rounds get to
+        // finish before ITS deadline cuts it off, not the overall sweep) -
         // safe to be this patient now that Default mode (see
         // requestBoundaryRedesign()) gives an always-available instant
         // result while this runs in the background.
@@ -1213,6 +1249,7 @@ void BBKDetachedPoleAudioProcessor::run()
         const float maxSearchTimeValue = parameters.getRawParameterValue ("maxSearchTimeValue")->load();
         const bool maxSearchTimeIsHours = parameters.getRawParameterValue ("maxSearchTimeIsHours")->load() > 0.5f;
         const double safetyDeadlineSeconds = static_cast<double> (maxSearchTimeValue) * (maxSearchTimeIsHours ? 3600.0 : 60.0);
+        const double perCandidateDeadlineSeconds = static_cast<double> (parameters.getRawParameterValue ("perCandidateSearchTimeSeconds")->load());
 
         bbk::parametric::SearchConcurrencyHooks concurrency;
         concurrency.pollConcurrency = [this] { return currentAllowedSearchConcurrency(); };
@@ -1257,11 +1294,11 @@ void BBKDetachedPoleAudioProcessor::run()
         {
             const int floor = bbk::parametric::minimumFeasibleTapCount (task.spec, bbk::detachedpole::maxTapCount, 30.0);
             const int target = juce::jmax (task.requestedTapCount, floor);
-            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, 60.0, concurrency);
+            result = bbk::parametric::designParametricFIRFixedM (task.spec, target, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, perCandidateDeadlineSeconds, concurrency);
         }
         else
         {
-            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, 60.0, concurrency);
+            result = bbk::parametric::designParametricFIR (task.spec, bbk::detachedpole::maxTapCount, safetyDeadlineSeconds, perCandidateDeadlineSeconds, concurrency);
         }
 
         // Remember this result so revisiting the exact same spec later -
