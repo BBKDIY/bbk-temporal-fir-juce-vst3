@@ -1410,12 +1410,13 @@ void BBKDetachedPoleAudioProcessor::run()
             const juce::SpinLock::ScopedLockType sl (specLock);
             return taskEpoch != boundaryEpoch;
         };
-        concurrency.onProgress = [this] (int attemptsSoFar, bool haveBest, int bestTapCount,
+        concurrency.onProgress = [this] (int attemptsSoFar, int currentTapCount, bool haveBest, int bestTapCount,
                                           double bestRPeakPercent, double bestAchievedStopbandDb,
                                           bool bestIsFeasible)
         {
             const juce::SpinLock::ScopedLockType sl (searchProgressLock);
             searchProgress.attemptsSoFar = attemptsSoFar;
+            searchProgress.currentTapCount = currentTapCount;
             searchProgress.haveBest = haveBest;
             searchProgress.bestTapCount = bestTapCount;
             searchProgress.bestRPeakPercent = bestRPeakPercent;

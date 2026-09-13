@@ -113,6 +113,24 @@ private:
     juce::ToggleButton autoHeadroomButton { "Auto" };
     juce::Label clipIndicator; // lit red for a short hold time after the soft-clip backstop engages
 
+    // Visual companion to searchProgressText's own numbers (see
+    // timerCallback()) - a horizontal bar spanning the search's own
+    // tap-count range (bbk::parametric::autoSearchStartTapCount up to
+    // bbk::detachedpole::maxTapCount, i.e. 19-161 for Auto mode) with the
+    // fill showing how far the candidate JUST evaluated
+    // (SearchProgressSnapshot::currentTapCount) has climbed through that
+    // range so far - not a generic "some % done" bar, since this search has
+    // no fixed number of steps to divide by (it can stop the moment a
+    // compliant M is found, or a deadline/Stop cuts it short) and a plain
+    // percentage would be meaningless. searchProgressFraction is the
+    // juce::ProgressBar's own required backing value - must be declared
+    // BEFORE searchProgressBar below, since the bar holds a reference to it
+    // that must already exist when the bar is constructed. Visible only
+    // while a search is actually running (see timerCallback(), same
+    // condition as searchIndicator/stopSearchButton).
+    double searchProgressFraction = 0.0;
+    juce::ProgressBar searchProgressBar { searchProgressFraction };
+
     juce::Label metricsReadout;
     juce::TextButton coefficientsButton { "Show Coefficients" };
     juce::TextEditor coefficientsBox;

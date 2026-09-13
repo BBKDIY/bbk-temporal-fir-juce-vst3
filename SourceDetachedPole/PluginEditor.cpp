@@ -219,6 +219,16 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     clipIndicator.setFont (juce::Font (12.0f, juce::Font::bold));
     content.addAndMakeVisible (clipIndicator);
 
+    // Percentage display off - a bare "%" would need the search's own
+    // finish condition to be a fixed step count, which it isn't (see this
+    // member's own comment in PluginEditor.h); setTextToDisplay() in
+    // timerCallback() supplies the real "N taps (searching 19-161)" text
+    // instead. Starts hidden - only shown while a search is actually
+    // running, same as searchIndicator/stopSearchButton (see timerCallback()).
+    searchProgressBar.setPercentageDisplay (false);
+    searchProgressBar.setVisible (false);
+    content.addAndMakeVisible (searchProgressBar);
+
     // topLeft, not centredLeft: a Label vertically CENTRES its text within
     // its own bounds, so when the (wrapped, multi-line) metrics text is
     // taller than the fixed area below it gives it, centring clips BOTH
@@ -348,21 +358,22 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     content.addChildComponent (coefficientsBox);
 
     // contentHeight is the sum of every fixed row/gap laid out in
-    // layOutContent() below (currently ~1264, including the 20px top/bottom
+    // layOutContent() below (currently ~1294, including the 20px top/bottom
     // margins baked into that method's own area.reduced(20), the 5
     // preset-slot rows - each 40px tall rather than a plain single-line 24px
     // row, since an occupied slot's label now shows a second line of the
-    // FIR's own metrics below its spec summary, see timerCallback() - plus
-    // the Export/Import row added below the top-N table) plus a fixed
-    // allowance for the coefficients box - it has its own internal
-    // scrollbar (see setScrollbarsShown() above), so it doesn't need much
-    // outer space to still be fully usable. This is content's own,
-    // possibly-tall size; it is NOT the window size - see viewport's own
-    // comment in PluginEditor.h and setSize() just below for why those are
-    // now deliberately different.
+    // FIR's own metrics below its spec summary, see timerCallback() - the
+    // Export/Import row added below the top-N table, and the 30px
+    // searchProgressBar row above metricsReadout, see its own comment in
+    // PluginEditor.h) plus a fixed allowance for the coefficients box - it
+    // has its own internal scrollbar (see setScrollbarsShown() above), so
+    // it doesn't need much outer space to still be fully usable. This is
+    // content's own, possibly-tall size; it is NOT the window size - see
+    // viewport's own comment in PluginEditor.h and setSize() just below for
+    // why those are now deliberately different.
     constexpr int contentWidth = 680;
     constexpr int coefficientsBoxHeight = 260;
-    constexpr int contentHeight = 1264 + 40 + coefficientsBoxHeight;
+    constexpr int contentHeight = 1294 + 40 + coefficientsBoxHeight;
     content.setSize (contentWidth, contentHeight);
     layOutContent();
 
@@ -477,6 +488,9 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     area.removeFromTop (6);
 
     area.removeFromTop (10);
+    searchProgressBar.setBounds (area.removeFromTop (22));
+    area.removeFromTop (8);
+
     // Sized generously (up from 215) for the metrics text's actual worst-
     // case line count: the "Design method"/"Stopband mode"/"Center-tap
     // gain" lines alone wrap to 2-3 lines each at this width, plus the
@@ -616,10 +630,37 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     // result for the whole duration of a search and only switches once,
     // either when the search finishes on its own, Stop is clicked, or the
     // safety-net deadline is hit.
+    // Visual companion to searchProgressText's own numbers below - see
+    // searchProgressBar's own comment in PluginEditor.h for why this is a
+    // range-position bar (19 up to bbk::detachedpole::maxTapCount, i.e. 161)
+    // rather than a plain percentage. Hidden outside a search, same
+    // condition as searchIndicator/stopSearchButton just above.
+    searchProgressBar.setVisible (searching);
+    if (! searching)
+        searchProgressFraction = 0.0;
+
     juce::String searchProgressText;
     if (searching)
     {
         const auto progress = processor.getSearchProgressForUI();
+
+        // currentTapCount is 0 before this search's very first onProgress
+        // call has landed (see SearchProgressSnapshot's own comment) - clamp
+        // rather than let that read as a negative fraction. Manual mode's
+        // own climb (designParametricFIRFixedM) can likewise start BELOW
+        // autoSearchStartTapCount if fewer taps were requested than Auto's
+        // own starting point - clamped to 0 (an empty bar) rather than a
+        // negative fraction in that case too; jlimit handles both.
+        constexpr int rangeFloor = bbk::parametric::autoSearchStartTapCount;
+        constexpr int rangeCeiling = bbk::detachedpole::maxTapCount;
+        searchProgressFraction = juce::jlimit (0.0, 1.0,
+            static_cast<double> (progress.currentTapCount - rangeFloor) / static_cast<double> (rangeCeiling - rangeFloor));
+
+        searchProgressBar.setTextToDisplay (progress.currentTapCount > 0
+            ? ("Trying " + juce::String (progress.currentTapCount) + " taps (search range "
+               + juce::String (rangeFloor) + "-" + juce::String (rangeCeiling) + ")")
+            : juce::String ("Starting search..."));
+
         searchProgressText << "\nSearching for a better result in the background ("
                             << progress.attemptsSoFar << " candidate(s) tried so far";
         if (progress.haveBest && progress.bestIsFeasible)

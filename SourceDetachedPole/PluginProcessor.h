@@ -139,6 +139,17 @@ public:
     struct SearchProgressSnapshot
     {
         int attemptsSoFar = 0;
+
+        // The tap count of whichever candidate was JUST evaluated (not the
+        // best found - see bestTapCount below for that) - climbs steadily
+        // attempt by attempt as the search works its way through the range,
+        // so this is what a progress bar should track for "where in the
+        // search we currently are". 0 before the very first attempt's own
+        // onProgress call has landed. See ParametricFIR.h's
+        // SearchConcurrencyHooks::onProgress and autoSearchStartTapCount for
+        // where this comes from and what range it spans.
+        int currentTapCount = 0;
+
         bool haveBest = false;
         int bestTapCount = 0;
         double bestRPeakPercent = 0.0;

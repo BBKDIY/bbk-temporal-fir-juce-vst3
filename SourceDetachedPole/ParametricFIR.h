@@ -203,11 +203,18 @@ struct SearchConcurrencyHooks
 
     // Called once per candidate attempt, right after its outcome has been
     // decided, with the search's running state so far: how many candidates
-    // have been tried in total, and - once at least one is feasible - the
-    // current best design's tap count, R_peak, and achieved stopband
-    // level. Purely informational (e.g. to show "trial N, current best: M
-    // taps, X% R_peak" while the search keeps running) - it never affects
-    // which candidate the search itself picks. Null means do nothing extra.
+    // have been tried in total, the tap count of the candidate JUST
+    // evaluated (currentTapCount - this climbs steadily attempt by attempt,
+    // 19, 21, 23, ... up toward maxTapCount for designParametricFIR's own
+    // Auto-mode search, or upward from whatever Manual mode requested for
+    // designParametricFIRFixedM's walk; see autoSearchStartTapCount above
+    // for Auto's own fixed starting point), and - once at least one is
+    // feasible - the current best design's tap count, R_peak, and achieved
+    // stopband level. Purely informational (e.g. to show "trial N,
+    // currently trying M taps (of up to 161), current best: M taps, X%
+    // R_peak" while the search keeps running, or to drive a progress bar
+    // spanning the search's own tap-count range) - it never affects which
+    // candidate the search itself picks. Null means do nothing extra.
     //
     // haveBest is true as soon as ANY non-degenerate candidate has been
     // seen, whether or not it's actually spec-compliant yet - bestTapCount/
@@ -224,7 +231,7 @@ struct SearchConcurrencyHooks
     // directly as the UI's progress counter visibly advancing attempt by
     // attempt while showing no best-so-far detail whatsoever the entire
     // time none of them were compliant yet.
-    std::function<void (int attemptsSoFar, bool haveBest, int bestTapCount,
+    std::function<void (int attemptsSoFar, int currentTapCount, bool haveBest, int bestTapCount,
                          double bestRPeakPercent, double bestAchievedStopbandDb,
                          bool bestIsFeasible)> onProgress;
 };
@@ -401,6 +408,17 @@ inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, 
 // in one always-visible table (see PluginEditor.cpp) - not a fundamental
 // limit of the search itself, just the UI's own row count.
 constexpr int topCandidateCount = 5;
+
+// designParametricFIR()'s Auto-mode M-search's own fixed starting point (see
+// its "int M = std::min (maxM, autoSearchStartM);" below) - exposed here,
+// not just inlined there, so a caller like the editor's own search-progress
+// display (see PluginEditor.cpp/SearchProgressSnapshot's own comment in
+// PluginProcessor.h) can show the search's true starting tap count without
+// duplicating this literal. designParametricFIRFixedM()'s own walk starts
+// from whatever tap count Manual mode requested (or its own floor-raised
+// value) instead - this constant describes Auto mode's start specifically.
+constexpr int autoSearchStartM = 9;
+constexpr int autoSearchStartTapCount = 2 * autoSearchStartM + 1; // 19
 
 // One ranked candidate from a top-N search result (see DesignResult::
 // topCandidates below), or a single stored entry in the search cache or a
@@ -1323,7 +1341,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     DesignResult result;
     const int maxM = (maxTapCount - 1) / 2;
 
-    int M = std::min (maxM, 9);
+    int M = std::min (maxM, autoSearchStartM);
     detail::AttemptResult best;
     int bestM = M;
     bool foundFeasible = false;
@@ -1515,7 +1533,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         }
 
         if (concurrency.onProgress)
-            concurrency.onProgress (result.designAttempts, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
+            concurrency.onProgress (result.designAttempts, 2 * M + 1, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
                                      best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb,
                                      foundFeasible);
 
@@ -1853,7 +1871,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
         }
 
         if (concurrency.onProgress)
-            concurrency.onProgress (result.designAttempts, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
+            concurrency.onProgress (result.designAttempts, 2 * M + 1, ! best.a.empty(), best.a.empty() ? 0 : (2 * bestM + 1),
                                      best.a.empty() ? 0.0 : best.rPeakPercent, best.a.empty() ? 0.0 : best.worstStopbandDb,
                                      foundFeasible);
 
