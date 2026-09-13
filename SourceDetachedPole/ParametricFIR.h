@@ -481,7 +481,8 @@ struct LPFeasibilityResult
 };
 
 inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<double>>& Arows, const std::vector<double>& b, int n,
-                                                std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max())
+                                                std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max(),
+                                                const std::function<bool()>& shouldStopEarly = {})
 {
     const int numRows = static_cast<int> (Arows.size());
 
@@ -572,7 +573,24 @@ inline LPFeasibilityResult solveLPFeasibility (const std::vector<std::vector<dou
         // (pivotRow < 0, below) - the caller already treats that as a
         // legitimate, expected outcome to degrade gracefully from, not a
         // crash or an ambiguous error.
-        if ((iter & 63) == 0 && std::chrono::steady_clock::now() > deadline)
+        //
+        // shouldStopEarly (the plugin's own Stop button, threaded all the
+        // way down from SearchConcurrencyHooks - see designParametricFIR's
+        // own round loop for the same check one level up) is polled
+        // alongside deadline for exactly the same reason: without it, a
+        // solve already in flight when Stop is clicked has no way to learn
+        // that until its ORIGINAL deadline (up to the plugin's own
+        // Per-Candidate Time setting, e.g. several minutes) actually
+        // elapses - the outer loop's own "collapse the round's deadline to
+        // now" trick (see designParametricFIR's own comment) only helps a
+        // round that hasn't STARTED yet, since this deadline argument is
+        // computed once, before dispatch, and never shrinks afterward.
+        // Reported directly as Stop appearing to do nothing at all -
+        // measured as this: a round already dispatched with the full
+        // (uncollapsed) deadline before Stop was clicked kept every one of
+        // its in-flight LP solves running all the way out, however far from
+        // done they actually were.
+        if ((iter & 63) == 0 && (std::chrono::steady_clock::now() > deadline || (shouldStopEarly && shouldStopEarly())))
             return { false, {} };
 
         int pivotCol = -1;
@@ -699,7 +717,8 @@ struct AttemptResult
 // try another" correctly) - only offline, non-interactive regeneration
 // of the prebuilt filter bank benefits from raising this past 15s.
 inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::steady_clock::time_point overallDeadline,
-                                     double perCandidateSeconds = 15.0)
+                                     double perCandidateSeconds = 15.0,
+                                     const std::function<bool()>& shouldStopEarly = {})
 {
     const int numVars = M + 1;
     const double Fs = spec.sampleRateHz;
@@ -899,7 +918,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // bounding it against the whole search's own budget (rather than
         // one stopEdge candidate's slice of it) stops that runaway cost
         // without punishing ordinary, if slow-on-this-hardware, solves.
-        return solveLPFeasibility (A, b, reducedVars, overallDeadline);
+        return solveLPFeasibility (A, b, reducedVars, overallDeadline, shouldStopEarly);
     };
 
     // Solve for one specific stopEdge choice (the boundary between the
@@ -993,7 +1012,15 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         int gridRound = 0;
         for (; gridRound < maxGridRounds; ++gridRound)
         {
-            if (std::chrono::steady_clock::now() > deadline)
+            // shouldStopEarly OR'd in alongside deadline at every one of
+            // this function's own break checks, same as solveLPFeasibility's
+            // own periodic check just above tryRho's call site - see that
+            // check's own comment for why a live Stop click needs this at
+            // every level, not just the outer M-search loop: without it,
+            // work already dispatched before Stop was clicked keeps running
+            // out its full, un-collapsed deadline regardless of how many
+            // outer loops also happen to be checking shouldStopEarly.
+            if (std::chrono::steady_clock::now() > deadline || (shouldStopEarly && shouldStopEarly()))
                 break;
 
             for (int mlIter = 0; mlIter < 2; ++mlIter)
@@ -1008,13 +1035,13 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
                 while (! tryRho (curPb, curSb, mainLobeStart, hi, true).feasible && hi < 1.0e6)
                 {
                     hi *= 2.0;
-                    if (std::chrono::steady_clock::now() > deadline) break;
+                    if (std::chrono::steady_clock::now() > deadline || (shouldStopEarly && shouldStopEarly())) break;
                 }
                 for (int it = 0; it < 10; ++it)
                 {
                     double mid = 0.5 * (lo + hi);
                     if (tryRho (curPb, curSb, mainLobeStart, mid, true).feasible) hi = mid; else lo = mid;
-                    if (std::chrono::steady_clock::now() > deadline) break;
+                    if (std::chrono::steady_clock::now() > deadline || (shouldStopEarly && shouldStopEarly())) break;
                 }
                 auto final = tryRho (curPb, curSb, mainLobeStart, hi, true);
                 if (final.feasible) { bestY = final.y; bestRho = hi; sidelobeBisectionSucceeded = true; }
@@ -1258,7 +1285,8 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
 inline std::vector<AttemptResult> attemptDesignBatch (const FilterSpec& spec, const std::vector<int>& candidateMs,
                                                         std::chrono::steady_clock::time_point overallDeadline,
                                                         double perCandidateSeconds,
-                                                        const std::function<void()>& onWorkerThreadStart)
+                                                        const std::function<void()>& onWorkerThreadStart,
+                                                        const std::function<bool()>& shouldStopEarly = {})
 {
     // A batch of exactly one candidate is the common case (concurrency
     // hook absent/returning 1, i.e. the original behaviour) - skip the
@@ -1268,7 +1296,7 @@ inline std::vector<AttemptResult> attemptDesignBatch (const FilterSpec& spec, co
     {
         std::vector<AttemptResult> results;
         if (! candidateMs.empty())
-            results.push_back (attemptDesign (spec, candidateMs[0], overallDeadline, perCandidateSeconds));
+            results.push_back (attemptDesign (spec, candidateMs[0], overallDeadline, perCandidateSeconds, shouldStopEarly));
         return results;
     }
 
@@ -1276,11 +1304,11 @@ inline std::vector<AttemptResult> attemptDesignBatch (const FilterSpec& spec, co
     futures.reserve (candidateMs.size());
     for (int m : candidateMs)
     {
-        futures.push_back (std::async (std::launch::async, [&spec, m, overallDeadline, perCandidateSeconds, &onWorkerThreadStart] () -> AttemptResult
+        futures.push_back (std::async (std::launch::async, [&spec, m, overallDeadline, perCandidateSeconds, &onWorkerThreadStart, &shouldStopEarly] () -> AttemptResult
         {
             if (onWorkerThreadStart)
                 onWorkerThreadStart();
-            return attemptDesign (spec, m, overallDeadline, perCandidateSeconds);
+            return attemptDesign (spec, m, overallDeadline, perCandidateSeconds, shouldStopEarly);
         }));
     }
 
@@ -1456,7 +1484,7 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
         const bool stopRequestedThisRound = concurrency.shouldStopEarly && concurrency.shouldStopEarly();
         const auto roundDeadline = stopRequestedThisRound ? std::chrono::steady_clock::now() : deadline;
 
-        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart, concurrency.shouldStopEarly);
 
         bool stopSearch = false;
         for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
@@ -1829,7 +1857,7 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
         const bool stopRequestedThisRound = concurrency.shouldStopEarly && concurrency.shouldStopEarly();
         const auto roundDeadline = stopRequestedThisRound ? std::chrono::steady_clock::now() : deadline;
 
-        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart);
+        auto batchResults = detail::attemptDesignBatch (spec, candidateMs, roundDeadline, perCandidateSeconds, concurrency.onWorkerThreadStart, concurrency.shouldStopEarly);
 
         bool stopSearch = false;
         for (std::size_t candidateIdx = 0; candidateIdx < candidateMs.size(); ++candidateIdx)
