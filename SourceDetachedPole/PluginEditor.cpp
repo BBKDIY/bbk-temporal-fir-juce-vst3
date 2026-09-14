@@ -23,6 +23,21 @@ void prepareSlider (juce::Slider& slider)
     slider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 90, 22);
     slider.setColour (juce::Slider::trackColourId, juce::Colour (0xff4a90d9));
 }
+
+// Converts a percentage ratio (a Decay Threshold, or an R_peak reading)
+// into its dB equivalent - the same -20*log10(pct/100) formula used
+// throughout ParametricFIR.h::TemporalMetrics::tdr0dB, just shared here
+// for the handful of additional dB labels below (per-candidate/per-preset
+// row text, live interim search progress) that don't go through a
+// TemporalMetrics struct at all (a threshold setting) or only have the
+// raw percent, not a precomputed dB field (SearchProgressSnapshot's
+// bestRPeakPercent). Clamped the same way tdr0dB's own computation is, so
+// a degenerate 0% input reads as a very large (not infinite/NaN) dB
+// figure rather than breaking the display.
+double percentRatioToDb (double percent)
+{
+    return -20.0 * std::log10 (std::max (percent / 100.0, 1.0e-300));
+}
 }
 
 BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDetachedPoleAudioProcessor& p)
@@ -713,6 +728,21 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     {
         const auto progress = processor.getSearchProgressForUI();
 
+        // TDR-constrained optimization - see the member comments in
+        // PluginEditor.h. Once the TDR Constraint toggle is on, TDR0 (dB)
+        // is the metric actually being optimised toward, so it leads the
+        // interim best-so-far readout below too, not just the finished
+        // design's own metrics text - per direct request, so a live
+        // search's progress is legible in the same units as the result
+        // it's converging toward. Read directly from the parameter (not
+        // snap.optimizationMode) so this tracks the toggle live even
+        // while the search itself is still running for whatever spec was
+        // in flight when it started - same reasoning as
+        // decayThresholdDbLabel's own live read further below. Left
+        // exactly as before (R_peak% only) while the toggle is off, since
+        // TDR0 isn't the quantity being searched for in that mode.
+        const bool tdrModeActive = processor.getAPVTS().getRawParameterValue ("tdrConstraintOn")->load() > 0.5f;
+
         // currentTapCount is 0 before this search's very first onProgress
         // call has landed (see SearchProgressSnapshot's own comment) - clamp
         // rather than let that read as a negative fraction. Manual mode's
@@ -734,21 +764,29 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
                             << progress.attemptsSoFar << " candidate(s) tried so far";
         if (progress.haveBest && progress.bestIsFeasible)
         {
-            searchProgressText << ", best so far " << progress.bestTapCount << " taps, R_peak "
-                                << juce::String (progress.bestRPeakPercent, 2) << "%, achieved "
-                                << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
+            searchProgressText << ", best so far " << progress.bestTapCount << " taps, ";
+            if (tdrModeActive)
+                searchProgressText << "TDR0 " << juce::String (percentRatioToDb (progress.bestRPeakPercent), 2)
+                                    << " dB (R_peak " << juce::String (progress.bestRPeakPercent, 2) << "%)";
+            else
+                searchProgressText << "R_peak " << juce::String (progress.bestRPeakPercent, 2) << "%";
+            searchProgressText << ", achieved " << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
         }
         else if (progress.haveBest)
         {
             // Not yet compliant at any tap count tried so far, but not
             // nothing either - show the closest attempt's own numbers
-            // (R_peak here is informational only, not a compliance claim)
-            // so a long climb through infeasible tap counts still shows
-            // real, moving progress instead of going silent until the
-            // first fully compliant candidate finally turns up.
-            searchProgressText << ", closest so far (not yet compliant) " << progress.bestTapCount
-                                << " taps, R_peak " << juce::String (progress.bestRPeakPercent, 2)
-                                << "%, achieved " << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
+            // (R_peak/TDR0 here is informational only, not a compliance
+            // claim) so a long climb through infeasible tap counts still
+            // shows real, moving progress instead of going silent until
+            // the first fully compliant candidate finally turns up.
+            searchProgressText << ", closest so far (not yet compliant) " << progress.bestTapCount << " taps, ";
+            if (tdrModeActive)
+                searchProgressText << "TDR0 " << juce::String (percentRatioToDb (progress.bestRPeakPercent), 2)
+                                    << " dB (R_peak " << juce::String (progress.bestRPeakPercent, 2) << "%)";
+            else
+                searchProgressText << "R_peak " << juce::String (progress.bestRPeakPercent, 2) << "%";
+            searchProgressText << ", achieved " << juce::String (progress.bestAchievedStopbandDb, 2) << " dB)";
         }
         else
         {
@@ -777,10 +815,27 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             // top-N table's own rows (see the "Top Results" loop below) -
             // this is what the user asked for when they said the presets
             // showed only the parameters, not the FIR's own metrics.
-            const auto temporal = bbk::parametric::computeTemporalMetrics (info.taps, info.spec.sampleRateHz);
-            labelText << "\n      " << info.tapCount << " taps | R_peak "
-                      << juce::String (temporal.rPeakPercent, 2) << "% | T_0.1% "
-                      << juce::String (temporal.settlingMs, 3) << " ms | stopband "
+            // Threshold now taken from this preset's own saved spec (not
+            // the legacy fixed 0.1%), per direct request, so the settling
+            // figure below reflects whatever Decay Threshold this preset
+            // was actually saved under, comparable across slots at their
+            // own respective thresholds.
+            const auto temporal = bbk::parametric::computeTemporalMetrics (
+                info.taps, info.spec.sampleRateHz, info.spec.tdrDecayThresholdPercent);
+
+            // Leads with TDR0 (dB) instead of R_peak% only for a preset
+            // saved under TDR-constrained optimization - see this same
+            // branch in the "Top Results" loop below for the full
+            // rationale. A plain Rpeak-only preset keeps R_peak% leading,
+            // unchanged.
+            const bool tdrMode = (info.spec.optimizationMode == bbk::parametric::OptimizationMode::RpeakWithTdrConstraint);
+            labelText << "\n      " << info.tapCount << " taps | ";
+            if (tdrMode)
+                labelText << "TDR0 " << juce::String (temporal.tdr0dB, 2) << " dB";
+            else
+                labelText << "R_peak " << juce::String (temporal.rPeakPercent, 2) << "%";
+            labelText << " | T(" << juce::String (percentRatioToDb (info.spec.tdrDecayThresholdPercent), 1)
+                      << " dB) " << juce::String (temporal.tdecayUs, 2) << " us | stopband "
                       << juce::String (info.achievedStopbandDb, 1) << " dB";
         }
         else if (i == 0)
@@ -1003,13 +1058,35 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             continue;
 
         const auto& c = snap.topCandidates[static_cast<std::size_t> (i)];
-        const auto temporal = bbk::parametric::computeTemporalMetrics (c.taps, snap.sampleRateHz);
+
+        // Threshold now taken from the active spec's own Decay Threshold
+        // (not the legacy fixed 0.1%), per direct request, so all 5 rows
+        // are directly comparable to each other and to the main metrics
+        // readout above at the same threshold - see the preset-slot
+        // loop's identical change above for the full rationale.
+        const auto temporal = bbk::parametric::computeTemporalMetrics (
+            c.taps, snap.sampleRateHz, snap.tdrDecayThresholdPercent);
         const bool active = (i == snap.selectedIndex);
 
+        // Leads with TDR0 (dB) instead of R_peak% only once TDR-constrained
+        // optimization is the active mode - per direct request ("when in
+        // TDR search optimization... have this metric as leading, not
+        // Rpeak"), since that's the quantity these 5 candidates were
+        // actually ranked to maximise in that mode (R_peak ascending and
+        // TDR0 descending are the same ordering - see this ranking's own
+        // comment above - so nothing about WHICH 5 candidates appear or
+        // their order changes here, only which number leads the text).
+        // Plain Rpeak-only mode keeps R_peak% leading, unchanged.
+        const bool tdrMode = (snap.optimizationMode == bbk::parametric::OptimizationMode::RpeakWithTdrConstraint);
+
         juce::String rowText;
-        rowText << "#" << (i + 1) << (active ? " (ACTIVE) " : "  ")
-                << c.tapCount << " taps | R_peak " << juce::String (temporal.rPeakPercent, 2)
-                << "% | T_0.1% " << juce::String (temporal.settlingMs, 3) << " ms | stopband "
+        rowText << "#" << (i + 1) << (active ? " (ACTIVE) " : "  ") << c.tapCount << " taps | ";
+        if (tdrMode)
+            rowText << "TDR0 " << juce::String (temporal.tdr0dB, 2) << " dB";
+        else
+            rowText << "R_peak " << juce::String (temporal.rPeakPercent, 2) << "%";
+        rowText << " | T(" << juce::String (percentRatioToDb (snap.tdrDecayThresholdPercent), 1)
+                << " dB) " << juce::String (temporal.tdecayUs, 2) << " us | stopband "
                 << juce::String (c.achievedStopbandDb, 1) << " dB";
         rowLabel.setText (rowText, juce::dontSendNotification);
         rowLabel.setColour (juce::Label::textColourId, active ? juce::Colour (0xffd9a34a) : juce::Colours::white);
