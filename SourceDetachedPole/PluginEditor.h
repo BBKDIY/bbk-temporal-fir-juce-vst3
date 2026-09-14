@@ -65,6 +65,27 @@ private:
     juce::Label sidelobeDecayLabel;
     juce::Slider sidelobeDecaySlider;
 
+    // TDR-constrained optimization (see ParametricFIR.h::OptimizationMode/
+    // FilterSpec's own comments). tdrConstraintButton: off (default) is
+    // the existing Rpeak-only optimization, unchanged; on additionally
+    // requires the selected decay threshold to be reached by
+    // maxDecayTimeSlider below. decayThresholdSlider stays live (never
+    // greyed out) regardless of the toggle - it also controls what
+    // "Actual Tdecay" in the metrics readout is measured against for
+    // display, per direct request that both modes report the same
+    // figures on the same footing; decayThresholdDbLabel shows the live
+    // dB equivalent right next to it (TDR_dB = -20*log10(pct/100)),
+    // refreshed every timerCallback() tick, per direct request to display
+    // both units together. maxDecayTimeSlider only matters while the
+    // toggle is on, so it greys out the same way manualTapCountSlider
+    // does for Auto mode.
+    juce::ToggleButton tdrConstraintButton { "TDR Constraint" };
+    juce::Label decayThresholdLabel;
+    juce::Slider decayThresholdSlider;
+    juce::Label decayThresholdDbLabel;
+    juce::Label maxDecayTimeLabel;
+    juce::Slider maxDecayTimeSlider;
+
     // Manual/Auto tap-count selector - see "tapCountAuto"/"manualTapCount"
     // in PluginProcessor.cpp::createParameterLayout(). manualTapCountSlider
     // is greyed out (see timerCallback()) whenever tapCountAutoButton is
@@ -198,6 +219,9 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenuationAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> stopbandAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sidelobeDecayAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tdrConstraintAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> decayThresholdAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxDecayTimeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> manualTapCountAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tapCountAutoAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxSearchTimeAttachment;

@@ -134,6 +134,16 @@ inline std::vector<OverrideEntry> loadAll (const juce::File& file = getOverrideF
         e.spec.stopbandMode = static_cast<bbk::parametric::StopbandMode> (child->getIntAttribute ("stopbandMode"));
         e.spec.sidelobeDecayRatio = child->getDoubleAttribute ("sidelobeDecayRatio", 1.0);
 
+        // TDR-constrained optimization (see ParametricFIR.h::
+        // OptimizationMode/FilterSpec's own comments) - missing attributes
+        // (every file written before this mode existed) default to plain
+        // Rpeak mode with the metric's own long-standing 0.1% threshold,
+        // i.e. byte-identical behaviour to before this was added.
+        e.spec.optimizationMode = static_cast<bbk::parametric::OptimizationMode> (
+            child->getIntAttribute ("optimizationMode", 0));
+        e.spec.tdrDecayThresholdPercent = child->getDoubleAttribute ("tdrDecayThresholdPercent", 0.1);
+        e.spec.tdrMaxDecayTimeUs = child->getDoubleAttribute ("tdrMaxDecayTimeUs", 100.0);
+
         bool anyCandidateChild = false;
         for (auto* candidateChild : child->getChildIterator())
         {
@@ -239,6 +249,9 @@ inline bool saveAll (const std::vector<OverrideEntry>& entries, const juce::File
         child->setAttribute ("stopbandRejectionDb", e.spec.stopbandRejectionDb);
         child->setAttribute ("stopbandMode", static_cast<int> (e.spec.stopbandMode));
         child->setAttribute ("sidelobeDecayRatio", e.spec.sidelobeDecayRatio);
+        child->setAttribute ("optimizationMode", static_cast<int> (e.spec.optimizationMode));
+        child->setAttribute ("tdrDecayThresholdPercent", e.spec.tdrDecayThresholdPercent);
+        child->setAttribute ("tdrMaxDecayTimeUs", e.spec.tdrMaxDecayTimeUs);
         child->setAttribute ("activeIndex", e.activeIndex);
         child->setAttribute ("presetSlot", e.presetSlot);
 

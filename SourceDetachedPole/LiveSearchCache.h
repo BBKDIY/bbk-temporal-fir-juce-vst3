@@ -90,6 +90,15 @@ inline std::vector<CacheEntry> loadAll()
         e.spec.stopbandMode = static_cast<bbk::parametric::StopbandMode> (child->getIntAttribute ("stopbandMode"));
         e.spec.sidelobeDecayRatio = child->getDoubleAttribute ("sidelobeDecayRatio", 1.0);
 
+        // TDR-constrained optimization - see UserPresetOverrides.h::
+        // loadAll()'s identical fields for the full rationale (missing
+        // attributes default to plain Rpeak mode, byte-identical to
+        // before this was added).
+        e.spec.optimizationMode = static_cast<bbk::parametric::OptimizationMode> (
+            child->getIntAttribute ("optimizationMode", 0));
+        e.spec.tdrDecayThresholdPercent = child->getDoubleAttribute ("tdrDecayThresholdPercent", 0.1);
+        e.spec.tdrMaxDecayTimeUs = child->getDoubleAttribute ("tdrMaxDecayTimeUs", 100.0);
+
         bool anyCandidateChild = false;
         for (auto* candidateChild : child->getChildIterator())
         {
@@ -154,6 +163,9 @@ inline bool saveAll (const std::vector<CacheEntry>& entries)
         child->setAttribute ("stopbandRejectionDb", e.spec.stopbandRejectionDb);
         child->setAttribute ("stopbandMode", static_cast<int> (e.spec.stopbandMode));
         child->setAttribute ("sidelobeDecayRatio", e.spec.sidelobeDecayRatio);
+        child->setAttribute ("optimizationMode", static_cast<int> (e.spec.optimizationMode));
+        child->setAttribute ("tdrDecayThresholdPercent", e.spec.tdrDecayThresholdPercent);
+        child->setAttribute ("tdrMaxDecayTimeUs", e.spec.tdrMaxDecayTimeUs);
 
         for (auto& c : e.candidates)
         {

@@ -243,6 +243,31 @@ enum class StopbandMode
     FreeTransition  // opt-in: [cutoff, Nyquist] is one free transition zone, -stopbandRejectionDb only enforced in a narrow guard band right at Nyquist
 };
 
+// TDR-constrained optimization (added per direct request: "maximize
+// transient dynamic range subject to a maximum allowed decay time" - NOT
+// "minimize decay time by itself", see the request's own worked example:
+// TDR30 <= 100us). Both modes reuse the exact same rho-bisection in
+// tryRho/solveForStopEdge below unchanged - RpeakWithTdrConstraint does
+// NOT add a second search dimension of its own. It adds exactly one more
+// FIXED (non-bisected) set of LP rows on top of whatever rho/
+// sidelobeDecayRatio bound the bisection is already solving for: every
+// tap at or beyond ceil(tdrMaxDecayTimeUs*1e-6*sampleRateHz) samples from
+// the impulse centre is hard-capped at tdrDecayThresholdPercent of the
+// peak, REGARDLESS of the bisected rho. Since that extra bound doesn't
+// depend on rho at all, the bisection either still finds a feasible rho
+// (now possibly larger, i.e. worse Rpeak, than it would have been
+// unconstrained - the "spend the remaining degrees of freedom on Rpeak,
+// once decay is fast enough" trade-off this mode exists for) or the whole
+// M becomes infeasible and designParametricFIR's own M-search moves on to
+// a larger M exactly as it already does for any other infeasible
+// candidate - see tryRho's own comment for exactly where these rows are
+// added.
+enum class OptimizationMode
+{
+    Rpeak,                  // default: existing behaviour, byte-for-byte unchanged
+    RpeakWithTdrConstraint  // additionally requires TDRxx <= tdrMaxDecayTimeUs (see FilterSpec fields below)
+};
+
 struct FilterSpec
 {
     double sampleRateHz = 192000.0;
@@ -281,8 +306,43 @@ struct FilterSpec
     //   0.15:            R_peak 4.6%,  T_0.1% 10 samples (plateaus, no further gain)
     // Not monotonic and not a single "best" value for every spec/tap
     // count, which is why this is a live control rather than a fixed
-    // constant - see PluginEditor.
+    // constant - see PluginEditor. Left completely intact by
+    // OptimizationMode::RpeakWithTdrConstraint below - the TDR decay
+    // constraint is added ON TOP of whatever shape this already produces,
+    // never in place of it (see tryRho's own comment).
     double sidelobeDecayRatio = 1.0;
+
+    // optimizationMode selects between the two supported modes (see
+    // OptimizationMode's own comment above); the two fields below are read
+    // only when it is RpeakWithTdrConstraint, EXCEPT
+    // tdrDecayThresholdPercent, which is also used purely for DISPLAY
+    // regardless of mode - every finished design reports its actual
+    // measured decay time at this threshold (see
+    // TemporalMetrics::tdecaySamples/tdecayUs) so both modes can be
+    // compared on the same footing, per direct request.
+    OptimizationMode optimizationMode = OptimizationMode::Rpeak;
+
+    // Single canonical decay-threshold control, kept as percent per direct
+    // request (no separate independently-settable dB field) - range 0.1 to
+    // 5.0. Equivalent dB via TDR_dB = -20*log10(pct/100.0):
+    //   0.1%   = 60.00 dB
+    //   1.0%   = 40.00 dB
+    //   3.162% = 30.00 dB
+    //   5.0%   = 26.02 dB
+    // Default matches the metric's own long-standing hardcoded 0.1%
+    // ("T_0.1%" - see computeTemporalMetrics's own settlingSampleSpan/
+    // settlingMs, kept unchanged alongside this), so nothing displayed
+    // changes unless this is actually moved.
+    double tdrDecayThresholdPercent = 0.1;
+
+    // Only enforced when optimizationMode is RpeakWithTdrConstraint - see
+    // OptimizationMode's own comment for exactly how (a fixed extra LP
+    // bound applied in tryRho, not a second bisection) and for the "no
+    // main-lobe exception" behaviour requested directly: once a tap lies
+    // beyond this time from the impulse centre, it must obey
+    // tdrDecayThresholdPercent regardless of whether it would otherwise be
+    // classified as part of the (self-consistently re-derived) main lobe.
+    double tdrMaxDecayTimeUs = 100.0;
 };
 
 // The paper's own time-domain concentration metrics (Section 8.1),
@@ -328,9 +388,52 @@ struct TemporalMetrics
     int settlingSampleSpan = 0;
     double groupDelayMs = 0.0;
     double centerTapPercent = 0.0;
+
+    // Added for the TDR-constrained optimization request (see FilterSpec::
+    // optimizationMode/tdrDecayThresholdPercent/tdrMaxDecayTimeUs above) -
+    // see computeTemporalMetrics's own comment for exactly how these are
+    // derived. tdr0dB is the TRUE, unweighted transient dynamic range -
+    // -20*log10(rPeakPercent/100) computed directly from the actual
+    // largest sidelobe of the finished filter above, NOT from any
+    // internal weighted rho quantity - so it is meaningful and reported
+    // the same way regardless of which optimization mode or
+    // FilterSpec::sidelobeDecayRatio weighting actually produced this
+    // filter (the weighting changes what the optimizer SHAPES for, never
+    // what gets MEASURED and reported here), per direct request.
+    double tdr0dB = 0.0;
+
+    // Tdecay/TDRxx at whatever decayThresholdPercent was passed to
+    // computeTemporalMetrics (see FilterSpec::tdrDecayThresholdPercent,
+    // the caller-selected threshold) - the sample offset from the peak,
+    // and its time-domain equivalent, out to the LAST tap (either side)
+    // that still exceeds the threshold; 0 if every tap other than the
+    // peak itself is already at/under it. Distinct from the older,
+    // always-0.1%-fixed settlingSampleSpan/settlingMs above (left
+    // completely unchanged) - this pair tracks whatever threshold is
+    // actually currently selected, which may or may not be 0.1%.
+    int tdecaySamples = 0;
+    double tdecayUs = 0.0;
+
+    // Fixed diagnostic ladder, always computed regardless of
+    // decayThresholdPercent above, so the UI can always show all four
+    // alongside whatever threshold is actually selected (see the TDR-
+    // constrained optimization request's own reporting requirements).
+    double tdr30Us = 0.0;
+    double tdr40Us = 0.0;
+    double tdr50Us = 0.0;
+    double tdr60Us = 0.0;
 };
 
-inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, double sampleRateHz)
+// decayThresholdPercent (default 0.1, matching the long-standing hardcoded
+// T_0.1% threshold used by settlingSampleSpan/settlingMs below, so every
+// pre-existing caller that doesn't pass this explicitly sees byte-
+// identical tdecaySamples/tdecayUs to before) selects which threshold
+// tdecaySamples/tdecayUs above are measured against - see FilterSpec::
+// tdrDecayThresholdPercent, the live caller-selected value every real call
+// site now passes. tdr30Us/tdr40Us/tdr50Us/tdr60Us are always computed at
+// their own fixed thresholds regardless of this parameter.
+inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, double sampleRateHz,
+                                                double decayThresholdPercent = 0.1)
 {
     TemporalMetrics m;
     const int n = static_cast<int> (taps.size());
@@ -399,6 +502,50 @@ inline TemporalMetrics computeTemporalMetrics (const std::vector<double>& taps, 
     const int M = (n - 1) / 2;
     m.groupDelayMs = (sampleRateHz > 0.0) ? (static_cast<double> (M) / sampleRateHz) * 1000.0 : 0.0;
 
+    // See TemporalMetrics::tdr0dB's own comment: the TRUE, unweighted
+    // transient dynamic range, computed straight from rPeakPercent above
+    // (the actual largest sidelobe of THIS finished filter), never from a
+    // weighted internal rho. Floored well above 0 before the log so a
+    // (never actually reachable in practice) exact-zero rPeakPercent
+    // reports a large but finite number instead of +inf/NaN.
+    m.tdr0dB = -20.0 * std::log10 (std::max (m.rPeakPercent / 100.0, 1.0e-300));
+
+    // Shared by tdecaySamples/tdecayUs above and the fixed TDR30/40/50/60
+    // diagnostic ladder below: the sample offset from the array's own peak
+    // out to the LAST tap (either side) whose absolute value still
+    // exceeds thresholdRatio*peakAbs - the request's own definition (do
+    // NOT use the first crossing; a tap sitting exactly ON the threshold
+    // counts as compliant, i.e. strict '>', same convention as the
+    // existing T_0.1% scan above). 0 means every tap other than the peak
+    // itself is already at/under the threshold.
+    auto decayBoundarySamples = [&] (double thresholdRatio) -> int
+    {
+        const double thr = thresholdRatio * peakAbs;
+        int farthest = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            if (std::fabs (taps[static_cast<std::size_t> (i)]) > thr)
+            {
+                const int dist = std::abs (i - peakIdx);
+                if (dist > farthest) farthest = dist;
+            }
+        }
+        return farthest;
+    };
+
+    const double usPerSample = (sampleRateHz > 0.0) ? (1.0e6 / sampleRateHz) : 0.0;
+
+    m.tdecaySamples = decayBoundarySamples (decayThresholdPercent / 100.0);
+    m.tdecayUs = static_cast<double> (m.tdecaySamples) * usPerSample;
+
+    // Fixed diagnostic points - 10^(-dB/20) worked out directly, matching
+    // the request's own reference table (TDR30=3.162%, TDR40=1%,
+    // TDR50=0.316228%, TDR60=0.1%).
+    m.tdr30Us = static_cast<double> (decayBoundarySamples (0.0316227766016838)) * usPerSample;
+    m.tdr40Us = static_cast<double> (decayBoundarySamples (0.01))               * usPerSample;
+    m.tdr50Us = static_cast<double> (decayBoundarySamples (0.0031622776601684)) * usPerSample;
+    m.tdr60Us = static_cast<double> (decayBoundarySamples (0.001))              * usPerSample;
+
     return m;
 }
 
@@ -455,6 +602,14 @@ struct DesignResult
     // function, so callers should treat an empty list as "just use the
     // top-level fields above", not as an error.
     std::vector<RankedCandidate> topCandidates;
+
+    // See AttemptResult::tdrIntrudesMainLobe's own comment - carried up
+    // from whichever attempt this result's taps/tapCount/etc above came
+    // from (best.tdrIntrudesMainLobe in both designParametricFIR() and
+    // designParametricFIRFixedM()). Always false when
+    // FilterSpec::optimizationMode is plain Rpeak, since the TDR
+    // constraint (and therefore this diagnostic) is never active then.
+    bool tdrIntrudesMainLobe = false;
 };
 
 namespace detail
@@ -689,6 +844,18 @@ struct AttemptResult
     // silently on the user's behalf.
     double rPeakPercent = 1.0e300;
     int settlingSampleSpan = INT_MAX;
+
+    // Diagnostic only, for OptimizationMode::RpeakWithTdrConstraint (see
+    // FilterSpec's own comment) - true when tdrMaxDecayTimeUs's boundary
+    // fell inside the self-consistent main lobe, meaning the TDR
+    // constraint had to squeeze the main lobe itself, not just the
+    // sidelobe region, to satisfy it. Set in solveForStopEdge; defaulted
+    // false here so every pre-existing aggregate-init return site (which
+    // never mentions this trailing field) is unaffected. Never weakens the
+    // constraint by itself - see tryRho's own comment - it only flags that
+    // this happened, per direct request ("issue a diagnostic warning...
+    // but do not silently weaken the constraint").
+    bool tdrIntrudesMainLobe = false;
 };
 
 // attemptDesign now sweeps several stopband-edge candidates per M (see
@@ -726,6 +893,22 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
     const double nyquist = Fs / 2.0;
     const double eps = std::pow (10.0, -spec.stopbandRejectionDb / 20.0);
     const double gainFloor = std::pow (10.0, -spec.attenuationAtCutoffDb / 20.0);
+
+    // TDR-constrained optimization mode (see FilterSpec::optimizationMode/
+    // tdrDecayThresholdPercent/tdrMaxDecayTimeUs and OptimizationMode's own
+    // comment) - computed once here, not per bisection trial, since none
+    // of the three depend on the trial rho or on stopEdge. tdrNmax is the
+    // request's own "boundary_samples = MaximumDecayTime*1e-6*Fs" ceil'd
+    // up ("conservatively enforce... from the first sample whose time
+    // offset is >= Tmax", i.e. round up, never down, so a tap even
+    // fractionally inside the allowed window is never wrongly forced to
+    // comply early). See tryRho below for exactly where this is applied -
+    // a fixed extra LP bound, not a second bisection.
+    const bool applyTdrConstraint = (spec.optimizationMode == OptimizationMode::RpeakWithTdrConstraint);
+    const double tdrThresholdRatio = spec.tdrDecayThresholdPercent / 100.0;
+    const int tdrNmax = applyTdrConstraint
+        ? static_cast<int> (std::ceil (spec.tdrMaxDecayTimeUs * 1.0e-6 * spec.sampleRateHz))
+        : INT_MAX;
 
     // Sparse starting grids, refined by dense-verify-and-inject inside
     // solveForStopEdge below (each LP solve costs real time, unlike the
@@ -902,6 +1085,46 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
                 A.push_back (up); b.push_back (c0 - ci);             // a[i] - a[0] <= 0
                 A.push_back (lo); b.push_back (c0 + ci);             // -a[i] - a[0] <= 0
             }
+
+            // TDR-constrained optimization mode only (see FilterSpec::
+            // optimizationMode/tdrMaxDecayTimeUs/tdrDecayThresholdPercent
+            // and OptimizationMode's own top-of-file comment): one more
+            // FIXED bound, using the constant tdrThresholdRatio in place
+            // of the bisected rho above - NOT a second bisection variable,
+            // just extra static rows added to every trial's LP alongside
+            // the sidelobe/peak-dominance rows just above, which is why
+            // this mode reuses the exact same rho-bisection loop unchanged
+            // rather than searching over anything of its own.
+            //
+            // Applies to every tap at or beyond tdrNmax samples from the
+            // centre REGARDLESS of whether it sits inside the main lobe
+            // (i < mainLobeStart, normally only bound at rho=1 by the
+            // peak-dominance loop just above) or outside it (i >=
+            // mainLobeStart, normally bound by the bisected rho loop
+            // above) - per direct request ("no main-lobe exception after
+            // the selected time"): the constraint is strictly about
+            // absolute time from the impulse centre, not about which
+            // shaping region a tap happens to fall in. When tdrNmax is
+            // itself inside the main lobe, this SQUEEZES the main lobe
+            // (see tdrIntrudesMainLobe below, which only flags that this
+            // happened - it never skips or loosens this loop because of
+            // it, per "do not silently weaken the constraint").
+            if (applyTdrConstraint)
+            {
+                for (int i = std::max (1, tdrNmax); i <= M; ++i)
+                {
+                    std::vector<double> zi; double ci;
+                    indexToLinear (i, zi, ci);
+                    std::vector<double> up (zi.size()), lo (zi.size());
+                    for (std::size_t k = 0; k < zi.size(); ++k)
+                    {
+                        up[k] = zi[k] - tdrThresholdRatio * z0[k];
+                        lo[k] = -zi[k] - tdrThresholdRatio * z0[k];
+                    }
+                    A.push_back (up); b.push_back (tdrThresholdRatio * c0 - ci);  // a[i] - thresholdRatio*a[0] <= 0
+                    A.push_back (lo); b.push_back (tdrThresholdRatio * c0 + ci);  // -a[i] - thresholdRatio*a[0] <= 0
+                }
+            }
         }
         // The safety-net deadline passed here is the FULL overallDeadline
         // (the whole M-search's budget, e.g. 90s in the test file or 180s
@@ -966,6 +1189,12 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // looking for a properly-shaped design at another tap count
         // instead of silently accepting whatever the fallback produced.
         bool sidelobeBisectionSucceeded = false;
+
+        // See AttemptResult::tdrIntrudesMainLobe's own comment - set just
+        // before the final return below, from the self-consistently
+        // settled mainLobeStart, once everFeasible is known. Diagnostic
+        // only; never changes what tryRho actually enforces.
+        bool tdrIntrudesMainLobe = false;
 
         // Per-candidate deadline. A prior experiment raising this (or
         // floating it up to whatever remained of overallDeadline) was
@@ -1159,7 +1388,16 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
             fullTaps[static_cast<std::size_t> (M - m)] = a[static_cast<std::size_t> (m)];
             fullTaps[static_cast<std::size_t> (M + m)] = a[static_cast<std::size_t> (m)];
         }
-        const auto fullMetrics = computeTemporalMetrics (fullTaps, Fs);
+        const auto fullMetrics = computeTemporalMetrics (fullTaps, Fs, spec.tdrDecayThresholdPercent);
+
+        // See AttemptResult::tdrIntrudesMainLobe's own comment - checked
+        // here, once, from the self-consistently settled mainLobeStart
+        // (the grid-refinement loop above has already converged or run out
+        // of rounds/time by this point) rather than inside every
+        // bisection trial, since it's purely diagnostic and doesn't affect
+        // what tryRho enforces (see its own TDR-row comment).
+        if (applyTdrConstraint && tdrNmax < mainLobeStart)
+            tdrIntrudesMainLobe = true;
 
         // sidelobeBisectionSucceeded is required alongside spectral
         // compliance (see its own comment above): without it, "feasible"
@@ -1173,7 +1411,7 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
         // actually completed, rather than accepting whatever shape the
         // fallback happened to produce.
         const bool feasible = sidelobeBisectionSucceeded && sbCompliant && pbCompliant;
-        return { a, feasible, worstStopbandDb, fullMetrics.rPeakPercent, fullMetrics.settlingSampleSpan };
+        return { a, feasible, worstStopbandDb, fullMetrics.rPeakPercent, fullMetrics.settlingSampleSpan, tdrIntrudesMainLobe };
     };
 
     double totalAvailable = nyquist - fc;
@@ -1635,7 +1873,8 @@ inline DesignResult designParametricFIR (const FilterSpec& spec, int maxTapCount
     result.tapCount = static_cast<int> (taps.size());
     result.constraintsMet = foundFeasible;
     result.achievedStopbandDb = best.worstStopbandDb;
-    result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz);
+    result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
+    result.tdrIntrudesMainLobe = best.tdrIntrudesMainLobe;
 
     // See DesignResult::topCandidates's own comment: topCandidates[0]
     // always matches the top-level fields set just above exactly, since
@@ -1934,7 +2173,8 @@ inline DesignResult designParametricFIRFixedM (const FilterSpec& spec, int tapCo
     result.tapCount = N;
     result.constraintsMet = foundFeasible;
     result.achievedStopbandDb = best.worstStopbandDb;
-    result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz);
+    result.temporal = computeTemporalMetrics (taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
+    result.tdrIntrudesMainLobe = best.tdrIntrudesMainLobe;
     return result;
 }
 

@@ -200,6 +200,18 @@ public:
         double stopbandRejectionDb = 0.0;
         bbk::parametric::StopbandMode stopbandMode = bbk::parametric::StopbandMode::FlatMask;
         double sidelobeDecayRatio = 1.0;
+
+        // TDR-constrained optimization (see ParametricFIR.h::
+        // OptimizationMode/FilterSpec's own comments). optimizationMode/
+        // tdrDecayThresholdPercent/tdrMaxDecayTimeUs mirror the spec this
+        // design was actually run for; tdrIntrudesMainLobe is carried up
+        // from DesignResult::tdrIntrudesMainLobe (diagnostic only - see
+        // its own comment).
+        bbk::parametric::OptimizationMode optimizationMode = bbk::parametric::OptimizationMode::Rpeak;
+        double tdrDecayThresholdPercent = 0.1;
+        double tdrMaxDecayTimeUs = 100.0;
+        bool tdrIntrudesMainLobe = false;
+
         bool amplitudeRelaxationOn = true;
         int tapCount = 0;
         double achievedStopbandDb = 0.0;

@@ -90,7 +90,10 @@ namespace
             && a.attenuationAtCutoffDb == b.attenuationAtCutoffDb
             && a.stopbandRejectionDb == b.stopbandRejectionDb
             && a.stopbandMode == b.stopbandMode
-            && a.sidelobeDecayRatio == b.sidelobeDecayRatio;
+            && a.sidelobeDecayRatio == b.sidelobeDecayRatio
+            && a.optimizationMode == b.optimizationMode
+            && a.tdrDecayThresholdPercent == b.tdrDecayThresholdPercent
+            && a.tdrMaxDecayTimeUs == b.tdrMaxDecayTimeUs;
     }
 
     // Combines a just-finished search's own top-N candidates with whatever
@@ -185,6 +188,9 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("stopband", &paramListener);
     parameters.addParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.addParameterListener ("sidelobeDecay", &paramListener);
+    parameters.addParameterListener ("tdrConstraintOn", &paramListener);
+    parameters.addParameterListener ("decayThreshold", &paramListener);
+    parameters.addParameterListener ("maxDecayTimeUs", &paramListener);
     parameters.addParameterListener ("tapCountAuto", &paramListener);
     parameters.addParameterListener ("manualTapCount", &paramListener);
 
@@ -219,6 +225,9 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("stopband", &paramListener);
     parameters.removeParameterListener ("amplitudeRelaxation", &paramListener);
     parameters.removeParameterListener ("sidelobeDecay", &paramListener);
+    parameters.removeParameterListener ("tdrConstraintOn", &paramListener);
+    parameters.removeParameterListener ("decayThreshold", &paramListener);
+    parameters.removeParameterListener ("maxDecayTimeUs", &paramListener);
     parameters.removeParameterListener ("tapCountAuto", &paramListener);
     parameters.removeParameterListener ("manualTapCount", &paramListener);
 
@@ -284,6 +293,51 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::ParameterID { "sidelobeDecay", 1 }, "Sidelobe Decay",
         juce::NormalisableRange<float> (0.02f, 1.0f, 0.001f, 0.5f),
         1.0f));
+
+    // TDR-constrained optimization (see ParametricFIR.h::OptimizationMode/
+    // FilterSpec's own comments) - "at least two" modes per direct
+    // request, and a plain on/off toggle is exactly that: off (default) is
+    // the existing Rpeak-only optimization, completely unchanged; on adds
+    // the fixed TDR decay-time constraint described below ON TOP of it,
+    // reusing the exact same rho-bisection engine.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "tdrConstraintOn", 1 },
+        "TDR Constraint",
+        false));
+
+    // Decay Threshold (%) - kept as a single canonical percent control per
+    // direct request (no separate independently-settable dB field; the
+    // editor computes and displays the equivalent dB live - see
+    // PluginEditor.cpp). Used both as the amplitude bound for the TDR
+    // constraint when tdrConstraintOn above is on, and purely for DISPLAY
+    // regardless of that toggle - every finished design reports its
+    // actual measured decay time at this threshold (see
+    // ParametricFIR.h::TemporalMetrics::tdecaySamples/tdecayUs), so the
+    // two modes stay directly comparable. Range 0.1 to 5.0 per direct
+    // request (0.1%=60dB ... 5.0%=26.02dB); default 0.1 matches the
+    // metric's own long-standing hardcoded "T_0.1%" so nothing displayed
+    // changes for an existing user until this is actually moved.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "decayThreshold", 1 }, "Decay Threshold",
+        juce::NormalisableRange<float> (0.1f, 5.0f, 0.01f),
+        0.1f,
+        juce::AudioParameterFloatAttributes().withLabel ("%")));
+
+    // Maximum Decay Time (us) - only enforced while tdrConstraintOn above
+    // is on (see ParametricFIR.h::FilterSpec::tdrMaxDecayTimeUs's own
+    // comment for exactly how). Range chosen to stay meaningful across the
+    // plugin's whole supported sample-rate/tap-count span: at 44.1 kHz the
+    // maximum 161-tap design's own half-length (80 samples) already spans
+    // ~1814us, so the ceiling here is set comfortably below that rather
+    // than allowing a value so large the constraint could never bind at
+    // any tap count. 1us floor keeps this from ever landing on a literal
+    // zero. Default 100 matches the request's own first validation case
+    // (TDR30 <= 100us).
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "maxDecayTimeUs", 1 }, "Maximum Decay Time",
+        juce::NormalisableRange<float> (1.0f, 2000.0f, 1.0f),
+        100.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("us")));
 
     // See the anonymous namespace above process() for the full rationale:
     // the measured worst-case peak gain here ranges from about +0.6 dB
@@ -433,6 +487,14 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
     spec.stopbandMode = bbk::parametric::StopbandMode::FreeTransition;
 
     spec.sidelobeDecayRatio = static_cast<double> (parameters.getRawParameterValue ("sidelobeDecay")->load());
+
+    // See ParametricFIR.h::OptimizationMode/FilterSpec's own comments.
+    spec.optimizationMode = (parameters.getRawParameterValue ("tdrConstraintOn")->load() > 0.5f)
+        ? bbk::parametric::OptimizationMode::RpeakWithTdrConstraint
+        : bbk::parametric::OptimizationMode::Rpeak;
+    spec.tdrDecayThresholdPercent = static_cast<double> (parameters.getRawParameterValue ("decayThreshold")->load());
+    spec.tdrMaxDecayTimeUs = static_cast<double> (parameters.getRawParameterValue ("maxDecayTimeUs")->load());
+
     return spec;
 }
 
@@ -458,6 +520,9 @@ void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
         spec.stopbandRejectionDb = uiSnapshot.stopbandRejectionDb;
         spec.stopbandMode = uiSnapshot.stopbandMode;
         spec.sidelobeDecayRatio = uiSnapshot.sidelobeDecayRatio;
+        spec.optimizationMode = uiSnapshot.optimizationMode;
+        spec.tdrDecayThresholdPercent = uiSnapshot.tdrDecayThresholdPercent;
+        spec.tdrMaxDecayTimeUs = uiSnapshot.tdrMaxDecayTimeUs;
         source = uiSnapshot.source;
 
         const auto& chosen = uiSnapshot.topCandidates[static_cast<std::size_t> (index)];
@@ -466,7 +531,7 @@ void BBKDetachedPoleAudioProcessor::selectTopCandidate (int index)
         result.constraintsMet = true;
         result.achievedStopbandDb = chosen.achievedStopbandDb;
         result.designAttempts = uiSnapshot.designAttempts;
-        result.temporal = bbk::parametric::computeTemporalMetrics (chosen.taps, spec.sampleRateHz);
+        result.temporal = bbk::parametric::computeTemporalMetrics (chosen.taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
         result.topCandidates = uiSnapshot.topCandidates; // keep the full list around for the next switch
     }
 
@@ -496,6 +561,9 @@ namespace
         entry.spec.stopbandRejectionDb = snap.stopbandRejectionDb;
         entry.spec.stopbandMode = snap.stopbandMode;
         entry.spec.sidelobeDecayRatio = snap.sidelobeDecayRatio;
+        entry.spec.optimizationMode = snap.optimizationMode;
+        entry.spec.tdrDecayThresholdPercent = snap.tdrDecayThresholdPercent;
+        entry.spec.tdrMaxDecayTimeUs = snap.tdrMaxDecayTimeUs;
 
         // Saves the WHOLE ranked list (see DesignSnapshot::topCandidates),
         // not just the one candidate the user picked - see OverrideEntry::
@@ -596,7 +664,7 @@ void BBKDetachedPoleAudioProcessor::saveTopCandidateAsOverride (int index)
     result.constraintsMet = true;
     result.achievedStopbandDb = active.achievedStopbandDb;
     result.designAttempts = 0;
-    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz);
+    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz, entry.spec.tdrDecayThresholdPercent);
     result.topCandidates = entry.candidates;
 
     publishResult (entry.spec, result, ResultSource::UserOverride, entry.activeIndex);
@@ -716,7 +784,7 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
         result.constraintsMet = true;
         result.achievedStopbandDb = active.achievedStopbandDb;
         result.designAttempts = 0;
-        result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, targetEntry.spec.sampleRateHz);
+        result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, targetEntry.spec.sampleRateHz, targetEntry.spec.tdrDecayThresholdPercent);
         result.topCandidates = targetEntry.candidates;
 
         publishResult (targetEntry.spec, result, ResultSource::UserOverride, targetEntry.activeIndex);
@@ -785,7 +853,7 @@ void BBKDetachedPoleAudioProcessor::savePresetSlot (int slot)
     result.constraintsMet = true;
     result.achievedStopbandDb = active.achievedStopbandDb;
     result.designAttempts = 0;
-    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz);
+    result.temporal = bbk::parametric::computeTemporalMetrics (result.taps, entry.spec.sampleRateHz, entry.spec.tdrDecayThresholdPercent);
     result.topCandidates = entry.candidates;
 
     publishResult (entry.spec, result, ResultSource::UserOverride, entry.activeIndex);
@@ -927,10 +995,20 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
     // correctly find no entry and fall back to a live design below, rather
     // than silently returning some unrelated preset. This is also what
     // backs an unassigned Preset 1's fallback - see loadPresetSlot().
+    // Also requires plain Rpeak mode: the compiled-in bank was generated
+    // entirely under the original Rpeak-only optimization, long before the
+    // TDR-constrained mode existed, so none of its entries respect any
+    // TDR decay-time constraint at all. Without this, a spec that happens
+    // to land exactly on the bank's fixed cutoff/stopband/decay point
+    // WHILE TDR Constraint is on would wrongly serve a stale bank filter
+    // that never actually satisfies the user's own selected constraint -
+    // gating on optimizationMode here instead correctly falls through to
+    // a live (or cached/override) TDR-aware search below.
     const bool atPresetOperatingPoint = ! manualTapCountOn
         && spec.cutoffHz == bbk::detachedpole::presetbank::presetCutoffHz
         && spec.stopbandRejectionDb == bbk::detachedpole::presetbank::presetStopbandRejectionDb
-        && spec.sidelobeDecayRatio == bbk::detachedpole::presetbank::presetSidelobeDecayRatio;
+        && spec.sidelobeDecayRatio == bbk::detachedpole::presetbank::presetSidelobeDecayRatio
+        && spec.optimizationMode == bbk::parametric::OptimizationMode::Rpeak;
     const auto* presetEntry = atPresetOperatingPoint
         ? bbk::detachedpole::presetbank::findEntry (spec.sampleRateHz, spec.attenuationAtCutoffDb)
         : nullptr;
@@ -1041,7 +1119,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
             instantResult.constraintsMet = true;
             instantResult.achievedStopbandDb = active.achievedStopbandDb;
             instantResult.designAttempts = 0;
-            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
             instantResult.topCandidates = overrideEntry->candidates;
         }
         else if (presetEntry != nullptr)
@@ -1053,7 +1131,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
             instantResult.constraintsMet = true;
             instantResult.achievedStopbandDb = presetEntry->achievedStopbandDb;
             instantResult.designAttempts = 0;
-            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+            instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
         }
         else
         {
@@ -1098,7 +1176,7 @@ void BBKDetachedPoleAudioProcessor::requestBoundaryRedesign()
                 instantResult.constraintsMet = true;
                 instantResult.achievedStopbandDb = top.achievedStopbandDb;
                 instantResult.designAttempts = 0;
-                instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz);
+                instantResult.temporal = bbk::parametric::computeTemporalMetrics (instantResult.taps, spec.sampleRateHz, spec.tdrDecayThresholdPercent);
                 instantResult.topCandidates = cacheEntry->candidates;
             }
             else
@@ -1176,6 +1254,10 @@ void BBKDetachedPoleAudioProcessor::publishResult (const bbk::parametric::Filter
         uiSnapshot.stopbandRejectionDb = spec.stopbandRejectionDb;
         uiSnapshot.stopbandMode = spec.stopbandMode;
         uiSnapshot.sidelobeDecayRatio = spec.sidelobeDecayRatio;
+        uiSnapshot.optimizationMode = spec.optimizationMode;
+        uiSnapshot.tdrDecayThresholdPercent = spec.tdrDecayThresholdPercent;
+        uiSnapshot.tdrMaxDecayTimeUs = spec.tdrMaxDecayTimeUs;
+        uiSnapshot.tdrIntrudesMainLobe = result.tdrIntrudesMainLobe;
         uiSnapshot.amplitudeRelaxationOn = parameters.getRawParameterValue ("amplitudeRelaxation")->load() > 0.5f;
         uiSnapshot.tapCount = result.tapCount;
         uiSnapshot.achievedStopbandDb = result.achievedStopbandDb;
@@ -1546,7 +1628,7 @@ void BBKDetachedPoleAudioProcessor::run()
                 result.taps = winner.taps;
                 result.tapCount = winner.tapCount;
                 result.achievedStopbandDb = winner.achievedStopbandDb;
-                result.temporal = bbk::parametric::computeTemporalMetrics (winner.taps, entry.spec.sampleRateHz);
+                result.temporal = bbk::parametric::computeTemporalMetrics (winner.taps, entry.spec.sampleRateHz, entry.spec.tdrDecayThresholdPercent);
             }
         }
 

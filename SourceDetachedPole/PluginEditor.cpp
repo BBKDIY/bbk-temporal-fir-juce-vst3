@@ -1,5 +1,12 @@
 #include "PluginEditor.h"
 
+// For the live Decay Threshold (%) -> dB conversion in timerCallback()
+// below (std::log10/std::max) - not strictly needed given ParametricFIR.h
+// already pulls these in transitively, but included directly rather than
+// relying on that.
+#include <algorithm>
+#include <cmath>
+
 namespace
 {
 void prepareLabel (juce::Label& label, float size = 14.0f, bool bold = false,
@@ -107,6 +114,39 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     content.addAndMakeVisible (sidelobeDecaySlider);
     sidelobeDecayAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "sidelobeDecay", sidelobeDecaySlider);
+
+    // TDR-constrained optimization - see the member comments in
+    // PluginEditor.h and ParametricFIR.h::OptimizationMode/FilterSpec's
+    // own comments. Off by default: the existing Rpeak-only optimization,
+    // completely unchanged.
+    tdrConstraintButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    content.addAndMakeVisible (tdrConstraintButton);
+    tdrConstraintAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "tdrConstraintOn", tdrConstraintButton);
+
+    prepareLabel (decayThresholdLabel, 13.0f, false, juce::Justification::centredLeft);
+    decayThresholdLabel.setText ("Decay Threshold", juce::dontSendNotification);
+    content.addAndMakeVisible (decayThresholdLabel);
+    prepareSlider (decayThresholdSlider);
+    decayThresholdSlider.setNumDecimalPlacesToDisplay (2);
+    content.addAndMakeVisible (decayThresholdSlider);
+    decayThresholdAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "decayThreshold", decayThresholdSlider);
+
+    // Live dB equivalent right next to the percent slider (TDR_dB =
+    // -20*log10(pct/100)) - refreshed every timerCallback() tick, per
+    // direct request to display both units together rather than only one.
+    prepareLabel (decayThresholdDbLabel, 12.0f, false, juce::Justification::centredLeft);
+    content.addAndMakeVisible (decayThresholdDbLabel);
+
+    prepareLabel (maxDecayTimeLabel, 13.0f, false, juce::Justification::centredLeft);
+    maxDecayTimeLabel.setText ("Maximum Decay Time (us)", juce::dontSendNotification);
+    content.addAndMakeVisible (maxDecayTimeLabel);
+    prepareSlider (maxDecayTimeSlider);
+    maxDecayTimeSlider.setNumDecimalPlacesToDisplay (0);
+    content.addAndMakeVisible (maxDecayTimeSlider);
+    maxDecayTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "maxDecayTimeUs", maxDecayTimeSlider);
 
     // Manual/Auto tap-count selector - greying handled in timerCallback()
     // (needs to track the parameter live, e.g. host automation of
@@ -358,22 +398,26 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     content.addChildComponent (coefficientsBox);
 
     // contentHeight is the sum of every fixed row/gap laid out in
-    // layOutContent() below (currently ~1294, including the 20px top/bottom
+    // layOutContent() below (currently ~1468, including the 20px top/bottom
     // margins baked into that method's own area.reduced(20), the 5
     // preset-slot rows - each 40px tall rather than a plain single-line 24px
     // row, since an occupied slot's label now shows a second line of the
     // FIR's own metrics below its spec summary, see timerCallback() - the
-    // Export/Import row added below the top-N table, and the 30px
-    // searchProgressBar row above metricsReadout, see its own comment in
-    // PluginEditor.h) plus a fixed allowance for the coefficients box - it
-    // has its own internal scrollbar (see setScrollbarsShown() above), so
-    // it doesn't need much outer space to still be fully usable. This is
+    // Export/Import row added below the top-N table, the 30px
+    // searchProgressBar row above metricsReadout (see its own comment in
+    // PluginEditor.h), the three TDR-constrained-optimization control rows
+    // (tdrConstraintButton/decayThresholdSlider/maxDecayTimeSlider, ~94px
+    // together - see their own comments in PluginEditor.h), and
+    // metricsReadout's own 380->460px bump for the extra TDR reporting
+    // lines) plus a fixed allowance for the coefficients box - it has its
+    // own internal scrollbar (see setScrollbarsShown() above), so it
+    // doesn't need much outer space to still be fully usable. This is
     // content's own, possibly-tall size; it is NOT the window size - see
     // viewport's own comment in PluginEditor.h and setSize() just below for
     // why those are now deliberately different.
     constexpr int contentWidth = 680;
     constexpr int coefficientsBoxHeight = 260;
-    constexpr int contentHeight = 1294 + 40 + coefficientsBoxHeight;
+    constexpr int contentHeight = 1468 + 40 + coefficientsBoxHeight;
     content.setSize (contentWidth, contentHeight);
     layOutContent();
 
@@ -447,6 +491,28 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     sliderRow (stopbandLabel, stopbandSlider);
     sliderRow (sidelobeDecayLabel, sidelobeDecaySlider);
 
+    tdrConstraintButton.setBounds (area.removeFromTop (24));
+    area.removeFromTop (6);
+
+    {
+        // decayThresholdDbLabel sits right of the slider's own text box,
+        // in the same row - see its own comment in PluginEditor.h for why
+        // this shows both units side by side rather than one or the other.
+        auto row = area.removeFromTop (26);
+        decayThresholdLabel.setBounds (row.removeFromLeft (170));
+        decayThresholdSlider.setBounds (row.removeFromLeft (200));
+        row.removeFromLeft (10);
+        decayThresholdDbLabel.setBounds (row);
+    }
+    area.removeFromTop (6);
+
+    {
+        auto row = area.removeFromTop (26);
+        maxDecayTimeLabel.setBounds (row.removeFromLeft (170));
+        maxDecayTimeSlider.setBounds (row);
+    }
+    area.removeFromTop (6);
+
     {
         auto row = area.removeFromTop (26);
         manualTapCountLabel.setBounds (row.removeFromLeft (170));
@@ -491,15 +557,18 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
     searchProgressBar.setBounds (area.removeFromTop (22));
     area.removeFromTop (8);
 
-    // Sized generously (up from 215) for the metrics text's actual worst-
-    // case line count: the "Design method"/"Stopband mode"/"Center-tap
-    // gain" lines alone wrap to 2-3 lines each at this width, plus the
-    // live search-progress addendum (see timerCallback()) adds up to 2
-    // more while a search is running - undersizing this clipped real
-    // content, reported directly ("the central part with the text is not
-    // big enough to show full text"). Content (not the window itself - see
-    // the constructor's own contentHeight comment) is sized to fit this.
-    metricsReadout.setBounds (area.removeFromTop (380));
+    // Sized generously (up from 215, then 380) for the metrics text's
+    // actual worst-case line count: the "Design method"/"Stopband mode"/
+    // "Center-tap gain" lines alone wrap to 2-3 lines each at this width,
+    // plus the live search-progress addendum (see timerCallback()) adds up
+    // to 2 more while a search is running, plus the TDR-constrained
+    // optimization block (TDR0/threshold/actual Tdecay/TDR30-60 ladder/
+    // PASS-FAIL/main-lobe-intrusion warning - see timerCallback()) adds up
+    // to 5 more - undersizing this clipped real content, reported directly
+    // ("the central part with the text is not big enough to show full
+    // text"). Content (not the window itself - see the constructor's own
+    // contentHeight comment) is sized to fit this.
+    metricsReadout.setBounds (area.removeFromTop (460));
 
     area.removeFromTop (10);
     topCandidatesHeader.setBounds (area.removeFromTop (20));
@@ -770,6 +839,27 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
     const bool tapCountAutoOn = processor.getAPVTS().getRawParameterValue ("tapCountAuto")->load() > 0.5f;
     manualTapCountSlider.setEnabled (! tapCountAutoOn);
 
+    // TDR-constrained optimization - see the member comments in
+    // PluginEditor.h. maxDecayTimeSlider only matters while the toggle is
+    // on, same greying convention as manualTapCountSlider above;
+    // decayThresholdSlider stays enabled regardless (it also drives the
+    // "Actual Tdecay" display below, in every mode).
+    const bool tdrConstraintOn = processor.getAPVTS().getRawParameterValue ("tdrConstraintOn")->load() > 0.5f;
+    maxDecayTimeSlider.setEnabled (tdrConstraintOn);
+
+    // Live dB equivalent of the Decay Threshold (%) slider - TDR_dB =
+    // -20*log10(pct/100) - per direct request to display both units
+    // together. Read directly from the parameter (not snap.
+    // tdrDecayThresholdPercent) so it tracks the slider live even while a
+    // background search for a different value is still in flight, same
+    // reasoning as sampleRate's own live read above.
+    {
+        const double decayThresholdPercent = static_cast<double> (
+            processor.getAPVTS().getRawParameterValue ("decayThreshold")->load());
+        const double decayThresholdDb = -20.0 * std::log10 (std::max (decayThresholdPercent / 100.0, 1.0e-300));
+        decayThresholdDbLabel.setText ("(~" + juce::String (decayThresholdDb, 2) + " dB)", juce::dontSendNotification);
+    }
+
     juce::String text;
     if (auto* bypassParam = processor.getAPVTS().getRawParameterValue ("bypass"))
         if (bypassParam->load() > 0.5f)
@@ -834,6 +924,47 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
          << "  Center-tap gain " << juce::String (snap.temporal.centerTapPercent, 2)
          << "% (share of a non-oversampling DAC's instantaneous impulse kept in the single "
             "centre sample; the rest is time-smeared across the other taps)\n";
+
+    // TDR-constrained optimization reporting (see ParametricFIR.h::
+    // OptimizationMode/TemporalMetrics's own comments) - shown for every
+    // finished design regardless of mode, per direct request, so the two
+    // optimization philosophies can be compared on the same footing.
+    // TDR0 is the TRUE unweighted transient dynamic range (from the
+    // actual rPeakPercent above, not any internal weighted quantity - see
+    // TemporalMetrics::tdr0dB's own comment); "Actual Tdecay" tracks
+    // whatever Decay Threshold (%) is currently selected, while the
+    // TDR30/40/50/60 ladder are always shown at their own fixed
+    // thresholds for comparison.
+    text << "Transient dynamic range: Rpeak " << juce::String (snap.temporal.rPeakPercent, 2)
+         << "%  |  TDR0 " << juce::String (snap.temporal.tdr0dB, 2) << " dB\n"
+         << "  Decay threshold " << juce::String (snap.tdrDecayThresholdPercent, 3) << "% (~"
+         << juce::String (-20.0 * std::log10 (std::max (snap.tdrDecayThresholdPercent / 100.0, 1.0e-300)), 2)
+         << " dB)  |  actual Tdecay " << snap.temporal.tdecaySamples << " samples ("
+         << juce::String (snap.temporal.tdecayUs, 2) << " us)\n"
+         << "  TDR30 " << juce::String (snap.temporal.tdr30Us, 2) << " us  |  TDR40 "
+         << juce::String (snap.temporal.tdr40Us, 2) << " us  |  TDR50 "
+         << juce::String (snap.temporal.tdr50Us, 2) << " us  |  TDR60 "
+         << juce::String (snap.temporal.tdr60Us, 2) << " us\n";
+
+    if (snap.optimizationMode == bbk::parametric::OptimizationMode::RpeakWithTdrConstraint)
+    {
+        // Pass/fail follows the design's own constraintsMet exactly (the
+        // TDR constraint is a hard LP row baked into the same bisection
+        // that produced this filter - see tryRho's own comment in
+        // ParametricFIR.h - so a feasible result already provably
+        // satisfies it; nothing separate to compute here).
+        const bool tdrPass = snap.constraintsMet;
+        text << "  Maximum allowed " << juce::String (snap.tdrMaxDecayTimeUs, 1) << " us - constraint "
+             << (tdrPass ? "PASS" : "FAIL (best effort shown - see Status below)") << "\n";
+
+        // Diagnostic only - see AttemptResult::tdrIntrudesMainLobe's own
+        // comment. Never means the constraint was weakened, only that it
+        // reached inside what would otherwise be the free main lobe.
+        if (snap.tdrIntrudesMainLobe)
+            text << "  Warning: Maximum Decay Time is short enough that the TDR constraint reaches "
+                    "inside the filter's natural main lobe, not just the sidelobe region - decay is "
+                    "still being enforced there too.\n";
+    }
 
     if (snap.constraintsMet)
     {
