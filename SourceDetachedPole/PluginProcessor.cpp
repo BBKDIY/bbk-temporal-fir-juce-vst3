@@ -85,15 +85,38 @@ namespace
     // what lets this be used as a real memory - see requestBoundaryRedesign().
     inline bool specsEqual (const bbk::parametric::FilterSpec& a, const bbk::parametric::FilterSpec& b) noexcept
     {
-        return a.sampleRateHz == b.sampleRateHz
-            && a.cutoffHz == b.cutoffHz
-            && a.attenuationAtCutoffDb == b.attenuationAtCutoffDb
-            && a.stopbandRejectionDb == b.stopbandRejectionDb
-            && a.stopbandMode == b.stopbandMode
-            && a.sidelobeDecayRatio == b.sidelobeDecayRatio
-            && a.optimizationMode == b.optimizationMode
-            && a.tdrDecayThresholdPercent == b.tdrDecayThresholdPercent
-            && a.tdrMaxDecayTimeUs == b.tdrMaxDecayTimeUs;
+        if (a.sampleRateHz != b.sampleRateHz
+            || a.cutoffHz != b.cutoffHz
+            || a.attenuationAtCutoffDb != b.attenuationAtCutoffDb
+            || a.stopbandRejectionDb != b.stopbandRejectionDb
+            || a.stopbandMode != b.stopbandMode
+            || a.sidelobeDecayRatio != b.sidelobeDecayRatio
+            || a.optimizationMode != b.optimizationMode)
+            return false;
+
+        // tdrDecayThresholdPercent/tdrMaxDecayTimeUs only need to match for
+        // two specs to count as "the same search" while TDR-constrained
+        // optimization is actually the active mode - see attemptDesign()'s
+        // own applyTdrConstraint comment in ParametricFIR.h: in plain Rpeak
+        // mode neither field ever reaches the LP, so it can't change the
+        // produced filter at all. The Decay Threshold slider stays live
+        // regardless of mode though (it drives its own dB readout and the
+        // "actual Tdecay" display either way - see PluginEditor.h), so
+        // comparing these two fields unconditionally meant merely nudging
+        // that slider while in Rpeak-only mode made every cache/override/
+        // dedup lookup below (requestBoundaryRedesign()'s own early-return,
+        // userOverrides, searchCache) think it was a brand-new spec, even
+        // though the actual search and resulting taps are byte-identical -
+        // reported directly as the live-search cache no longer recalling
+        // work it had already done. Guarding on mode here is the fix; once
+        // TDR-constrained mode IS active these two fields are exactly as
+        // load-bearing as everything else above, so they're compared the
+        // same exact (not tolerance-based) way.
+        if (a.optimizationMode == bbk::parametric::OptimizationMode::RpeakWithTdrConstraint)
+            return a.tdrDecayThresholdPercent == b.tdrDecayThresholdPercent
+                && a.tdrMaxDecayTimeUs == b.tdrMaxDecayTimeUs;
+
+        return true;
     }
 
     // Combines a just-finished search's own top-N candidates with whatever
