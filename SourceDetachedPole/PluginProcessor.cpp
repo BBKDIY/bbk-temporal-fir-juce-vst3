@@ -781,7 +781,26 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     if (auto* decayParam = parameters.getParameter ("sidelobeDecay"))
         decayParam->setValueNotifyingHost (decayParam->convertTo0to1 (static_cast<float> (targetSpec.sidelobeDecayRatio)));
 
-    // The four setValueNotifyingHost calls above each re-enter
+    // Also restore the TDR-constraint operating point (toggle + its two
+    // thresholds) from the saved spec, not just the four "classic" controls
+    // above. These previously weren't touched at all by loadPresetSlot(),
+    // so recalling a preset saved in TDR-constrained mode silently left
+    // whatever the UI's TDR controls already happened to show in place -
+    // harmless for the direct republish just below (which always plays
+    // back the preset's own saved taps/spec when the sample rate matches),
+    // but wrong for the sample-rate-mismatch fallback redesign introduced
+    // below, which needs these three at the preset's own saved values so
+    // it reconstructs the preset's actual intended spec rather than
+    // whatever mode/thresholds happened to be on screen before recall.
+    const bool targetTdrOn = (targetSpec.optimizationMode == bbk::parametric::OptimizationMode::RpeakWithTdrConstraint);
+    if (auto* tdrOnParam = parameters.getParameter ("tdrConstraintOn"))
+        tdrOnParam->setValueNotifyingHost (targetTdrOn ? 1.0f : 0.0f);
+    if (auto* decayThresholdParam = parameters.getParameter ("decayThreshold"))
+        decayThresholdParam->setValueNotifyingHost (decayThresholdParam->convertTo0to1 (static_cast<float> (targetSpec.tdrDecayThresholdPercent)));
+    if (auto* maxDecayTimeParam = parameters.getParameter ("maxDecayTimeUs"))
+        maxDecayTimeParam->setValueNotifyingHost (maxDecayTimeParam->convertTo0to1 (static_cast<float> (targetSpec.tdrMaxDecayTimeUs)));
+
+    // The seven setValueNotifyingHost calls above each re-enter
     // requestBoundaryRedesign() via the ParamListener, which finds an
     // instant result for targetSpec by matching userOverrides on SPEC
     // ALONE (see its own comment there) - ambiguous whenever more than one
@@ -797,7 +816,30 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     // republish of the same taps when this spec is unambiguous (the common
     // case); a no-op for slot 0's factory-bank fallback (found is false
     // there, nothing of our own to republish over the bank's own result).
-    if (found && targetEntry.activeIndex >= 0
+    //
+    // GUARDED on the preset's saved sample rate matching the host's actual
+    // CURRENT sample rate. Presets are saved with whatever sampleRateHz was
+    // live at save time (see savePresetSlot()); a saved preset's taps were
+    // designed for THAT rate, so republishing them verbatim while the host
+    // is now actually running at a different rate would play back a filter
+    // designed for the wrong Fs entirely (wrong cutoff-in-Hz, wrong
+    // transition width, wrong TDR-in-microseconds - everything downstream
+    // that depends on sampleRateHz would silently be for the wrong rate).
+    // When the rates don't match, skip this direct republish and let the
+    // redesign already triggered by the parameter-change calls above stand
+    // instead - requestBoundaryRedesign() builds its own spec fresh from
+    // specFromParameters(), which reads the CURRENT live currentSampleRate,
+    // so that redesign is correct for the host's actual rate right now.
+    // Tolerance-based comparison (matching the same pattern already used
+    // for this exact kind of check elsewhere - see the crossfade-publish
+    // guard further down in this file) rather than exact equality, since
+    // sampleRateHz round-trips through XML state save/restore as text and
+    // floating-point rounding could otherwise cause a false mismatch even
+    // when the rate is genuinely the same.
+    const bool sampleRateMatchesHost = found
+        && std::abs (targetEntry.spec.sampleRateHz - currentSampleRate.load()) <= 0.5;
+
+    if (found && sampleRateMatchesHost && targetEntry.activeIndex >= 0
         && targetEntry.activeIndex < static_cast<int> (targetEntry.candidates.size()))
     {
         const auto& active = targetEntry.candidates[static_cast<std::size_t> (targetEntry.activeIndex)];
