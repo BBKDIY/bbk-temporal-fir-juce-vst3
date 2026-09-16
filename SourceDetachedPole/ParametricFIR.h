@@ -370,9 +370,13 @@ struct FilterSpec
     // nothing further (R_peak stayed in the same 4-8% band out to 130%)
     // while adding genuine full-scale headroom risk on transient input
     // (a[0] > 1 means a single full-scale impulse sample produces an
-    // output sample above 0 dBFS) - which is why the UI-facing parameter
-    // (see PluginProcessor.cpp::createParameterLayout()) caps its range at
-    // 100%, even though this field itself has no such ceiling.
+    // output sample above 0 dBFS). The UI-facing parameter (see
+    // PluginProcessor.cpp::createParameterLayout()) extends to 150% per
+    // direct request, specifically to allow experimenting with that
+    // region - relying on the plugin's existing Auto Headroom pad +
+    // soft-clip backstop to absorb the resulting above-full-scale peaks
+    // rather than hard-clipping. This field itself still has no ceiling
+    // of its own either way.
     double centerTapFloorPercent = 0.0;
 };
 

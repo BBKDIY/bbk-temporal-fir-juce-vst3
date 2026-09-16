@@ -390,17 +390,21 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
     // Center Peak Floor (%) - single canonical percent control, same
     // convention as Decay Threshold above (manual slider, live dB readout
     // computed in the editor, no separate independently-settable dB
-    // field). Range capped at 100% (full scale) even though the LP itself
-    // has no such ceiling (see FilterSpec::centerTapFloorPercent's own
-    // comment): the empirical sweep found nothing above 100% buys any
-    // further R_peak improvement, while it does add genuine full-scale
-    // headroom risk on transient input, so there is no reason to expose
-    // that region here. Default 50 matches the sweep's own observed
-    // free-running optimum, i.e. a sensible starting point that costs
-    // nothing extra the moment this is switched on.
+    // field). Range extends to 150% - deliberately past full scale (see
+    // FilterSpec::centerTapFloorPercent's own comment: the LP itself has
+    // no ceiling on a[0], only on the frequency response) - per direct
+    // request, to allow experimenting with that region now that the
+    // existing Auto Headroom pad + soft-clip backstop above (see
+    // autoHeadroomEnabled/softClip* just above process()) are there to
+    // absorb whatever above-full-scale peaks a floor this high produces
+    // on transient input, rather than hard-clipping outright. The
+    // empirical sweep found no R_peak benefit anywhere above 100% (it
+    // plateaus in the same 4-8% band out to 130%), so this is an
+    // experimentation range, not a recommended operating point - default
+    // stays at 50, the sweep's own observed free-running optimum.
     layout.add (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID { "centerTapFloorPercent", 1 }, "Center Peak Floor",
-        juce::NormalisableRange<float> (1.0f, 100.0f, 0.1f),
+        juce::NormalisableRange<float> (1.0f, 150.0f, 0.1f),
         50.0f,
         juce::AudioParameterFloatAttributes().withLabel ("%")));
 
