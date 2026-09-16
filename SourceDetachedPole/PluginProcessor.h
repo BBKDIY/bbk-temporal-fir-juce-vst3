@@ -313,7 +313,10 @@ public:
     // live search candidates - not just the input spec that was searched for.
     // slot must be in range [0, numPresetSlots); out of range returns an
     // unoccupied result rather than asserting, same defensive posture as
-    // selectTopCandidate()'s own range check.
+    // selectTopCandidate()'s own range check. PER-SAMPLE-RATE: a slot with
+    // a preset saved for a different sample rate than the host's current
+    // one reads as unoccupied here, not as if that other rate's preset
+    // applied now - see loadPresetSlot()'s own comment on why.
     PresetSlotInfo getPresetSlotInfoForUI (int slot) const;
 
     // Recalls slot's own exact operating point: forces cutoff/attenuation/
@@ -332,15 +335,29 @@ public:
     // 10 precomputed steps) - the same starting point the old Default
     // toggle always forced, so there's always something useful in Preset 1
     // even before you've saved anything of your own.
+    //
+    // PER-SAMPLE-RATE: each numbered slot remembers one preset PER SAMPLE
+    // RATE, not one preset overall - slot 3 saved while running at 44.1kHz
+    // and slot 3 saved separately while running at 192kHz are two
+    // independent presets that only happen to share a slot number. Loading
+    // slot 3 while the host is at 192kHz only ever recalls the 192kHz
+    // preset (if any was saved there); it never substitutes a different
+    // rate's preset for that slot, even if one exists. "Unoccupied" above
+    // means "no preset saved in this slot for the CURRENT sample rate", not
+    // "nothing has ever been saved in this slot at any rate" - a slot can
+    // be occupied at 44.1kHz and simultaneously empty at 192kHz.
     void loadPresetSlot (int slot);
 
     // Saves whatever is CURRENTLY PLAYING (same source as
     // saveTopCandidateAsOverride(), re-read fresh at call time via
     // getDesignSnapshotForUI() so it always reflects the very latest Use/
     // Load) directly into the given slot, unconditionally overwriting
-    // whatever was there before. A no-op if nothing has been designed yet.
-    // If some other override already exists for this exact spec (e.g. it
-    // was already saved via a top-N row's plain "Save" button), that entry
+    // whatever was there before AT THE CURRENT SAMPLE RATE (see
+    // loadPresetSlot()'s own comment: slots are per-sample-rate, so this
+    // never touches this same slot's preset for a different sample rate,
+    // if one exists). A no-op if nothing has been designed yet. If some
+    // other override already exists for this exact spec (e.g. it was
+    // already saved via a top-N row's plain "Save" button), that entry
     // is replaced rather than duplicated, same dedup rule
     // saveTopCandidateAsOverride() already uses.
     void savePresetSlot (int slot);

@@ -24,6 +24,7 @@
 #include <juce_core/juce_core.h>
 
 #include <array>
+#include <cmath>
 #include <vector>
 
 namespace bbk::detachedpole::useroverrides
@@ -66,10 +67,16 @@ struct OverrideEntry
     // slot forces cutoff/attenuation/stopband/decay to THIS entry's own
     // spec (recalling it exactly, whatever it was searched with) rather
     // than requiring the spec to already match what's currently dialed in.
-    // At most one entry may claim a given slot at a time - saving a new
-    // preset into an occupied slot clears this field on whatever entry
-    // held it before (that entry isn't deleted, it just stops being a
-    // preset - it's still a plain override for its own exact spec).
+    // At most one entry may claim a given slot AT A GIVEN SAMPLE RATE at a
+    // time - saving a new preset into an occupied slot clears this field on
+    // whatever entry held that same slot AT THAT SAME SAMPLE RATE before
+    // (that entry isn't deleted, it just stops being a preset - it's still
+    // a plain override for its own exact spec). Preset slots are
+    // per-sample-rate (see BBKDetachedPoleAudioProcessor::loadPresetSlot()'s
+    // own comment on why): slot 3 saved at 44.1kHz and slot 3 saved
+    // separately at 192kHz are two independent presets that only happen to
+    // share a slot number - each is entirely its own entry here, and saving
+    // or loading one never touches the other.
     //
     // Multiple entries CAN share the exact same spec now, each tagged with
     // a different slot (or one left untagged, -1): two different top-N
@@ -204,25 +211,51 @@ inline std::vector<OverrideEntry> loadAll (const juce::File& file = getOverrideF
         result.push_back (std::move (e));
     }
 
-    // Guard against two entries claiming the same preset slot - shouldn't
-    // happen from this file's own writer (saveTopCandidateAsOverride()/
-    // savePresetSlot() always clear the previous occupant first), but a
-    // hand-edited file, a corrupted write, or an imported file merged in
-    // some unexpected way could still produce one. First entry in file
-    // order wins; every later duplicate claimant is demoted to a plain
-    // (non-preset) override rather than silently leaving two "Preset 3"
-    // buttons disagreeing about what they'd load.
+    // Guard against two entries claiming the same preset slot AT THE SAME
+    // SAMPLE RATE - shouldn't happen from this file's own writer
+    // (saveTopCandidateAsOverride()/savePresetSlot() always clear the
+    // previous same-rate occupant first, see savePresetSlot()'s own
+    // comment), but a hand-edited file, a corrupted write, or an imported
+    // file merged in some unexpected way could still produce one. First
+    // entry in file order wins; every later duplicate claimant (same slot,
+    // same sample rate) is demoted to a plain (non-preset) override rather
+    // than silently leaving two "Preset 3" buttons disagreeing about what
+    // they'd load at that rate.
+    //
+    // Deliberately NOT keyed on slot number alone: preset slots are
+    // per-sample-rate (see BBKDetachedPoleAudioProcessor::loadPresetSlot()'s
+    // own comment on why) - slot 3 saved at 44.1kHz and slot 3 saved
+    // (separately) at 192kHz are two genuinely different, both-valid
+    // presets that happen to share a slot NUMBER, not a conflict. Keying
+    // this guard on slot alone would silently demote the second one to a
+    // plain override on every load from disk, permanently losing its
+    // preset-slot tag even though nothing was actually wrong. Tolerance-
+    // based sample-rate compare (0.5Hz), matching the pattern used
+    // throughout the processor for this exact kind of check, since
+    // sampleRateHz round-trips through this same XML as text.
     {
-        std::array<bool, static_cast<std::size_t> (numPresetSlots)> slotClaimed {};
+        struct ClaimedSlot { int slot; double sampleRateHz; };
+        std::vector<ClaimedSlot> claimed;
         for (auto& e : result)
         {
             if (e.presetSlot < 0)
                 continue;
-            auto idx = static_cast<std::size_t> (e.presetSlot);
-            if (slotClaimed[idx])
+
+            bool alreadyClaimed = false;
+            for (auto& c : claimed)
+            {
+                if (c.slot == e.presetSlot
+                    && std::abs (c.sampleRateHz - e.spec.sampleRateHz) <= 0.5)
+                {
+                    alreadyClaimed = true;
+                    break;
+                }
+            }
+
+            if (alreadyClaimed)
                 e.presetSlot = -1;
             else
-                slotClaimed[idx] = true;
+                claimed.push_back ({ e.presetSlot, e.spec.sampleRateHz });
         }
     }
 

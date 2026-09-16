@@ -699,10 +699,19 @@ BBKDetachedPoleAudioProcessor::PresetSlotInfo BBKDetachedPoleAudioProcessor::get
     if (slot < 0 || slot >= bbk::detachedpole::useroverrides::numPresetSlots)
         return info;
 
+    // Preset slots are per-sample-rate (see loadPresetSlot()'s own comment
+    // on why) - a slot with a preset saved for a DIFFERENT sample rate than
+    // the host's current one must read as unoccupied here, not show that
+    // other rate's preset as if it applied now. Reported directly: at
+    // 192kHz, slots that only had presets saved at 44.1kHz still showed as
+    // occupied. Tolerance-based compare, same reasoning as loadPresetSlot().
+    const double liveSampleRate = currentSampleRate.load();
+
     const juce::SpinLock::ScopedLockType sl (specLock);
     for (auto& e : userOverrides)
     {
-        if (e.presetSlot == slot)
+        if (e.presetSlot == slot
+            && std::abs (e.spec.sampleRateHz - liveSampleRate) <= 0.5)
         {
             info.occupied = true;
             info.spec = e.spec;
@@ -731,6 +740,22 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     if (slot < 0 || slot >= bbk::detachedpole::useroverrides::numPresetSlots)
         return;
 
+    // Preset slots are per-sample-rate: slot N saved while running at
+    // 44.1kHz and slot N saved (separately) while running at 192kHz are two
+    // independent bookmarks that happen to share a slot NUMBER, not the
+    // same preset. Reported directly: switching the host to 192kHz still
+    // showed (and loaded) the 44.1kHz-era presets as if they were valid at
+    // the new rate. Scoping this lookup on the live sample rate as well as
+    // the slot number is what makes a slot with nothing saved for the
+    // CURRENT rate behave as genuinely empty - the same "not found" path
+    // slots 1-4 already take when nothing has ever been saved into them at
+    // all (see below). Tolerance-based compare (same pattern used
+    // throughout this file for this exact kind of check - see the
+    // crossfade-publish guard further down) rather than exact equality,
+    // since sampleRateHz round-trips through XML state save/restore as
+    // text.
+    const double liveSampleRateForLoad = currentSampleRate.load();
+
     bbk::parametric::FilterSpec targetSpec;
     bool found = false;
     bbk::detachedpole::useroverrides::OverrideEntry targetEntry;
@@ -738,7 +763,8 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
         const juce::SpinLock::ScopedLockType sl (specLock);
         for (auto& e : userOverrides)
         {
-            if (e.presetSlot == slot)
+            if (e.presetSlot == slot
+                && std::abs (e.spec.sampleRateHz - liveSampleRateForLoad) <= 0.5)
             {
                 targetSpec = e.spec;
                 targetEntry = e;
@@ -751,8 +777,9 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     if (! found)
     {
         // Only slot 0 (Preset 1) has a built-in fallback - see this
-        // method's own header comment. Every other empty slot is simply
-        // nothing to load yet.
+        // method's own header comment. Every other empty slot (including
+        // one that has a saved preset, just not for the CURRENT sample
+        // rate) is simply nothing to load yet at this rate.
         if (slot != 0)
             return;
 
@@ -818,24 +845,23 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     // there, nothing of our own to republish over the bank's own result).
     //
     // GUARDED on the preset's saved sample rate matching the host's actual
-    // CURRENT sample rate. Presets are saved with whatever sampleRateHz was
-    // live at save time (see savePresetSlot()); a saved preset's taps were
-    // designed for THAT rate, so republishing them verbatim while the host
-    // is now actually running at a different rate would play back a filter
-    // designed for the wrong Fs entirely (wrong cutoff-in-Hz, wrong
-    // transition width, wrong TDR-in-microseconds - everything downstream
-    // that depends on sampleRateHz would silently be for the wrong rate).
-    // When the rates don't match, skip this direct republish and let the
-    // redesign already triggered by the parameter-change calls above stand
-    // instead - requestBoundaryRedesign() builds its own spec fresh from
-    // specFromParameters(), which reads the CURRENT live currentSampleRate,
-    // so that redesign is correct for the host's actual rate right now.
-    // Tolerance-based comparison (matching the same pattern already used
-    // for this exact kind of check elsewhere - see the crossfade-publish
-    // guard further down in this file) rather than exact equality, since
-    // sampleRateHz round-trips through XML state save/restore as text and
-    // floating-point rounding could otherwise cause a false mismatch even
-    // when the rate is genuinely the same.
+    // CURRENT sample rate. The search above already scopes on sample rate,
+    // so found==true should already guarantee this holds - this re-check is
+    // a defensive backstop only, in case the host's sample rate genuinely
+    // changes between that search and this point (setValueNotifyingHost
+    // above can re-enter arbitrary listener code). A saved preset's taps
+    // were designed for the rate it was saved at, so republishing them
+    // verbatim while the host is actually running at a different rate would
+    // play back a filter designed for the wrong Fs entirely (wrong
+    // cutoff-in-Hz, wrong transition width, wrong TDR-in-microseconds -
+    // everything downstream that depends on sampleRateHz would silently be
+    // for the wrong rate). When the rates don't match, skip this direct
+    // republish and let the redesign already triggered by the
+    // parameter-change calls above stand instead - requestBoundaryRedesign()
+    // builds its own spec fresh from specFromParameters(), which reads the
+    // CURRENT live currentSampleRate, so that redesign is correct for the
+    // host's actual rate right now. Tolerance-based comparison, same
+    // reasoning as the search above.
     const bool sampleRateMatchesHost = found
         && std::abs (targetEntry.spec.sampleRateHz - currentSampleRate.load()) <= 0.5;
 
@@ -882,12 +908,19 @@ void BBKDetachedPoleAudioProcessor::savePresetSlot (int slot)
         // search silently emptied Preset 1 again, because the old dedup
         // rule erased EVERY entry matching this spec regardless of which
         // slot (if any) it belonged to. What must still never happen is
-        // two entries claiming the SAME slot, or a stray duplicate plain
-        // (non-preset) entry for a spec a preset already covers - so only
-        // THOSE are cleared here:
+        // two entries claiming the SAME slot AT THE SAME SAMPLE RATE, or a
+        // stray duplicate plain (non-preset) entry for a spec a preset
+        // already covers - so only THOSE are cleared here. Preset slots are
+        // per-sample-rate (see loadPresetSlot()'s own comment): saving into
+        // slot N while running at 192kHz must not disturb whatever entry
+        // already occupies slot N for 44.1kHz - they're two independent
+        // bookmarks that only happen to share a slot NUMBER, so the
+        // sample rate is part of what "currently occupies THIS slot" means
+        // here. Tolerance-based compare, same reasoning as loadPresetSlot().
         for (auto& e : userOverrides)
-            if (e.presetSlot == slot)
-                e.presetSlot = -1; // free whichever entry currently occupies THIS slot (if any) - it stays around as a plain, exact-spec-recall override, it just stops being a preset, same as before
+            if (e.presetSlot == slot
+                && std::abs (e.spec.sampleRateHz - entry.spec.sampleRateHz) <= 0.5)
+                e.presetSlot = -1; // free whichever entry currently occupies THIS slot AT THIS SAMPLE RATE (if any) - it stays around as a plain, exact-spec-recall override, it just stops being a preset, same as before
 
         userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
                                               [&] (const auto& e)
