@@ -1583,8 +1583,37 @@ void BBKDetachedPoleAudioProcessor::run()
         // work to have wasted, and caching whatever was found so far
         // regardless of staleness means that work is never simply thrown
         // away either way.
+        // threadShouldExit() (juce::Thread's own flag, set by the
+        // destructor's signalThreadShouldExit() below - see
+        // ~BBKDetachedPoleAudioProcessor()) is checked FIRST and is what
+        // actually makes that destructor safe. Confirmed as a real, live
+        // crash: a Windows crash dump captured from Audirvana showed the
+        // access violation happening exactly inside this deep search loop,
+        // reading through a captured `this` that was already-freed memory.
+        // Root cause: the destructor calls stopThread(5000), but before
+        // this fix, NOTHING this deep search loop checked was tied to
+        // threadShouldExit() at all - only stopSearchRequested (the UI Stop
+        // button) and a boundaryEpoch mismatch (a newer redesign request)
+        // were visible here. A search can legitimately run for up to
+        // several minutes (perCandidateSearchTimeSeconds x maxSearchTimeValue),
+        // so whenever the plugin was destroyed while one was in flight -
+        // which some hosts do routinely around transport start/stop, not
+        // just at project close - stopThread(5000)'s 5-second wait reliably
+        // timed out and returned anyway (JUCE does not forcibly kill the
+        // thread on a stopThread timeout), and the destructor proceeded to
+        // free `this` while this background thread - and every capture in
+        // `concurrency` below that closes over `this` - kept running
+        // against that now-freed memory. Checking threadShouldExit() here,
+        // at the exact same fine granularity (every 64 LP pivots - see
+        // solveLPFeasibility's own comment on why that's already fast/
+        // responsive, proven by the Stop button using this identical
+        // mechanism) makes the search unwind in a fraction of a second
+        // once signalThreadShouldExit() is called, so stopThread(5000)'s
+        // existing timeout is now actually sufficient in practice.
         concurrency.shouldStopEarly = [this, taskEpoch = task.epoch]
         {
+            if (threadShouldExit())
+                return true;
             if (stopSearchRequested.load())
                 return true;
             const juce::SpinLock::ScopedLockType sl (specLock);
