@@ -370,19 +370,30 @@ public:
     // argument. This is the whole "share with a friend" feature: destFile
     // is just an ordinary file the user can email, message, or drop
     // anywhere, and importPresets() below reads it back on the other end.
+    //
+    // NOT scoped to the current sample rate - every occupied slot at EVERY
+    // sample rate you've saved (see loadPresetSlot()'s own comment on
+    // presets being per-sample-rate) goes into this one file. One export
+    // is a complete backup of your whole preset bank; you never need a
+    // separate export per sample rate.
     void exportPresets (const juce::File& destFile);
 
     // Reads srcFile (expected to be a file exportPresets() produced, though
     // any valid UserPresetOverrides-shaped XML works) and merges every
     // preset it contains into this install's own bank, slot by slot: for
-    // each occupied slot the file defines, whatever currently occupies that
-    // same slot locally is displaced (demoted to a plain, non-preset
-    // override, same as savePresetSlot()'s own overwrite rule) and replaced
-    // with the imported one. Slots the file doesn't define are left
-    // completely untouched - importing a friend's 2-preset export never
-    // disturbs the other 3 slots you've already built up yourself. Returns
-    // false if srcFile couldn't be read or contained no presets at all (a
-    // plain override-only export, or an unrelated/corrupt file); true
+    // each occupied (slot, sample rate) pair the file defines, whatever
+    // currently occupies that same slot AT THAT SAME SAMPLE RATE locally is
+    // displaced (demoted to a plain, non-preset override, same as
+    // savePresetSlot()'s own overwrite rule) and replaced with the imported
+    // one - an imported Preset 1 saved at 44.1kHz only ever displaces THIS
+    // install's own Preset 1 at 44.1kHz, never a separate Preset 1 this
+    // install already has at a different sample rate (e.g. 192kHz); those
+    // coexist, exactly as they would from two local saves. Slots (at a
+    // given sample rate) the file doesn't define are left completely
+    // untouched - importing a friend's 2-preset export never disturbs the
+    // other 3 slots you've already built up yourself, at any sample rate.
+    // Returns false if srcFile couldn't be read or contained no presets at
+    // all (a plain override-only export, or an unrelated/corrupt file); true
     // otherwise, including if fewer presets were merged than the file
     // nominally listed (only entries actually tagged with a valid slot are
     // merged - see UserPresetOverrides.h::loadAll()'s own dedup guard).

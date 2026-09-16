@@ -981,9 +981,18 @@ bool BBKDetachedPoleAudioProcessor::importPresets (const juce::File& srcFile)
             if (incoming.presetSlot < 0)
                 continue; // a plain override in the imported file, not tagged as a preset - nothing to merge
 
+            // Preset slots are per-sample-rate (see loadPresetSlot()'s own
+            // comment on why): an imported "Preset 1" saved at 44.1kHz must
+            // only displace this install's own Preset 1 AT 44.1kHz, never a
+            // completely separate Preset 1 this install already has saved
+            // at a different sample rate (e.g. 192kHz) - those coexist, the
+            // same as savePresetSlot()'s own same-rate-only clear does for
+            // a local save. Tolerance-based compare, same reasoning as
+            // loadPresetSlot()/savePresetSlot().
             for (auto& e : userOverrides)
-                if (e.presetSlot == incoming.presetSlot)
-                    e.presetSlot = -1; // this slot is about to be replaced - see savePresetSlot()'s own comment
+                if (e.presetSlot == incoming.presetSlot
+                    && std::abs (e.spec.sampleRateHz - incoming.spec.sampleRateHz) <= 0.5)
+                    e.presetSlot = -1; // this slot is about to be replaced AT THIS SAMPLE RATE - see savePresetSlot()'s own comment
 
             userOverrides.erase (std::remove_if (userOverrides.begin(), userOverrides.end(),
                                                   [&] (const auto& e) { return specsEqual (e.spec, incoming.spec); }),
