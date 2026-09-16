@@ -163,6 +163,31 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     maxDecayTimeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.getAPVTS(), "maxDecayTimeUs", maxDecayTimeSlider);
 
+    // Center Peak Constraint - see the member comments in PluginEditor.h
+    // and ParametricFIR.h::FilterSpec::centerTapFloorPercent's own
+    // comment. Off by default: existing behaviour, completely unchanged.
+    centerTapConstraintButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    content.addAndMakeVisible (centerTapConstraintButton);
+    centerTapConstraintAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+        processor.getAPVTS(), "centerTapConstraintOn", centerTapConstraintButton);
+
+    prepareLabel (centerTapFloorLabel, 13.0f, false, juce::Justification::centredLeft);
+    centerTapFloorLabel.setText ("Center Peak Floor", juce::dontSendNotification);
+    content.addAndMakeVisible (centerTapFloorLabel);
+    prepareSlider (centerTapFloorSlider);
+    centerTapFloorSlider.setNumDecimalPlacesToDisplay (2);
+    content.addAndMakeVisible (centerTapFloorSlider);
+    centerTapFloorAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processor.getAPVTS(), "centerTapFloorPercent", centerTapFloorSlider);
+
+    // Live dB equivalent right next to the percent slider - see
+    // PluginEditor.h's own comment on the sign (NOT negated, unlike
+    // decayThresholdDbLabel: this is a literal gain, 0 dB at 100%).
+    // Refreshed every timerCallback() tick, same convention as
+    // decayThresholdDbLabel just above.
+    prepareLabel (centerTapFloorDbLabel, 12.0f, false, juce::Justification::centredLeft);
+    content.addAndMakeVisible (centerTapFloorDbLabel);
+
     // Manual/Auto tap-count selector - greying handled in timerCallback()
     // (needs to track the parameter live, e.g. host automation of
     // "tapCountAuto").
@@ -422,8 +447,11 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // searchProgressBar row above metricsReadout (see its own comment in
     // PluginEditor.h), the three TDR-constrained-optimization control rows
     // (tdrConstraintButton/decayThresholdSlider/maxDecayTimeSlider, ~94px
-    // together - see their own comments in PluginEditor.h), and
-    // metricsReadout's own 380->460px bump for the extra TDR reporting
+    // together - see their own comments in PluginEditor.h), the two
+    // Center-Peak-Constraint control rows (centerTapConstraintButton/
+    // centerTapFloorSlider, ~62px together - same layout convention, one
+    // fewer row than TDR since there's no maxDecayTimeSlider equivalent),
+    // and metricsReadout's own 380->460px bump for the extra TDR reporting
     // lines) plus a fixed allowance for the coefficients box - it has its
     // own internal scrollbar (see setScrollbarsShown() above), so it
     // doesn't need much outer space to still be fully usable. This is
@@ -432,7 +460,7 @@ BBKDetachedPoleAudioProcessorEditor::BBKDetachedPoleAudioProcessorEditor (BBKDet
     // why those are now deliberately different.
     constexpr int contentWidth = 680;
     constexpr int coefficientsBoxHeight = 260;
-    constexpr int contentHeight = 1468 + 40 + coefficientsBoxHeight;
+    constexpr int contentHeight = 1468 + 62 + 40 + coefficientsBoxHeight;
     content.setSize (contentWidth, contentHeight);
     layOutContent();
 
@@ -525,6 +553,20 @@ void BBKDetachedPoleAudioProcessorEditor::layOutContent()
         auto row = area.removeFromTop (26);
         maxDecayTimeLabel.setBounds (row.removeFromLeft (170));
         maxDecayTimeSlider.setBounds (row);
+    }
+    area.removeFromTop (6);
+
+    centerTapConstraintButton.setBounds (area.removeFromTop (24));
+    area.removeFromTop (6);
+
+    {
+        // centerTapFloorDbLabel sits right of the slider's own text box,
+        // same layout convention as decayThresholdDbLabel above.
+        auto row = area.removeFromTop (26);
+        centerTapFloorLabel.setBounds (row.removeFromLeft (170));
+        centerTapFloorSlider.setBounds (row.removeFromLeft (200));
+        row.removeFromLeft (10);
+        centerTapFloorDbLabel.setBounds (row);
     }
     area.removeFromTop (6);
 
@@ -913,6 +955,21 @@ void BBKDetachedPoleAudioProcessorEditor::timerCallback()
             processor.getAPVTS().getRawParameterValue ("decayThreshold")->load());
         const double decayThresholdDb = -20.0 * std::log10 (std::max (decayThresholdPercent / 100.0, 1.0e-300));
         decayThresholdDbLabel.setText ("(~" + juce::String (decayThresholdDb, 2) + " dB)", juce::dontSendNotification);
+    }
+
+    // Center Peak Constraint - live dB equivalent of the Center Peak Floor
+    // (%) slider, same "read directly off the live parameter" convention
+    // as decayThresholdDbLabel just above, so it previews correctly even
+    // while the toggle is off or a background search for a different
+    // value is in flight. CenterTapDb = 20*log10(pct/100) - NOT negated:
+    // see PluginEditor.h's own comment on why this sign differs from
+    // decayThresholdDb's formula (a literal gain, 0 dB at 100% = full
+    // scale, rather than a decay/rejection ratio).
+    {
+        const double centerTapFloorPercent = static_cast<double> (
+            processor.getAPVTS().getRawParameterValue ("centerTapFloorPercent")->load());
+        const double centerTapFloorDb = 20.0 * std::log10 (std::max (centerTapFloorPercent / 100.0, 1.0e-300));
+        centerTapFloorDbLabel.setText ("(~" + juce::String (centerTapFloorDb, 2) + " dB)", juce::dontSendNotification);
     }
 
     juce::String text;

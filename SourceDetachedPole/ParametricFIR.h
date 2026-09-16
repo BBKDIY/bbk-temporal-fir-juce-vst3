@@ -343,6 +343,37 @@ struct FilterSpec
     // tdrDecayThresholdPercent regardless of whether it would otherwise be
     // classified as part of the (self-consistently re-derived) main lobe.
     double tdrMaxDecayTimeUs = 100.0;
+
+    // Center Peak Constraint (added per direct request, after empirically
+    // sweeping the trade-off with a standalone probe): an independent,
+    // ALWAYS-composable one-sided floor on a[0] itself (the centre/peak
+    // tap - see TemporalMetrics::centerTapPercent's own comment), separate
+    // from OptimizationMode/tdrDecayThresholdPercent/tdrMaxDecayTimeUs
+    // above and combinable with either mode. 0.0 (default) disables it
+    // entirely - a byte-for-byte no-op, exactly like every other opt-in
+    // control here. A positive value N requires a[0] >= N/100 (fraction of
+    // the filter's unity DC gain), via one extra LP row in tryRho below -
+    // NOT an equality pin, so the solver stays free to push a[0] higher
+    // than the floor if that happens to help feasibility.
+    //
+    // The empirical sweep (192 kHz, cutoff 18500 Hz, -0.87 dB at cutoff,
+    // 40 dB min rejection, FreeTransition, sidelobeDecayRatio 1.0) found a
+    // steep knee, not a smooth dial:
+    //   50% (~free-running optimum) : R_peak 0.098%, TDR0 60.21 dB
+    //   55%                         : R_peak 0.684%, TDR0 43.30 dB
+    //   60%                         : R_peak 1.563%, TDR0 36.12 dB
+    //   70-100%                     : R_peak plateaus in the 2-5% band,
+    //                                  no further gain from more taps
+    // Values above 100% were also confirmed LP-feasible (nothing here caps
+    // a[0] at unity - the frequency-response passband ceiling is a
+    // separate constraint on A(f), not on any individual tap), but bought
+    // nothing further (R_peak stayed in the same 4-8% band out to 130%)
+    // while adding genuine full-scale headroom risk on transient input
+    // (a[0] > 1 means a single full-scale impulse sample produces an
+    // output sample above 0 dBFS) - which is why the UI-facing parameter
+    // (see PluginProcessor.cpp::createParameterLayout()) caps its range at
+    // 100%, even though this field itself has no such ceiling.
+    double centerTapFloorPercent = 0.0;
 };
 
 // The paper's own time-domain concentration metrics (Section 8.1),
@@ -1034,6 +1065,22 @@ inline AttemptResult attemptDesign (const FilterSpec& spec, int M, std::chrono::
             std::vector<double> neg (z.size()); for (std::size_t k = 0; k < z.size(); ++k) neg[k] = -z[k];
             A.push_back (neg); b.push_back (c + eps);               // A(f) >= -eps
         }
+
+        // Center Peak Constraint (see FilterSpec::centerTapFloorPercent's
+        // own comment) - a plain one-sided floor on a[0], independent of
+        // applySidelobe/rho/applyTdrConstraint below, so it applies to
+        // every trial LP (including the applySidelobe=false feasibility-
+        // only check in solveForStopEdge) rather than only the fully-
+        // constrained ones.
+        if (spec.centerTapFloorPercent > 0.0)
+        {
+            std::vector<double> z0f; double c0f;
+            indexToLinear (0, z0f, c0f);
+            const double floorFrac = spec.centerTapFloorPercent / 100.0;
+            std::vector<double> negz0f (z0f.size()); for (std::size_t k = 0; k < z0f.size(); ++k) negz0f[k] = -z0f[k];
+            A.push_back (negz0f); b.push_back (c0f - floorFrac);    // a[0] >= floorFrac
+        }
+
         if (applySidelobe)
         {
             std::vector<double> z0; double c0;

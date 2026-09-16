@@ -86,6 +86,25 @@ private:
     juce::Label maxDecayTimeLabel;
     juce::Slider maxDecayTimeSlider;
 
+    // Center Peak Constraint (see ParametricFIR.h::FilterSpec::
+    // centerTapFloorPercent's own comment for the full empirical basis).
+    // Independent of, and combinable with, the TDR controls just above -
+    // same on/off + live-percent + live-dB-readout pattern as
+    // tdrConstraintButton/decayThresholdSlider/decayThresholdDbLabel, just
+    // without an equivalent to maxDecayTimeSlider (this constraint is
+    // fully described by the one percent value, no second threshold).
+    // centerTapFloorSlider stays enabled regardless of the toggle, same
+    // reasoning as decayThresholdSlider - so its live dB readout is always
+    // meaningful to preview even before switching the constraint on.
+    // centerTapFloorDbLabel shows CenterTapDb = 20*log10(pct/100) - note
+    // the SIGN is opposite decayThresholdDbLabel's formula: this is a
+    // literal gain (0 dB at 100%, i.e. full scale), not a decay/rejection
+    // ratio, so it is NOT negated the way TDR_dB is.
+    juce::ToggleButton centerTapConstraintButton { "Center Peak Constraint" };
+    juce::Label centerTapFloorLabel;
+    juce::Slider centerTapFloorSlider;
+    juce::Label centerTapFloorDbLabel;
+
     // Manual/Auto tap-count selector - see "tapCountAuto"/"manualTapCount"
     // in PluginProcessor.cpp::createParameterLayout(). manualTapCountSlider
     // is greyed out (see timerCallback()) whenever tapCountAutoButton is
@@ -222,6 +241,8 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tdrConstraintAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> decayThresholdAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxDecayTimeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> centerTapConstraintAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> centerTapFloorAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> manualTapCountAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tapCountAutoAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> maxSearchTimeAttachment;

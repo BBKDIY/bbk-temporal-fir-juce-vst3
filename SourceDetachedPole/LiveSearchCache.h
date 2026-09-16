@@ -99,6 +99,11 @@ inline std::vector<CacheEntry> loadAll()
         e.spec.tdrDecayThresholdPercent = child->getDoubleAttribute ("tdrDecayThresholdPercent", 0.1);
         e.spec.tdrMaxDecayTimeUs = child->getDoubleAttribute ("tdrMaxDecayTimeUs", 100.0);
 
+        // Center Peak Constraint - see UserPresetOverrides.h::loadAll()'s
+        // identical field for the full rationale (missing attribute
+        // defaults to 0.0, disabled, byte-identical to before this existed).
+        e.spec.centerTapFloorPercent = child->getDoubleAttribute ("centerTapFloorPercent", 0.0);
+
         bool anyCandidateChild = false;
         for (auto* candidateChild : child->getChildIterator())
         {
@@ -166,6 +171,7 @@ inline bool saveAll (const std::vector<CacheEntry>& entries)
         child->setAttribute ("optimizationMode", static_cast<int> (e.spec.optimizationMode));
         child->setAttribute ("tdrDecayThresholdPercent", e.spec.tdrDecayThresholdPercent);
         child->setAttribute ("tdrMaxDecayTimeUs", e.spec.tdrMaxDecayTimeUs);
+        child->setAttribute ("centerTapFloorPercent", e.spec.centerTapFloorPercent);
 
         for (auto& c : e.candidates)
         {

@@ -151,6 +151,13 @@ inline std::vector<OverrideEntry> loadAll (const juce::File& file = getOverrideF
         e.spec.tdrDecayThresholdPercent = child->getDoubleAttribute ("tdrDecayThresholdPercent", 0.1);
         e.spec.tdrMaxDecayTimeUs = child->getDoubleAttribute ("tdrMaxDecayTimeUs", 100.0);
 
+        // Center Peak Constraint (see ParametricFIR.h::FilterSpec::
+        // centerTapFloorPercent's own comment) - missing attribute (every
+        // file written before this existed) defaults to 0.0, the field's
+        // own "disabled" sentinel, i.e. byte-identical behaviour to before
+        // this was added.
+        e.spec.centerTapFloorPercent = child->getDoubleAttribute ("centerTapFloorPercent", 0.0);
+
         bool anyCandidateChild = false;
         for (auto* candidateChild : child->getChildIterator())
         {
@@ -285,6 +292,7 @@ inline bool saveAll (const std::vector<OverrideEntry>& entries, const juce::File
         child->setAttribute ("optimizationMode", static_cast<int> (e.spec.optimizationMode));
         child->setAttribute ("tdrDecayThresholdPercent", e.spec.tdrDecayThresholdPercent);
         child->setAttribute ("tdrMaxDecayTimeUs", e.spec.tdrMaxDecayTimeUs);
+        child->setAttribute ("centerTapFloorPercent", e.spec.centerTapFloorPercent);
         child->setAttribute ("activeIndex", e.activeIndex);
         child->setAttribute ("presetSlot", e.presetSlot);
 

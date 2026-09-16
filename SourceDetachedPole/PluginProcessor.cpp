@@ -91,7 +91,15 @@ namespace
             || a.stopbandRejectionDb != b.stopbandRejectionDb
             || a.stopbandMode != b.stopbandMode
             || a.sidelobeDecayRatio != b.sidelobeDecayRatio
-            || a.optimizationMode != b.optimizationMode)
+            || a.optimizationMode != b.optimizationMode
+            // Center Peak Constraint (see ParametricFIR.h::FilterSpec::
+            // centerTapFloorPercent's own comment) - compared
+            // unconditionally, unlike the TDR pair below: specFromParameters()
+            // above already forces this to exactly 0.0 whenever
+            // centerTapConstraintOn is off, so two "off" specs already
+            // compare equal here with no extra gating needed, the same way
+            // every other always-active field above does.
+            || a.centerTapFloorPercent != b.centerTapFloorPercent)
             return false;
 
         // tdrDecayThresholdPercent/tdrMaxDecayTimeUs only need to match for
@@ -214,6 +222,8 @@ BBKDetachedPoleAudioProcessor::BBKDetachedPoleAudioProcessor()
     parameters.addParameterListener ("tdrConstraintOn", &paramListener);
     parameters.addParameterListener ("decayThreshold", &paramListener);
     parameters.addParameterListener ("maxDecayTimeUs", &paramListener);
+    parameters.addParameterListener ("centerTapConstraintOn", &paramListener);
+    parameters.addParameterListener ("centerTapFloorPercent", &paramListener);
     parameters.addParameterListener ("tapCountAuto", &paramListener);
     parameters.addParameterListener ("manualTapCount", &paramListener);
 
@@ -251,6 +261,8 @@ BBKDetachedPoleAudioProcessor::~BBKDetachedPoleAudioProcessor()
     parameters.removeParameterListener ("tdrConstraintOn", &paramListener);
     parameters.removeParameterListener ("decayThreshold", &paramListener);
     parameters.removeParameterListener ("maxDecayTimeUs", &paramListener);
+    parameters.removeParameterListener ("centerTapConstraintOn", &paramListener);
+    parameters.removeParameterListener ("centerTapFloorPercent", &paramListener);
     parameters.removeParameterListener ("tapCountAuto", &paramListener);
     parameters.removeParameterListener ("manualTapCount", &paramListener);
 
@@ -361,6 +373,36 @@ juce::AudioProcessorValueTreeState::ParameterLayout BBKDetachedPoleAudioProcesso
         juce::NormalisableRange<float> (1.0f, 2000.0f, 1.0f),
         100.0f,
         juce::AudioParameterFloatAttributes().withLabel ("us")));
+
+    // Center Peak Constraint (see ParametricFIR.h::FilterSpec::
+    // centerTapFloorPercent's own comment for the full empirical sweep
+    // this is based on) - a completely independent floor from the TDR
+    // constraint above, combinable with either optimization mode. Off
+    // (default): existing behaviour, byte-for-byte unchanged - the centre
+    // tap is left wherever the search naturally lands it (typically ~50%
+    // of unity DC gain at a demanding spec). On: additionally requires the
+    // centre tap to reach at least centerTapFloorPercent below.
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { "centerTapConstraintOn", 1 },
+        "Center Peak Constraint",
+        false));
+
+    // Center Peak Floor (%) - single canonical percent control, same
+    // convention as Decay Threshold above (manual slider, live dB readout
+    // computed in the editor, no separate independently-settable dB
+    // field). Range capped at 100% (full scale) even though the LP itself
+    // has no such ceiling (see FilterSpec::centerTapFloorPercent's own
+    // comment): the empirical sweep found nothing above 100% buys any
+    // further R_peak improvement, while it does add genuine full-scale
+    // headroom risk on transient input, so there is no reason to expose
+    // that region here. Default 50 matches the sweep's own observed
+    // free-running optimum, i.e. a sensible starting point that costs
+    // nothing extra the moment this is switched on.
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID { "centerTapFloorPercent", 1 }, "Center Peak Floor",
+        juce::NormalisableRange<float> (1.0f, 100.0f, 0.1f),
+        50.0f,
+        juce::AudioParameterFloatAttributes().withLabel ("%")));
 
     // See the anonymous namespace above process() for the full rationale:
     // the measured worst-case peak gain here ranges from about +0.6 dB
@@ -517,6 +559,17 @@ bbk::parametric::FilterSpec BBKDetachedPoleAudioProcessor::specFromParameters() 
         : bbk::parametric::OptimizationMode::Rpeak;
     spec.tdrDecayThresholdPercent = static_cast<double> (parameters.getRawParameterValue ("decayThreshold")->load());
     spec.tdrMaxDecayTimeUs = static_cast<double> (parameters.getRawParameterValue ("maxDecayTimeUs")->load());
+
+    // Center Peak Constraint (see ParametricFIR.h::FilterSpec::
+    // centerTapFloorPercent's own comment). Off: forced to 0.0, the
+    // field's own "disabled" sentinel, regardless of whatever the floor
+    // slider happens to be showing - same convention as tdrConstraintOn's
+    // effect on optimizationMode above, and what lets specsEqual() below
+    // compare this field unconditionally rather than needing to gate on a
+    // separate enable flag the way the TDR fields do.
+    spec.centerTapFloorPercent = (parameters.getRawParameterValue ("centerTapConstraintOn")->load() > 0.5f)
+        ? static_cast<double> (parameters.getRawParameterValue ("centerTapFloorPercent")->load())
+        : 0.0;
 
     return spec;
 }
@@ -827,7 +880,18 @@ void BBKDetachedPoleAudioProcessor::loadPresetSlot (int slot)
     if (auto* maxDecayTimeParam = parameters.getParameter ("maxDecayTimeUs"))
         maxDecayTimeParam->setValueNotifyingHost (maxDecayTimeParam->convertTo0to1 (static_cast<float> (targetSpec.tdrMaxDecayTimeUs)));
 
-    // The seven setValueNotifyingHost calls above each re-enter
+    // Also restore the Center Peak Constraint operating point (toggle +
+    // its floor), same reasoning as the TDR restore just above - recalling
+    // a preset saved with this constraint on must not silently leave
+    // whatever the UI's own controls happened to show in place.
+    const bool targetCenterTapOn = (targetSpec.centerTapFloorPercent > 0.0);
+    if (auto* centerTapOnParam = parameters.getParameter ("centerTapConstraintOn"))
+        centerTapOnParam->setValueNotifyingHost (targetCenterTapOn ? 1.0f : 0.0f);
+    if (auto* centerTapFloorParam = parameters.getParameter ("centerTapFloorPercent"))
+        centerTapFloorParam->setValueNotifyingHost (centerTapFloorParam->convertTo0to1 (
+            static_cast<float> (targetCenterTapOn ? targetSpec.centerTapFloorPercent : 50.0)));
+
+    // The nine setValueNotifyingHost calls above each re-enter
     // requestBoundaryRedesign() via the ParamListener, which finds an
     // instant result for targetSpec by matching userOverrides on SPEC
     // ALONE (see its own comment there) - ambiguous whenever more than one
